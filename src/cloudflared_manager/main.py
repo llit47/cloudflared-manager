@@ -7,13 +7,20 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+from cloudflared_manager.cloudflared.discovery import (
+    RuntimeDiscoveryProvider,
+    discover_cloudflared,
+)
 from cloudflared_manager.config import Settings
 from cloudflared_manager.web.routes import router
 
 PACKAGE_DIR = Path(__file__).parent
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    runtime_discovery: RuntimeDiscoveryProvider = discover_cloudflared,
+) -> FastAPI:
     """Create an application instance with explicit, replaceable settings."""
 
     app_settings = settings or Settings.from_env()
@@ -22,6 +29,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         description="LAN-only manager for a locally operated Cloudflare Tunnel.",
     )
     application.state.settings = app_settings
+    application.state.runtime_discovery = runtime_discovery
     application.mount(
         "/static",
         StaticFiles(directory=PACKAGE_DIR / "static"),
