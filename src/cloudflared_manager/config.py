@@ -20,6 +20,7 @@ class Settings:
     bind_host: str = "127.0.0.1"
     bind_port: int = 8000
     cloudflared_config_path: Path | None = None
+    runtime_discovery_enabled: bool = False
 
     def __post_init__(self) -> None:
         if not self.app_name.strip():
@@ -30,6 +31,8 @@ class Settings:
             raise ValueError("bind_host must not be empty")
         if not 1 <= self.bind_port <= 65_535:
             raise ValueError("bind_port must be between 1 and 65535")
+        if not isinstance(self.runtime_discovery_enabled, bool):
+            raise ValueError("runtime_discovery_enabled must be a boolean")
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Settings:
@@ -39,6 +42,7 @@ class Settings:
         mode = values.get("CFM_MODE", "development").strip().lower()
         port_value = values.get("CFM_BIND_PORT", "8000").strip()
         config_path = values.get("CFM_CLOUDFLARED_CONFIG_PATH", "").strip()
+        discovery_value = values.get("CFM_RUNTIME_DISCOVERY_ENABLED", "false")
 
         try:
             bind_port = int(port_value)
@@ -51,4 +55,17 @@ class Settings:
             bind_host=values.get("CFM_BIND_HOST", "127.0.0.1").strip(),
             bind_port=bind_port,
             cloudflared_config_path=Path(config_path) if config_path else None,
+            runtime_discovery_enabled=_strict_boolean(
+                discovery_value,
+                "CFM_RUNTIME_DISCOVERY_ENABLED",
+            ),
         )
+
+
+def _strict_boolean(value: str, variable: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ValueError(f"{variable} must be true or false")

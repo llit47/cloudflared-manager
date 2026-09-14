@@ -23,7 +23,10 @@ def dashboard(request: Request) -> HTMLResponse:
         name="dashboard.html",
         context={
             "settings": request.app.state.settings,
-            "dashboard": build_dashboard_view(request.app.state.settings),
+            "dashboard": build_dashboard_view(
+                request.app.state.settings,
+                discover_runtime=request.app.state.runtime_discovery,
+            ),
         },
     )
 
