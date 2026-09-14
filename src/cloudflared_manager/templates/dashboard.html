@@ -26,15 +26,15 @@
           <p class="eyebrow">Local tunnel control</p>
           <h1 id="page-title">Your tunnel, at a glance</h1>
           <p class="intro-copy">
-            Manage ingress routes and their DNS records from one place. Infrastructure
-            connections will appear here after they are configured in a future release.
+            Inspect configured hostname routes from one place. Management and
+            infrastructure operations will arrive in later reviewed releases.
           </p>
         </div>
         <div class="preview-note" role="status">
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M12 8v4m0 4h.01M10.3 3.84 2.2 18a2 2 0 0 0 1.74 3h16.12a2 2 0 0 0 1.74-3L13.7 3.84a2 2 0 0 0-3.4 0Z" />
           </svg>
-          <span><strong>Foundation preview</strong>No infrastructure connections are active.</span>
+          <span><strong>Read-only detection</strong>Existing routes are detected only and are not yet manager-owned.</span>
         </div>
       </section>
 
@@ -55,10 +55,10 @@
                   <path d="M5 17.5h13a3.5 3.5 0 0 0 .34-6.98A6.5 6.5 0 0 0 5.9 9 4.25 4.25 0 0 0 5 17.5Z" />
                 </svg>
               </span>
-              <span class="status-chip status-neutral"><span aria-hidden="true"></span>Not configured</span>
+              <span class="status-chip status-{{ dashboard.tunnel.tone }}"><span aria-hidden="true"></span>{{ dashboard.tunnel.label }}</span>
             </div>
             <h3>Tunnel</h3>
-            <p>No Cloudflare Tunnel connection has been configured.</p>
+            <p>{{ dashboard.tunnel.description }}</p>
           </article>
 
           <article class="status-card">
@@ -68,10 +68,10 @@
                   <path d="M8 6.5h8M7 10h10v8H7zM9.5 10V7m5 3V7M10 14h4" />
                 </svg>
               </span>
-              <span class="status-chip status-neutral"><span aria-hidden="true"></span>Not connected</span>
+              <span class="status-chip status-{{ dashboard.cloudflared.tone }}"><span aria-hidden="true"></span>{{ dashboard.cloudflared.label }}</span>
             </div>
             <h3>cloudflared</h3>
-            <p>Service health checks are not available in this release.</p>
+            <p>{{ dashboard.cloudflared.description }}</p>
           </article>
 
           <article class="status-card">
@@ -81,10 +81,10 @@
                   <path d="M7 3.5h7l4 4v13H7zM14 3.5v4h4M10 12h5m-5 4h5" />
                 </svg>
               </span>
-              <span class="status-chip status-neutral"><span aria-hidden="true"></span>Not configured</span>
+              <span class="status-chip status-{{ dashboard.configuration.tone }}"><span aria-hidden="true"></span>{{ dashboard.configuration.label }}</span>
             </div>
             <h3>Configuration</h3>
-            <p>No cloudflared configuration source is currently selected.</p>
+            <p>{{ dashboard.configuration.description }}</p>
           </article>
         </div>
       </section>
@@ -93,10 +93,10 @@
         <div class="section-heading services-heading">
           <div>
             <div class="heading-row">
-              <h2 id="services-heading">Managed Services</h2>
-              <span class="count-badge" aria-label="0 managed services">0</span>
+              <h2 id="services-heading">Detected ingress routes</h2>
+              <span class="count-badge" aria-label="{{ dashboard.route_count }} detected ingress routes">{{ dashboard.route_count }}</span>
             </div>
-            <p>Hostname routes explicitly managed by this application will appear here.</p>
+            <p>Hostname routes read from the configured file. Detection does not imply ownership or permission to modify them.</p>
           </div>
           <button class="primary-button" type="button" disabled title="Service management is coming in a future release">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
@@ -104,26 +104,57 @@
           </button>
         </div>
 
-        <div class="empty-state">
-          <span class="empty-illustration" aria-hidden="true">
-            <svg viewBox="0 0 64 64">
-              <rect x="9" y="12" width="46" height="36" rx="7" />
-              <path d="M17 22h18M17 29h30M17 36h22" />
-              <circle cx="48" cy="47" r="9" />
-              <path d="M48 43v8m-4-4h8" />
-            </svg>
-          </span>
-          <h3>No managed services yet</h3>
-          <p>Once service management is available, this is where you’ll add and monitor tunnel routes.</p>
-          <span class="coming-soon">Service actions coming in a later release</span>
-        </div>
+        {% if dashboard.routes %}
+          <ul class="route-list" aria-label="Detected ingress routes">
+            {% for route in dashboard.routes %}
+              <li class="route-row">
+                <div class="route-identity">
+                  <span class="route-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24">
+                      <circle cx="12" cy="12" r="8.5" />
+                      <path d="M3.5 12h17M12 3.5c2.2 2.3 3.3 5.1 3.3 8.5S14.2 18.2 12 20.5M12 3.5C9.8 5.8 8.7 8.6 8.7 12s1.1 6.2 3.3 8.5" />
+                    </svg>
+                  </span>
+                  <div>
+                    <h3>{{ route.hostname }}</h3>
+                    <span class="route-state"><span aria-hidden="true"></span>{{ route.status }}</span>
+                  </div>
+                </div>
+                <dl class="route-details">
+                  <div>
+                    <dt>Path</dt>
+                    <dd><code>{{ route.path }}</code></dd>
+                  </div>
+                  <div>
+                    <dt>Origin</dt>
+                    <dd><code>{{ route.service }}</code></dd>
+                  </div>
+                </dl>
+              </li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <div class="empty-state">
+            <span class="empty-illustration" aria-hidden="true">
+              <svg viewBox="0 0 64 64">
+                <rect x="9" y="12" width="46" height="36" rx="7" />
+                <path d="M17 22h18M17 29h30M17 36h22" />
+                <circle cx="48" cy="47" r="9" />
+                <path d="M48 43v8m-4-4h8" />
+              </svg>
+            </span>
+            <h3>{{ dashboard.empty_title }}</h3>
+            <p>{{ dashboard.empty_description }}</p>
+            <span class="coming-soon">Service actions coming in a later release</span>
+          </div>
+        {% endif %}
       </section>
     </main>
 
     <footer class="site-footer">
       <div class="page-width footer-inner">
         <span>{{ settings.app_name }}</span>
-        <span>LAN-only management foundation</span>
+        <span>LAN-only · read-only configuration detection</span>
       </div>
     </footer>
   </div>
