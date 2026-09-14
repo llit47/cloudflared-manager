@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+
+{% block body %}
+  <div class="app-shell">
+    <header class="site-header">
+      <div class="page-width header-inner">
+        <a class="brand" href="{{ url_for('dashboard') }}" aria-label="{{ settings.app_name }} dashboard">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="M6.4 17.5h11.3a3.3 3.3 0 0 0 .4-6.57A6.25 6.25 0 0 0 6.35 9.5 4 4 0 0 0 6.4 17.5Z" />
+              <path d="M8.5 17.5a3.75 3.75 0 0 1 7.18-1.52" />
+            </svg>
+          </span>
+          <span>{{ settings.app_name }}</span>
+        </a>
+        <span class="environment-badge">
+          <span class="environment-dot" aria-hidden="true"></span>
+          {{ settings.mode | capitalize }}
+        </span>
+      </div>
+    </header>
+
+    <main id="main-content" class="page-width main-content">
+      <section class="intro" aria-labelledby="page-title">
+        <div>
+          <p class="eyebrow">Local tunnel control</p>
+          <h1 id="page-title">Your tunnel, at a glance</h1>
+          <p class="intro-copy">
+            Manage ingress routes and their DNS records from one place. Infrastructure
+            connections will appear here after they are configured in a future release.
+          </p>
+        </div>
+        <div class="preview-note" role="status">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 8v4m0 4h.01M10.3 3.84 2.2 18a2 2 0 0 0 1.74 3h16.12a2 2 0 0 0 1.74-3L13.7 3.84a2 2 0 0 0-3.4 0Z" />
+          </svg>
+          <span><strong>Foundation preview</strong>No infrastructure connections are active.</span>
+        </div>
+      </section>
+
+      <section class="status-section" aria-labelledby="status-heading">
+        <div class="section-heading compact-heading">
+          <div>
+            <p class="eyebrow">System overview</p>
+            <h2 id="status-heading">Connection status</h2>
+          </div>
+          <span class="updated-label">Awaiting setup</span>
+        </div>
+
+        <div class="status-grid">
+          <article class="status-card">
+            <div class="status-card-top">
+              <span class="status-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24">
+                  <path d="M5 17.5h13a3.5 3.5 0 0 0 .34-6.98A6.5 6.5 0 0 0 5.9 9 4.25 4.25 0 0 0 5 17.5Z" />
+                </svg>
+              </span>
+              <span class="status-chip status-neutral"><span aria-hidden="true"></span>Not configured</span>
+            </div>
+            <h3>Tunnel</h3>
+            <p>No Cloudflare Tunnel connection has been configured.</p>
+          </article>
+
+          <article class="status-card">
+            <div class="status-card-top">
+              <span class="status-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24">
+                  <path d="M8 6.5h8M7 10h10v8H7zM9.5 10V7m5 3V7M10 14h4" />
+                </svg>
+              </span>
+              <span class="status-chip status-neutral"><span aria-hidden="true"></span>Not connected</span>
+            </div>
+            <h3>cloudflared</h3>
+            <p>Service health checks are not available in this release.</p>
+          </article>
+
+          <article class="status-card">
+            <div class="status-card-top">
+              <span class="status-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24">
+                  <path d="M7 3.5h7l4 4v13H7zM14 3.5v4h4M10 12h5m-5 4h5" />
+                </svg>
+              </span>
+              <span class="status-chip status-neutral"><span aria-hidden="true"></span>Not configured</span>
+            </div>
+            <h3>Configuration</h3>
+            <p>No cloudflared configuration source is currently selected.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="services-panel" aria-labelledby="services-heading">
+        <div class="section-heading services-heading">
+          <div>
+            <div class="heading-row">
+              <h2 id="services-heading">Managed Services</h2>
+              <span class="count-badge" aria-label="0 managed services">0</span>
+            </div>
+            <p>Hostname routes explicitly managed by this application will appear here.</p>
+          </div>
+          <button class="primary-button" type="button" disabled title="Service management is coming in a future release">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+            Add service
+          </button>
+        </div>
+
+        <div class="empty-state">
+          <span class="empty-illustration" aria-hidden="true">
+            <svg viewBox="0 0 64 64">
+              <rect x="9" y="12" width="46" height="36" rx="7" />
+              <path d="M17 22h18M17 29h30M17 36h22" />
+              <circle cx="48" cy="47" r="9" />
+              <path d="M48 43v8m-4-4h8" />
+            </svg>
+          </span>
+          <h3>No managed services yet</h3>
+          <p>Once service management is available, this is where you’ll add and monitor tunnel routes.</p>
+          <span class="coming-soon">Service actions coming in a later release</span>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="page-width footer-inner">
+        <span>{{ settings.app_name }}</span>
+        <span>LAN-only management foundation</span>
+      </div>
+    </footer>
+  </div>
+{% endblock %}

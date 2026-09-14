@@ -1,0 +1,46 @@
+# Local environment and configuration
+.env
+.env.*
+!.env.example
+.cloudflared/
+config.local.yml
+instance/
+local-data/
+
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage and build output
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+
+# Local persistence
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Certificates and cloudflared credentials
+*.pem
+*.key
+*.crt
+cert.pem
+credentials.json
+*-credentials.json
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*.swp
