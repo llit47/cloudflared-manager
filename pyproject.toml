@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cloudflared-manager"
+version = "0.1.0"
+description = "LAN-only web manager for Cloudflare Tunnel ingress and DNS routes"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "jinja2>=3.1,<4",
+    "uvicorn>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.28,<1",
+    "pytest>=8.3,<10",
+]
+
+[project.scripts]
+cloudflared-manager = "cloudflared_manager.main:run"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cloudflared_manager = [
+    "templates/*.html",
+    "static/css/*.css",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
