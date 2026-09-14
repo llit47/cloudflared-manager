@@ -3,15 +3,18 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient, Response
+import pytest
 
 from cloudflared_manager.cloudflared import CommandTimedOutError
 from cloudflared_manager.cloudflared.discovery import discover_cloudflared
 from cloudflared_manager.cloudflared.runtime import CommandResult, DiscoveryCommand
 from cloudflared_manager.config import Settings
 from cloudflared_manager.main import create_app
+from cloudflared_manager.web.presentation import build_dashboard_view
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "cloudflared" / "config.yml"
 FAKE_SECRET = "TEST_SECRET_MUST_NOT_LEAK"
+FAKE_TOKEN_FILE_PATH = "/nonexistent/test-token-file"
 
 
 def get_from_app(application: FastAPI, path: str) -> Response:
@@ -145,7 +148,19 @@ def test_healthz_returns_only_safe_monitoring_fields() -> None:
     }
 
 
-def test_dashboard_renders_sanitized_token_managed_runtime() -> None:
+@pytest.mark.parametrize(
+    ("token_argument", "sensitive_value"),
+    [
+        (f"--token {FAKE_SECRET}", FAKE_SECRET),
+        (f"--token={FAKE_SECRET}", FAKE_SECRET),
+        (f"--token-file {FAKE_TOKEN_FILE_PATH}", FAKE_TOKEN_FILE_PATH),
+        (f"--token-file={FAKE_TOKEN_FILE_PATH}", FAKE_TOKEN_FILE_PATH),
+    ],
+)
+def test_dashboard_renders_sanitized_token_managed_runtime(
+    token_argument: str,
+    sensitive_value: str,
+) -> None:
     class TokenServiceRunner:
         def run(
             self,
@@ -162,8 +177,8 @@ def test_dashboard_renders_sanitized_token_managed_runtime() -> None:
                         "SubState=running\n"
                         "MainPID=4242\n"
                         "ExecStart={ path=/opt/example/bin/cloudflared ; "
-                        "argv[]=/opt/example/bin/cloudflared tunnel run --token "
-                        f"{FAKE_SECRET} ; ignore_errors=no ; }}\n"
+                        "argv[]=/opt/example/bin/cloudflared tunnel run "
+                        f"{token_argument} ; ignore_errors=no ; }}\n"
                     ),
                     stderr="",
                 )
@@ -178,6 +193,10 @@ def test_dashboard_renders_sanitized_token_managed_runtime() -> None:
         executable_checker=lambda path: False,
     )
     settings = Settings(mode="test", runtime_discovery_enabled=True)
+    dashboard = build_dashboard_view(
+        settings,
+        discover_runtime=lambda enabled: runtime,
+    )
 
     response = get_from_app(
         create_app(settings, runtime_discovery=lambda enabled: runtime),
@@ -190,7 +209,9 @@ def test_dashboard_renders_sanitized_token_managed_runtime() -> None:
     assert "Token-managed mode detected" in response.text
     assert "Not configured" in response.text
     assert "No configuration selected" in response.text
-    assert FAKE_SECRET not in response.text
+    assert sensitive_value not in repr(runtime)
+    assert sensitive_value not in repr(dashboard)
+    assert sensitive_value not in response.text
     assert "ExecStart" not in response.text
     assert "/opt/example" not in response.text
 

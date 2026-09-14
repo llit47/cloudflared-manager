@@ -20,6 +20,7 @@ from cloudflared_manager.cloudflared.runtime import (
 )
 
 FAKE_SECRET = "TEST_SECRET_MUST_NOT_LEAK"
+FAKE_TOKEN_FILE_PATH = "/nonexistent/test-token-file"
 BIN_PATH = Path("/opt/example/bin/cloudflared")
 
 
@@ -350,6 +351,36 @@ def test_token_managed_service_discards_secret(token_arguments: str) -> None:
     assert result.management_mode is ManagementMode.REMOTE_TOKEN
     assert result.explicit_config_path is None
     assert FAKE_SECRET not in repr(result)
+
+
+@pytest.mark.parametrize(
+    "token_arguments",
+    [
+        f"tunnel run --token-file {FAKE_TOKEN_FILE_PATH}",
+        f"tunnel run --token-file={FAKE_TOKEN_FILE_PATH}",
+    ],
+)
+def test_token_file_managed_service_discards_path(token_arguments: str) -> None:
+    runner = FakeCommandRunner(
+        {
+            DiscoveryCommand.SYSTEMD_SHOW: command_result(
+                systemd_output(exec_start=exec_start(token_arguments))
+            ),
+            DiscoveryCommand.SYSTEMD_IS_ENABLED: command_result("enabled\n"),
+        }
+    )
+
+    result = discover_cloudflared(
+        True,
+        runner,
+        executable_finder=no_binary,
+        executable_checker=lambda path: False,
+    )
+
+    assert result is not None
+    assert result.management_mode is ManagementMode.REMOTE_TOKEN
+    assert result.explicit_config_path is None
+    assert FAKE_TOKEN_FILE_PATH not in repr(result)
 
 
 def test_unexpected_systemd_output_yields_unknown_safe_facts() -> None:

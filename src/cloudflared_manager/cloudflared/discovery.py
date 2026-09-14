@@ -257,7 +257,8 @@ def _parse_exec_start(raw_value: str) -> _ExecStartFacts:
         executable_path = _safe_cloudflared_path(arguments[0])
 
     has_token = any(
-        argument == "--token" or argument.startswith("--token=")
+        argument in {"--token", "--token-file"}
+        or argument.startswith(("--token=", "--token-file="))
         for argument in arguments
     )
     config_value = _flag_value(arguments, "--config")
