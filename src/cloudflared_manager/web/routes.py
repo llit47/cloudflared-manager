@@ -15,7 +15,7 @@ templates = Jinja2Templates(
 
 
 @router.get("/", response_class=HTMLResponse, name="dashboard")
-async def dashboard(request: Request) -> HTMLResponse:
+def dashboard(request: Request) -> HTMLResponse:
     """Render the read-only dashboard."""
 
     return templates.TemplateResponse(
