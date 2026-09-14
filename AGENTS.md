@@ -20,6 +20,25 @@ changes, configuration validation, and service restarts.
   the tunnel or a public listener by default. Treat LAN access as a network
   boundary, not as a substitute for application safeguards.
 
+## Maintainability and modularity
+
+- Give each module one coherent responsibility. Avoid monolithic files, god
+  objects, god modules, and route handlers that accumulate unrelated work;
+  split modules when their responsibilities diverge or they become difficult
+  to understand and maintain.
+- Keep HTTP routing, presentation/view models, cloudflared parsing, Cloudflare
+  API access, service control, persistence, and orchestration as separate
+  concerns. Business and infrastructure logic must not accumulate in FastAPI
+  route functions or Jinja templates.
+- Prefer small, composable components with explicit inputs and outputs. Keep
+  components with external side effects replaceable and independently
+  testable.
+- Do not overcorrect with dozens of meaningless tiny files or speculative
+  abstraction layers. Add a boundary when it supports a real responsibility.
+- Optimize architecture for future debugging, replacement, extension, and
+  targeted testing. New features should usually be possible without changing
+  unrelated subsystems.
+
 ## UI and UX
 
 - Build a polished, modern, clean, visually consistent interface rather than a

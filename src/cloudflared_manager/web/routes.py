@@ -6,6 +6,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
+from cloudflared_manager.web.presentation import build_dashboard_view
+
 router = APIRouter()
 templates = Jinja2Templates(
     directory=Path(__file__).parent.parent / "templates",
@@ -13,13 +15,16 @@ templates = Jinja2Templates(
 
 
 @router.get("/", response_class=HTMLResponse, name="dashboard")
-async def dashboard(request: Request) -> HTMLResponse:
-    """Render the honest, integration-free dashboard foundation."""
+def dashboard(request: Request) -> HTMLResponse:
+    """Render the read-only dashboard."""
 
     return templates.TemplateResponse(
         request=request,
         name="dashboard.html",
-        context={"settings": request.app.state.settings},
+        context={
+            "settings": request.app.state.settings,
+            "dashboard": build_dashboard_view(request.app.state.settings),
+        },
     )
 
 
