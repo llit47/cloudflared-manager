@@ -1,0 +1,102 @@
+# Agent guidance for cloudflared-manager
+
+These rules apply to the whole repository. This project is a small LAN-only web
+application for managing services on an existing, locally managed Cloudflare
+Tunnel. It replaces manual edits to `cloudflared` `config.yml`, DNS route
+changes, configuration validation, and service restarts.
+
+## Product and architecture
+
+- Use Python with FastAPI, server-rendered Jinja templates, and HTMX where it
+  helps. Avoid a heavy SPA unless its value is clear.
+- Keep the existing `cloudflared` configuration authoritative for active
+  ingress. Use SQLite only for manager-specific metadata and state; reconcile
+  stored state with the actual configuration rather than treating the database
+  as the source of active routes.
+- Keep Cloudflare API access, config parsing and mutation, system service
+  control, persistence, and HTTP/UI code separate. Put external side effects
+  behind interfaces that tests can replace with fakes.
+- Default the UI to LAN-only access. Do not expose the management UI through
+  the tunnel or a public listener by default. Treat LAN access as a network
+  boundary, not as a substitute for application safeguards.
+
+## UI and UX
+
+- Build a polished, modern, clean, visually consistent interface rather than a
+  generic admin prototype. Keep it lightweight and primarily server-rendered
+  with Jinja and HTMX; appearance alone does not justify a heavy SPA, large UI
+  framework, or icon library.
+- Make the UI responsive and usable on desktop and mobile. Support automatic
+  light and dark themes via `prefers-color-scheme`; design both intentionally
+  with strong contrast and readable status indicators.
+- Use semantic CSS variables/design tokens for colors, surfaces, borders, text,
+  success/warning/error states, spacing, and other shared visual primitives
+  so both themes remain consistent.
+- Show service status and dangerous actions with text or icons/labels as well
+  as color. Make Delete visually distinct and require confirmation.
+- Keep Add, Enable, Disable, Edit, and Delete easy to find without clutter.
+  Make tunnel, `cloudflared`, config health, and managed-service status clear
+  at a glance on the primary dashboard.
+- Favor accessibility, keyboard use, visible focus states, and sensible touch
+  targets. Avoid excessive animation, unnecessary effects, and dashboard
+  clutter.
+
+## Service behavior
+
+- **Add:** create an ingress rule and its required, explicitly managed DNS
+  record.
+- **Disable:** remove or deactivate the active ingress rule while retaining
+  enough local metadata and DNS state to enable it again easily.
+- **Enable:** restore the ingress rule without duplicating it or changing
+  unrelated records.
+- **Edit:** safely change hostname, origin, protocol, or port, reconciling
+  config and managed DNS as needed.
+- **Delete:** after explicit confirmation, remove the ingress rule, associated
+  manager state, and managed DNS record. Never infer that an unrelated record
+  is manager-owned.
+
+## Safety boundaries
+
+- Development and automated tests MUST NOT modify the real
+  `/etc/cloudflared/config.yml`. Use fixtures, temporary files, or an
+  explicitly configured test path; keep tests isolated from real DNS and
+  service-control operations.
+- Never commit Cloudflare API tokens, tunnel credentials, secret-bearing account
+  IDs, `.env` files, certificates, production configuration, or other real
+  credentials. Use least-privilege API tokens and OS permissions.
+- Never execute shell commands supplied by the UI. Implement system actions as
+  explicit allowlisted operations with controlled arguments; do not turn user
+  input into command text.
+- Treat production systemd/root/sudo access as a separately configured
+  deployment boundary. Do not assume it in development, and avoid running
+  Codex or the application as unrestricted root.
+- Safeguard destructive UI actions with explicit confirmation and server-side
+  checks. Limit DNS mutation to records positively identified as managed by
+  this application; leave all other zone records alone.
+- Preserve the terminal catch-all ingress rule (for example,
+  `http_status:404`). Place hostname rules before it, and preserve unrelated
+  ingress rules and config fields. Reject ambiguous or unsafe mutations rather
+  than guessing ownership.
+- Make configuration changes transactional where practical: read the current
+  file, make a backup, write a candidate safely, validate it with
+  `cloudflared`, then activate/restart and verify health. On activation failure,
+  restore the backup and previous working service state automatically. Handle
+  partial DNS/config failures with explicit compensation or a recoverable
+  reconciliation state; never report partial success as complete.
+
+## Engineering workflow
+
+- Keep modules small and responsibilities clear. Avoid dependencies without a
+  clear benefit, unrelated refactors, and silent scope expansion.
+- Add meaningful, deterministic tests for config mutation, catch-all ordering,
+  rollback, add/edit/enable/disable/delete semantics, ownership boundaries,
+  and dangerous edge cases. Use temporary directories and mocked external
+  services. Run relevant tests and checks before declaring work complete.
+- Update documentation when operational behavior changes. Report changes,
+  tests run, and remaining uncertainty clearly.
+- Do not develop features directly on `main`; create a focused branch for each
+  meaningful unit of work. Keep commits logically scoped. Inspect `git diff`
+  and `git status` before committing. Never commit secrets or production config,
+  force-push, or merge a PR without explicit user instruction.
+- PR descriptions should explain behavior, tests, risks, and deployment
+  implications.
