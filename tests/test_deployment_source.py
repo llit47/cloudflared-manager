@@ -1,6 +1,7 @@
 import io
 import json
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
 
@@ -9,6 +10,23 @@ import pytest
 from cloudflared_manager.deployment import bootstrap
 
 SHA = "b" * 40
+
+
+def test_install_handoff_imports_without_site_packages() -> None:
+    source_root = Path(__file__).parents[1] / "src"
+    script = (
+        f"import sys; sys.path.insert(0, {str(source_root)!r}); "
+        "import cloudflared_manager.deployment.cli"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def _archive(path: Path, *, unsafe_name: str | None = None) -> None:
