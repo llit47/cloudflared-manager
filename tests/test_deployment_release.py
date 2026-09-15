@@ -177,6 +177,80 @@ def test_existing_unmarked_install_root_is_rejected(tmp_path: Path) -> None:
     assert (paths.install_root / "unrelated").read_text() == "operator data\n"
 
 
+def test_existing_safe_releases_directory_is_accepted(tmp_path: Path) -> None:
+    paths = make_paths(tmp_path)
+    filesystem = ReleaseFilesystem(paths, owner=None)
+
+    filesystem.ensure_layout()
+    filesystem.ensure_layout()
+
+    assert paths.releases.is_dir()
+    assert not paths.releases.is_symlink()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "file", "writable"])
+def test_unsafe_releases_boundary_is_rejected_without_modification(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    paths = make_paths(tmp_path)
+    filesystem = ReleaseFilesystem(
+        paths,
+        owner=None,
+        process_runner=FakePreparationRunner(),
+    )
+    filesystem.ensure_layout()
+    paths.releases.rmdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if kind == "symlink":
+        paths.releases.symlink_to(outside, target_is_directory=True)
+    elif kind == "file":
+        paths.releases.write_text("unrelated\n", encoding="utf-8")
+    else:
+        paths.releases.mkdir()
+        paths.releases.chmod(0o777)
+
+    with pytest.raises(HostOperationError, match="releases directory is unsafe"):
+        filesystem.ensure_layout()
+
+    if kind == "symlink":
+        assert paths.releases.is_symlink()
+    elif kind == "file":
+        assert paths.releases.read_text() == "unrelated\n"
+    else:
+        assert paths.releases.stat().st_mode & 0o777 == 0o777
+
+
+def test_prepare_rejects_releases_symlink_before_touching_external_candidate(
+    tmp_path: Path,
+) -> None:
+    paths = make_paths(tmp_path)
+    filesystem = ReleaseFilesystem(
+        paths,
+        owner=None,
+        process_runner=FakePreparationRunner(),
+    )
+    filesystem.ensure_layout()
+    paths.releases.rmdir()
+    outside = tmp_path / "outside"
+    external_candidate = outside / NEW_SHA
+    external_candidate.mkdir(parents=True)
+    sentinel = external_candidate / "operator-data"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    paths.releases.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(HostOperationError, match="releases directory is unsafe"):
+        filesystem.prepare_release(
+            make_source(tmp_path / "candidate"),
+            NEW_SHA,
+            Path("/usr/bin/python3"),
+        )
+
+    assert sentinel.read_text() == "keep\n"
+    assert paths.releases.is_symlink()
+
+
 @pytest.mark.parametrize(
     "collision",
     ["unit", "stable-update", "stable-config", "update-link", "config-link"],

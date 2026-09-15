@@ -148,13 +148,20 @@ systemd protections including `NoNewPrivileges`, `PrivateTmp`,
 `PrivateDevices`, `ProtectHome`, `ProtectSystem=strict`, kernel/control-group
 protections, and a restricted address-family set.
 
-Installation and configuration are not considered successful merely because
-systemd started a process. They make bounded requests to the configured LAN
-address and require this exact health contract:
+`GET /healthz` is the minimal public monitoring endpoint. Its response contract
+remains exactly:
 
 ```json
 {"status":"ok","app":"cloudflared-manager"}
 ```
+
+Deployment transactions use the separate internal `GET /deployment-readiness`
+endpoint. Installation, update, and configuration success additionally require
+the readiness responder PID to match the systemd manager `MainPID`, require that
+`MainPID` to remain stable across verification, require the returned `config_id`
+to match the expected persisted runtime configuration, and confirm that the
+managed service remains active. The readiness response contains no paths,
+environment contents, command lines, or secrets.
 
 Runtime discovery is enabled in production. It performs only the read-only
 observations documented below. A systemd-discovered cloudflared configuration

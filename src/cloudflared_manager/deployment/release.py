@@ -118,7 +118,7 @@ class ReleaseFilesystem:
 
     def ensure_layout(self) -> None:
         self._ensure_install_root()
-        self._ensure_directory(self.paths.releases, 0o755)
+        self._ensure_owned_releases()
         self._ensure_directory(self.paths.config_root, 0o750)
         self._ensure_system_directory(self.paths.update_link.parent)
 
@@ -168,6 +168,7 @@ class ReleaseFilesystem:
     def prepare_release(self, source: Path, sha: str, python: Path) -> Path:
         """Build a release-local venv directly at its final immutable path."""
 
+        self._require_owned_releases()
         revision = validate_sha(sha)
         target = self.paths.release(revision)
         if not python.is_absolute() or not python.is_file() or not os.access(python, os.X_OK):
@@ -503,6 +504,36 @@ class ReleaseFilesystem:
             self.atomic_write(root / DEPLOYMENT_MARKER, DEPLOYMENT_MARKER_CONTENT, 0o644)
         except OSError as error:
             raise HostOperationError("The manager installation root could not be created.") from error
+
+    def _ensure_owned_releases(self) -> None:
+        releases = self.paths.releases
+        if not releases.exists() and not releases.is_symlink():
+            try:
+                releases.mkdir(mode=0o755, exist_ok=False)
+                os.chmod(releases, 0o755)
+                if self.owner is not None:
+                    os.chown(releases, self.owner[0], self.owner[1])
+            except OSError as error:
+                raise HostOperationError(
+                    "The manager releases directory could not be created safely."
+                ) from error
+        self._require_owned_releases()
+
+    def _require_owned_releases(self) -> None:
+        try:
+            metadata = self.paths.releases.lstat()
+        except OSError as error:
+            raise HostOperationError("The manager releases directory is unsafe.") from error
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_mode & 0o022
+            or (
+                self.owner is not None
+                and (metadata.st_uid, metadata.st_gid) != self.owner
+            )
+        ):
+            raise HostOperationError("The manager releases directory is unsafe.")
 
     @staticmethod
     def _ensure_system_directory(path: Path) -> None:
