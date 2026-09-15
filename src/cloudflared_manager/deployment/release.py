@@ -43,25 +43,48 @@ class PathSnapshot:
 class DeploymentLock:
     """Non-blocking advisory lock for the fixed update path."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, owner: tuple[int, int] | None = (0, 0)) -> None:
         self._path = path
+        self._owner = owner
         self._stream: BinaryIO | None = None
 
     def __enter__(self) -> DeploymentLock:
-        self._path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        parent_existed = self._path.parent.exists() or self._path.parent.is_symlink()
+        if not parent_existed:
+            try:
+                self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=False)
+                if self._owner is not None:
+                    os.chown(self._path.parent, *self._owner)
+            except OSError as error:
+                raise UpdateLockedError("The manager update lock directory is unavailable.") from error
         parent_metadata = self._path.parent.lstat()
-        if stat.S_ISLNK(parent_metadata.st_mode) or not stat.S_ISDIR(parent_metadata.st_mode):
+        if (
+            stat.S_ISLNK(parent_metadata.st_mode)
+            or not stat.S_ISDIR(parent_metadata.st_mode)
+            or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+            or (self._owner is not None and (
+                parent_metadata.st_uid, parent_metadata.st_gid
+            ) != self._owner)
+        ):
             raise UpdateLockedError("The manager update lock directory is unsafe.")
+        lock_existed = self._path.exists() or self._path.is_symlink()
         flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
         try:
             descriptor = os.open(self._path, flags, 0o600)
         except OSError as error:
             raise UpdateLockedError("The manager update lock is unavailable.") from error
         stream = os.fdopen(descriptor, "a+b")
-        os.fchmod(stream.fileno(), 0o600)
-        if os.geteuid() == 0:
-            os.fchown(stream.fileno(), 0, 0)
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+        metadata = os.fstat(stream.fileno())
+        if not lock_existed:
+            os.fchmod(stream.fileno(), 0o600)
+            if self._owner is not None:
+                os.fchown(stream.fileno(), *self._owner)
+            metadata = os.fstat(stream.fileno())
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or (self._owner is not None and (metadata.st_uid, metadata.st_gid) != self._owner)
+        ):
             stream.close()
             raise UpdateLockedError("The manager update lock is unsafe.")
         try:

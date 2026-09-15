@@ -120,7 +120,8 @@ class Installer:
             service_start_attempted = True
             self.service.start()
             verify_managed_health(
-                self.service, self.health, settings.bind_host, settings.bind_port
+                self.service, self.health, settings.bind_host, settings.bind_port,
+                settings.config_id,
             )
             enable_attempted = True
             self.service.enable()

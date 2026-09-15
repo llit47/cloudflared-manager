@@ -46,6 +46,11 @@ def test_systemd_mutation_surface_is_fixed_to_manager_unit(monkeypatch) -> None:
 
     def fake_run(arguments, **kwargs):
         calls.append(arguments)
+        if "--property=ActiveState,MainPID,NeedDaemonReload" in arguments:
+            return subprocess.CompletedProcess(
+                arguments, 0,
+                "ActiveState=active\nMainPID=1234\nNeedDaemonReload=no\n", ""
+            )
         return subprocess.CompletedProcess(arguments, 0, "LoadState=loaded\n", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -59,6 +64,7 @@ def test_systemd_mutation_surface_is_fixed_to_manager_unit(monkeypatch) -> None:
     manager.restart()
     manager.is_active()
     manager.is_enabled()
+    manager.runtime_state()
     manager.sanitized_status()
 
     assert calls == [
@@ -70,6 +76,13 @@ def test_systemd_mutation_surface_is_fixed_to_manager_unit(monkeypatch) -> None:
         ["/usr/bin/systemctl", "restart", MANAGER_UNIT],
         ["/usr/bin/systemctl", "is-active", "--quiet", MANAGER_UNIT],
         ["/usr/bin/systemctl", "is-enabled", "--quiet", MANAGER_UNIT],
+        [
+            "/usr/bin/systemctl",
+            "show",
+            MANAGER_UNIT,
+            "--no-pager",
+            "--property=ActiveState,MainPID,NeedDaemonReload",
+        ],
         [
             "/usr/bin/systemctl",
             "show",

@@ -4,6 +4,14 @@ import os
 from pathlib import Path
 
 from cloudflared_manager.deployment.paths import DeploymentPaths
+from cloudflared_manager.deployment.health import DeploymentReadiness
+from cloudflared_manager.runtime_identity import runtime_config_id
+
+
+def fake_readiness(
+    host: str, port: int, *, discovery: bool = True, pid: int = 1234
+) -> DeploymentReadiness:
+    return DeploymentReadiness(pid, runtime_config_id(host, port, discovery))
 
 
 def make_paths(root: Path) -> DeploymentPaths:
@@ -13,7 +21,7 @@ def make_paths(root: Path) -> DeploymentPaths:
         unit_path=root / "etc" / "systemd" / "system" / "cloudflared-manager.service",
         update_link=root / "usr" / "local" / "sbin" / "cfm-update",
         config_link=root / "usr" / "local" / "sbin" / "cfm-config",
-        lock_path=root / "run" / "lock" / "cloudflared-manager-update.lock",
+        runtime_root=root / "run" / "cloudflared-manager",
     )
 
 
@@ -66,9 +74,12 @@ class FakeService:
         self.states = ("loaded", "active", "running")
         self.active = active
         self.enabled = enabled
+        self.main_pid = 1234 if active else 0
+        self.needs_daemon_reload = False
 
     def daemon_reload(self) -> None:
         self.calls.append("daemon-reload")
+        self.needs_daemon_reload = False
 
     def enable(self) -> None:
         self.calls.append("enable")
@@ -81,14 +92,21 @@ class FakeService:
     def start(self) -> None:
         self.calls.append("start")
         self.active = True
+        self.main_pid = 1234
 
     def stop(self) -> None:
         self.calls.append("stop")
         self.active = False
+        self.main_pid = 0
 
     def restart(self) -> None:
         self.calls.append("restart")
         self.active = True
+        self.main_pid = 1234
+
+    def runtime_state(self):
+        from cloudflared_manager.deployment.service import ManagerRuntimeState
+        return ManagerRuntimeState(self.active, self.main_pid, self.needs_daemon_reload)
 
     def is_active(self) -> bool:
         self.calls.append("is-active")

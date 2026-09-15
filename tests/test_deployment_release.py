@@ -140,9 +140,9 @@ def test_current_symlink_switch_is_atomic_and_reversible(tmp_path: Path) -> None
 def test_update_lock_rejects_concurrent_owner(tmp_path: Path) -> None:
     lock_path = tmp_path / "update.lock"
 
-    with DeploymentLock(lock_path):
+    with DeploymentLock(lock_path, owner=None):
         with pytest.raises(UpdateLockedError):
-            with DeploymentLock(lock_path):
+            with DeploymentLock(lock_path, owner=None):
                 pass
 
 

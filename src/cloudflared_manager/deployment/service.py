@@ -22,6 +22,13 @@ class CommandOutput:
     stdout: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class ManagerRuntimeState:
+    active: bool
+    main_pid: int
+    needs_daemon_reload: bool
+
+
 class SystemdManager:
     """Expose only the systemd operations permitted for the manager unit."""
 
@@ -61,6 +68,35 @@ class SystemdManager:
     def is_enabled(self) -> bool:
         result = self._run(("is-enabled", "--quiet", MANAGER_UNIT))
         return result.returncode == 0
+
+    def runtime_state(self) -> ManagerRuntimeState:
+        result = self._run((
+            "show", MANAGER_UNIT, "--no-pager",
+            "--property=ActiveState,MainPID,NeedDaemonReload",
+        ))
+        values: dict[str, str] = {}
+        if result.returncode != 0:
+            raise HostOperationError("The manager systemd runtime state is unavailable.")
+        for line in result.stdout[:4096].splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key in {"ActiveState", "MainPID", "NeedDaemonReload"}:
+                values[key] = value.strip()
+        if set(values) != {"ActiveState", "MainPID", "NeedDaemonReload"}:
+            raise HostOperationError("The manager systemd runtime state is unavailable.")
+        pid = values["MainPID"]
+        reload_value = values["NeedDaemonReload"].lower()
+        active_value = values["ActiveState"].lower()
+        if (
+            not pid.isdecimal()
+            or reload_value not in {"yes", "no"}
+            or not _SAFE_STATE.fullmatch(active_value)
+        ):
+            raise HostOperationError("The manager systemd runtime state is invalid.")
+        return ManagerRuntimeState(
+            active=active_value == "active",
+            main_pid=int(pid),
+            needs_daemon_reload=reload_value == "yes",
+        )
 
     def sanitized_status(self) -> tuple[str | None, str | None, str | None]:
         result = self._run(

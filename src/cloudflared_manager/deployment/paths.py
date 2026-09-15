@@ -17,7 +17,7 @@ class DeploymentPaths:
     unit_path: Path = Path("/etc/systemd/system/cloudflared-manager.service")
     update_link: Path = Path("/usr/local/sbin/cfm-update")
     config_link: Path = Path("/usr/local/sbin/cfm-config")
-    lock_path: Path = Path("/run/lock/cloudflared-manager-update.lock")
+    runtime_root: Path = Path("/run/cloudflared-manager")
 
     @property
     def releases(self) -> Path:
@@ -30,6 +30,10 @@ class DeploymentPaths:
     @property
     def environment_file(self) -> Path:
         return self.config_root / "cloudflared-manager.env"
+
+    @property
+    def lock_path(self) -> Path:
+        return self.runtime_root / "update.lock"
 
     @property
     def stable_update(self) -> Path:

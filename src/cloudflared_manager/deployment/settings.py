@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from cloudflared_manager.deployment.environment import EnvironmentDocument
 from cloudflared_manager.deployment.errors import HostOperationError
 from cloudflared_manager.deployment.validation import validate_bind_host, validate_port
+from cloudflared_manager.runtime_identity import runtime_config_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -14,6 +15,12 @@ class ManagerSettings:
     bind_host: str
     bind_port: int
     runtime_discovery_enabled: bool
+
+    @property
+    def config_id(self) -> str:
+        return runtime_config_id(
+            self.bind_host, self.bind_port, self.runtime_discovery_enabled
+        )
 
 
 def complete_existing_environment(

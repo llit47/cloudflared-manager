@@ -18,7 +18,7 @@ from cloudflared_manager.deployment.errors import (
     RollbackError,
     TransactionFailedError,
 )
-from cloudflared_manager.deployment.health import wait_for_health
+from cloudflared_manager.deployment.health import wait_for_readiness
 from cloudflared_manager.deployment.identity import ensure_service_identity
 from cloudflared_manager.deployment.installer import Installer
 from cloudflared_manager.deployment.network import select_lan_address, validate_local_bind_address
@@ -301,8 +301,8 @@ def _print_install_summary(
     print("Commands: sudo cfm-config | sudo cfm-update")
 
 
-def _health(host: str, port: int) -> None:
-    wait_for_health(host, port)
+def _health(host: str, port: int) -> object:
+    return wait_for_readiness(host, port)
 
 
 def _require_root() -> None:

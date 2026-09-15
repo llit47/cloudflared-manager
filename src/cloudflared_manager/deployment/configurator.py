@@ -44,7 +44,19 @@ class Configurator:
         candidate = document.updated(updates)
         candidate_settings = settings_from_document(candidate)
         if candidate.render() == document.render():
-            return ConfigResult(changed=False, settings=previous_settings)
+            try:
+                verify_managed_health(
+                    self.service, self.health, previous_settings.bind_host,
+                    previous_settings.bind_port, previous_settings.config_id,
+                )
+                return ConfigResult(changed=False, settings=previous_settings)
+            except Exception:
+                self.service.restart()
+                verify_managed_health(
+                    self.service, self.health, previous_settings.bind_host,
+                    previous_settings.bind_port, previous_settings.config_id,
+                )
+                return ConfigResult(changed=True, settings=previous_settings)
 
         try:
             atomic_write_environment(
@@ -58,6 +70,7 @@ class Configurator:
                 self.health,
                 candidate_settings.bind_host,
                 candidate_settings.bind_port,
+                candidate_settings.config_id,
             )
             return ConfigResult(changed=True, settings=candidate_settings)
         except Exception as error:
@@ -73,6 +86,7 @@ class Configurator:
                     self.health,
                     previous_settings.bind_host,
                     previous_settings.bind_port,
+                    previous_settings.config_id,
                 )
             except Exception as rollback_error:
                 raise RollbackError(

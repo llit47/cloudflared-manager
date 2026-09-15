@@ -17,7 +17,13 @@ from cloudflared_manager.deployment.reconciliation import DeploymentReconciler
 from cloudflared_manager.deployment.release import ReleaseFilesystem
 from cloudflared_manager.deployment.settings import ManagerSettings
 from cloudflared_manager.deployment.updater import Updater
-from tests.deployment_support import FakePreparationRunner, FakeService, make_paths, make_source
+from tests.deployment_support import (
+    FakePreparationRunner,
+    FakeService,
+    fake_readiness,
+    make_paths,
+    make_source,
+)
 
 A_SHA = "a" * 40
 B_SHA = "b" * 40
@@ -51,7 +57,7 @@ def test_first_install_rejects_http_health_when_managed_service_is_inactive(
 
     service = FailedManagedStart(active=False)
     with pytest.raises(TransactionFailedError):
-        Installer(paths, filesystem, service, lambda host, port: None, lambda: None,
+        Installer(paths, filesystem, service, fake_readiness, lambda: None,
                   environment_owner=None).install(
             make_source(tmp_path / "candidate"), B_SHA, Path("/usr/bin/python3"),
             "192.168.1.20", 8000,
@@ -78,7 +84,7 @@ def test_update_rejects_http_health_when_candidate_service_is_inactive(
 
     service = FailedCandidateRestart()
     with pytest.raises(TransactionFailedError):
-        Updater(paths, filesystem, service, lambda host, port: None).update(
+        Updater(paths, filesystem, service, fake_readiness).update(
             make_source(tmp_path / "b", unit=b"B unit\n"), B_SHA, Path("/usr/bin/python3")
         )
     assert filesystem.read_current_sha() == A_SHA
@@ -102,7 +108,7 @@ def test_config_rejects_http_health_when_candidate_service_is_inactive(
 
     service = FailedCandidateRestart()
     with pytest.raises(TransactionFailedError):
-        Configurator(filesystem.paths, service, lambda host, port: None,
+        Configurator(filesystem.paths, service, fake_readiness,
                      environment_owner=None).apply({"CFM_BIND_PORT": "9000"})
     assert service.active is True
 
@@ -119,7 +125,7 @@ def test_reconciler_recovery_rejects_http_health_when_service_stays_inactive(
     service = FailedManagedStart(active=False)
     settings = ManagerSettings("192.168.1.20", 8000, True)
     with pytest.raises(TransactionFailedError):
-        DeploymentReconciler(filesystem, service, lambda host, port: None).reconcile(
+        DeploymentReconciler(filesystem, service, fake_readiness).reconcile(
             release, settings
         )
     assert service.active is False
@@ -147,6 +153,7 @@ def test_rollback_cannot_claim_health_when_http_succeeds_but_service_is_inactive
             transaction == "update" and filesystem.read_current_sha() == B_SHA
         ):
             raise HealthCheckError("candidate failed")
+        return fake_readiness(host, port)
 
     with pytest.raises(RollbackError):
         if transaction == "update":
@@ -208,6 +215,7 @@ def test_update_reconciles_current_unit_before_candidate_rollback_baseline(
         if filesystem.read_current_sha() == B_SHA:
             candidate_checks += 1
             raise HealthCheckError("B candidate failed")
+        return fake_readiness(host, port)
 
     with pytest.raises(TransactionFailedError):
         Updater(paths, filesystem, service, http_health).update(

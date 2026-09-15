@@ -33,12 +33,14 @@ class DeploymentReconciler:
     def reconcile(self, release: Path, settings: ManagerSettings) -> ReconcileResult:
         self.filesystem.validate_deployment_assets(release)
         unit_snapshot = self.filesystem.snapshot(self.filesystem.paths.unit_path)
-        was_active = self.service.is_active()
+        initial_runtime = self.service.runtime_state()
+        was_active = initial_runtime.active
         was_enabled = self.service.is_enabled()
         unit_install_attempted = False
         unit_install_completed = False
         unit_changed = False
         unit_reload_attempted = False
+        unit_repair_verified = False
         service_changed = False
         service_operation_attempted = False
         enable_attempted = False
@@ -46,7 +48,8 @@ class DeploymentReconciler:
             unit_install_attempted = True
             unit_changed = self.filesystem.install_unit(release)
             unit_install_completed = True
-            if unit_changed:
+            unit_sync_required = unit_changed or initial_runtime.needs_daemon_reload
+            if unit_sync_required:
                 unit_reload_attempted = True
                 self.service.daemon_reload()
                 service_operation_attempted = True
@@ -56,6 +59,7 @@ class DeploymentReconciler:
                     self.service.start()
                 service_changed = True
                 self._verify_health(settings)
+                unit_repair_verified = True
             elif not was_active:
                 service_operation_attempted = True
                 self.service.start()
@@ -85,7 +89,10 @@ class DeploymentReconciler:
                     self.service.disable()
                 except Exception as rollback_error:
                     rollback_errors.append(rollback_error)
-            if unit_changed or (unit_install_attempted and not unit_install_completed):
+            if (
+                not unit_repair_verified
+                and (unit_changed or (unit_install_attempted and not unit_install_completed))
+            ):
                 try:
                     self.filesystem.restore_snapshot(
                         self.filesystem.paths.unit_path,
@@ -109,7 +116,7 @@ class DeploymentReconciler:
                     "Manager deployment reconciliation failed and rollback was incomplete."
                 ) from error
             raise TransactionFailedError(
-                "Manager deployment reconciliation failed; prior manager state was restored."
+                "Manager deployment reconciliation failed after safe manager recovery."
             ) from error
 
     def _verify_health(self, settings: ManagerSettings) -> None:
@@ -118,4 +125,5 @@ class DeploymentReconciler:
             self.health,
             settings.bind_host,
             settings.bind_port,
+            settings.config_id,
         )
