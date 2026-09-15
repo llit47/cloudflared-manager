@@ -15,6 +15,7 @@ from cloudflared_manager.deployment.errors import (
     RollbackError,
     TransactionFailedError,
 )
+from cloudflared_manager.deployment.health import verify_managed_health
 from cloudflared_manager.deployment.paths import DeploymentPaths
 from cloudflared_manager.deployment.protocols import HealthVerifier, ManagerService
 from cloudflared_manager.deployment.reconciliation import DeploymentReconciler
@@ -118,7 +119,9 @@ class Installer:
             current_target = self.filesystem.switch_current(revision)
             service_start_attempted = True
             self.service.start()
-            self.health(settings.bind_host, settings.bind_port)
+            verify_managed_health(
+                self.service, self.health, settings.bind_host, settings.bind_port
+            )
             enable_attempted = True
             self.service.enable()
             self.filesystem.install_stable_administration(release)

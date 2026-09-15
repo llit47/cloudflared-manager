@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from cloudflared_manager.deployment.environment import atomic_write_environment, read_environment
 from cloudflared_manager.deployment.errors import RollbackError, TransactionFailedError
+from cloudflared_manager.deployment.health import verify_managed_health
 from cloudflared_manager.deployment.paths import DeploymentPaths
 from cloudflared_manager.deployment.protocols import HealthVerifier, ManagerService
 from cloudflared_manager.deployment.settings import ManagerSettings, settings_from_document
@@ -52,7 +53,12 @@ class Configurator:
                 owner=self.environment_owner,
             )
             self.service.restart()
-            self.health(candidate_settings.bind_host, candidate_settings.bind_port)
+            verify_managed_health(
+                self.service,
+                self.health,
+                candidate_settings.bind_host,
+                candidate_settings.bind_port,
+            )
             return ConfigResult(changed=True, settings=candidate_settings)
         except Exception as error:
             try:
@@ -62,7 +68,12 @@ class Configurator:
                     owner=self.environment_owner,
                 )
                 self.service.restart()
-                self.health(previous_settings.bind_host, previous_settings.bind_port)
+                verify_managed_health(
+                    self.service,
+                    self.health,
+                    previous_settings.bind_host,
+                    previous_settings.bind_port,
+                )
             except Exception as rollback_error:
                 raise RollbackError(
                     "Configuration failed and the previous manager configuration is not healthy."

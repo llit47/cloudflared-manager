@@ -11,6 +11,7 @@ from cloudflared_manager.deployment.errors import (
     RollbackError,
     TransactionFailedError,
 )
+from cloudflared_manager.deployment.health import verify_managed_health
 from cloudflared_manager.deployment.paths import DeploymentPaths
 from cloudflared_manager.deployment.protocols import HealthVerifier, ManagerService
 from cloudflared_manager.deployment.reconciliation import DeploymentReconciler
@@ -55,6 +56,11 @@ class Updater:
         if source is None:
             raise HostOperationError("The candidate source is required for an update.")
 
+        DeploymentReconciler(
+            self.filesystem,
+            self.service,
+            self.health,
+        ).reconcile(self.paths.release(previous_sha), settings)
         release = self.filesystem.prepare_release(source, revision, python)
         self.filesystem.validate_deployment_assets(release)
         previous_target = f"releases/{previous_sha}"
@@ -66,7 +72,9 @@ class Updater:
             self.service.daemon_reload()
             self.filesystem.switch_current(revision)
             self.service.restart()
-            self.health(settings.bind_host, settings.bind_port)
+            verify_managed_health(
+                self.service, self.health, settings.bind_host, settings.bind_port
+            )
             self.filesystem.install_stable_administration(release)
             return UpdateResult(sha=revision, changed=True)
         except Exception as error:
@@ -76,7 +84,9 @@ class Updater:
                 self.filesystem.restore_snapshot(self.paths.unit_path, unit_snapshot)
                 self.service.daemon_reload()
                 self.service.restart()
-                self.health(settings.bind_host, settings.bind_port)
+                verify_managed_health(
+                    self.service, self.health, settings.bind_host, settings.bind_port
+                )
             except Exception as rollback_error:
                 rollback_errors.append(rollback_error)
             if rollback_errors:

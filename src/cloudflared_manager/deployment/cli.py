@@ -62,7 +62,7 @@ def install_from_source(source: Path, sha: str, python: Path) -> int:
                     bind_host,
                     bind_port,
                 )
-            runtime = discover_cloudflared(True)
+            runtime = discover_cloudflared(result.settings.runtime_discovery_enabled)
         _print_install_summary(
             (
                 "reconciled"

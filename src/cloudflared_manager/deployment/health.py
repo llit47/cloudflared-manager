@@ -10,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from cloudflared_manager.deployment.errors import HealthCheckError
+from cloudflared_manager.deployment.protocols import HealthVerifier, ManagerService
 from cloudflared_manager.deployment.validation import validate_bind_host, validate_port
 
 EXPECTED_HEALTH = {"status": "ok", "app": "cloudflared-manager"}
@@ -23,6 +24,19 @@ class HealthResponse:
 
 
 HealthFetcher = Callable[[str, float], HealthResponse]
+
+
+def verify_managed_health(
+    service: ManagerService,
+    http_health: HealthVerifier,
+    bind_host: str,
+    bind_port: int,
+) -> None:
+    """Require both the HTTP contract and the managed systemd unit to be healthy."""
+
+    http_health(bind_host, bind_port)
+    if not service.is_active():
+        raise HealthCheckError("The managed Cloudflared Manager service is not active.")
 
 
 def wait_for_health(

@@ -92,7 +92,7 @@ def test_first_install_creates_environment_release_and_stable_commands(tmp_path:
     assert filesystem.read_current_sha() == NEW_SHA
     assert identities == ["created"]
     assert health == [("192.168.1.30", 8000)]
-    assert service.calls == ["daemon-reload", "start", "enable"]
+    assert service.calls == ["daemon-reload", "start", "is-active", "enable"]
     assert paths.stable_update.read_text().startswith("#!/bin/bash")
     assert paths.update_link.is_symlink()
     assert paths.stable_update.stat().st_mode & 0o777 == 0o755
@@ -164,7 +164,7 @@ def test_first_install_recovers_unit_written_before_current_switch(tmp_path: Pat
 
     assert result.sha == NEW_SHA
     assert filesystem.read_current_sha() == NEW_SHA
-    assert service.calls == ["daemon-reload", "start", "enable"]
+    assert service.calls == ["daemon-reload", "start", "is-active", "enable"]
     assert paths.stable_update.is_file()
     assert paths.stable_config.is_file()
     assert paths.update_link.is_symlink()
@@ -264,7 +264,7 @@ def test_installer_rerun_reconciles_complete_healthy_install_without_restart(
     assert result.changed is False
     assert identities == ["validated"]
     assert health == [("192.168.1.20", 8000)]
-    assert service.calls == ["is-active", "is-enabled"]
+    assert service.calls == ["is-active", "is-enabled", "is-active"]
     assert filesystem.read_current_sha() == OLD_SHA
 
 
@@ -285,7 +285,7 @@ def test_installer_rerun_repairs_missing_stable_scripts(tmp_path: Path) -> None:
 
     assert "old update" in paths.stable_update.read_text()
     assert "old config" in paths.stable_config.read_text()
-    assert service.calls == ["is-active", "is-enabled"]
+    assert service.calls == ["is-active", "is-enabled", "is-active"]
 
 
 def test_installer_rerun_repairs_missing_command_links(tmp_path: Path) -> None:
@@ -319,7 +319,7 @@ def test_installer_rerun_enables_manager_service_when_needed(tmp_path: Path) -> 
         environment_owner=None,
     ).reconcile()
 
-    assert service.calls == ["is-active", "is-enabled", "enable"]
+    assert service.calls == ["is-active", "is-enabled", "is-active", "enable"]
 
 
 def test_installer_rerun_repairs_missing_unit_and_starts_manager(tmp_path: Path) -> None:
@@ -338,7 +338,9 @@ def test_installer_rerun_repairs_missing_unit_and_starts_manager(tmp_path: Path)
     ).reconcile()
 
     assert paths.unit_path.read_bytes() == b"old unit\n"
-    assert service.calls == ["is-active", "is-enabled", "daemon-reload", "start"]
+    assert service.calls == [
+        "is-active", "is-enabled", "daemon-reload", "start", "is-active"
+    ]
     assert health == [("192.168.1.20", 8000)]
 
 
@@ -566,7 +568,7 @@ def test_reconciliation_does_not_restore_unchanged_unit_after_later_failure(
 
     assert restore_calls == []
     assert paths.unit_path.read_bytes() == prior_unit
-    assert service.calls == ["is-active", "is-enabled"]
+    assert service.calls == ["is-active", "is-enabled", "is-active"]
 
 
 def test_installer_refuses_unowned_current_collision(tmp_path: Path) -> None:
@@ -779,7 +781,7 @@ def test_update_same_sha_is_no_op(tmp_path: Path) -> None:
     )
 
     assert result.changed is False
-    assert service.calls == ["is-active", "is-enabled"]
+    assert service.calls == ["is-active", "is-enabled", "is-active"]
     assert checked == [("192.168.1.20", 8000)]
 
 
@@ -802,7 +804,7 @@ def test_update_same_sha_repairs_missing_stable_administration(tmp_path: Path) -
     assert paths.stable_config.exists()
     assert paths.update_link.is_symlink()
     assert paths.config_link.is_symlink()
-    assert service.calls == ["is-active", "is-enabled"]
+    assert service.calls == ["is-active", "is-enabled", "is-active"]
 
 
 def test_update_same_sha_replaces_stale_scripts_from_ready_retained_release(
@@ -830,7 +832,7 @@ def test_update_same_sha_replaces_stale_scripts_from_ready_retained_release(
     assert result.changed is True
     assert paths.stable_update.read_bytes() == (new_release / "deploy" / "update.sh").read_bytes()
     assert paths.stable_config.read_bytes() == (new_release / "deploy" / "config.sh").read_bytes()
-    assert service.calls == ["is-active", "is-enabled"]
+    assert service.calls == ["is-active", "is-enabled", "is-active"]
 
 
 def test_successful_update_switches_release_after_preflight_and_preserves_config(
@@ -846,6 +848,8 @@ def test_successful_update_switches_release_after_preflight_and_preserves_config
     service = FakeService()
 
     def health(host: str, port: int) -> None:
+        if filesystem.read_current_sha() == OLD_SHA:
+            return
         assert filesystem.read_current_sha() == NEW_SHA
         assert "old update" in paths.stable_update.read_text()
 
@@ -858,7 +862,10 @@ def test_successful_update_switches_release_after_preflight_and_preserves_config
     assert result.changed is True
     assert filesystem.read_current_sha() == NEW_SHA
     assert paths.environment_file.read_bytes() == previous_environment
-    assert service.calls == ["daemon-reload", "restart"]
+    assert service.calls == [
+        "is-active", "is-enabled", "is-active",
+        "daemon-reload", "restart", "is-active",
+    ]
     assert paths.unit_path.read_bytes() == b"new unit\n"
     assert "new update" in paths.stable_update.read_text()
     assert "new config" in paths.stable_config.read_text()
@@ -873,7 +880,8 @@ def test_update_reloads_unit_already_written_by_interrupted_attempt(tmp_path: Pa
     service = FakeService()
 
     def health(host: str, port: int) -> None:
-        assert service.calls == ["daemon-reload", "restart"]
+        if filesystem.read_current_sha() == OLD_SHA:
+            return
         assert filesystem.read_current_sha() == NEW_SHA
 
     result = Updater(paths, filesystem, service, health).update(
@@ -883,7 +891,10 @@ def test_update_reloads_unit_already_written_by_interrupted_attempt(tmp_path: Pa
     )
 
     assert result.changed is True
-    assert service.calls == ["daemon-reload", "restart"]
+    assert service.calls == [
+        "is-active", "is-enabled", "daemon-reload", "restart", "is-active",
+        "daemon-reload", "restart", "is-active",
+    ]
     assert paths.unit_path.read_bytes() == b"new unit\n"
 
 
@@ -896,7 +907,7 @@ def test_failed_candidate_health_restores_release_and_systemd_unit(tmp_path: Pat
     def health(host: str, port: int) -> None:
         nonlocal health_calls
         health_calls += 1
-        if health_calls == 1:
+        if filesystem.read_current_sha() == NEW_SHA:
             raise HealthCheckError("candidate failed")
 
     with pytest.raises(TransactionFailedError, match="restored"):
@@ -908,20 +919,31 @@ def test_failed_candidate_health_restores_release_and_systemd_unit(tmp_path: Pat
 
     assert filesystem.read_current_sha() == OLD_SHA
     assert paths.unit_path.read_bytes() == b"old unit\n"
-    assert service.calls == ["daemon-reload", "restart", "daemon-reload", "restart"]
-    assert health_calls == 2
+    assert service.calls == [
+        "is-active", "is-enabled", "is-active",
+        "daemon-reload", "restart", "daemon-reload", "restart", "is-active",
+    ]
+    assert health_calls == 3
 
 
 def test_failed_candidate_and_failed_rollback_health_are_distinct(tmp_path: Path) -> None:
     paths, filesystem = _installed(tmp_path)
     source = make_source(tmp_path / "new")
 
+    health_calls = 0
+
+    def health(host: str, port: int) -> None:
+        nonlocal health_calls
+        health_calls += 1
+        if health_calls > 1:
+            raise HealthCheckError("failed")
+
     with pytest.raises(RollbackError, match="could not be verified healthy"):
         Updater(
             paths,
             filesystem,
             FakeService(),
-            lambda host, port: (_ for _ in ()).throw(HealthCheckError("failed")),
+            health,
         ).update(source, NEW_SHA, Path("/usr/bin/python3"))
 
     assert filesystem.read_current_sha() == OLD_SHA
@@ -943,7 +965,7 @@ def test_config_change_restarts_and_preserves_unknown_content(tmp_path: Path) ->
     result = configurator.apply({"CFM_BIND_PORT": "9000"})
 
     assert result.changed is True
-    assert service.calls == ["restart"]
+    assert service.calls == ["restart", "is-active"]
     assert health == [("192.168.1.20", 9000)]
     assert "# custom\nFUTURE=keep\n" in paths.environment_file.read_text()
 
@@ -999,7 +1021,7 @@ def test_config_health_failure_restores_exact_previous_file(tmp_path: Path) -> N
         ).apply({"CFM_BIND_HOST": "10.0.0.8"})
 
     assert paths.environment_file.read_bytes() == previous
-    assert service.calls == ["restart", "restart"]
+    assert service.calls == ["restart", "restart", "is-active"]
     assert health_calls == 2
 
 

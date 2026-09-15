@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cloudflared_manager.deployment.errors import RollbackError, TransactionFailedError
+from cloudflared_manager.deployment.health import verify_managed_health
 from cloudflared_manager.deployment.protocols import HealthVerifier, ManagerService
 from cloudflared_manager.deployment.release import ReleaseFilesystem
 from cloudflared_manager.deployment.settings import ManagerSettings
@@ -54,20 +55,20 @@ class DeploymentReconciler:
                 else:
                     self.service.start()
                 service_changed = True
-                self.health(settings.bind_host, settings.bind_port)
+                self._verify_health(settings)
             elif not was_active:
                 service_operation_attempted = True
                 self.service.start()
                 service_changed = True
-                self.health(settings.bind_host, settings.bind_port)
+                self._verify_health(settings)
             else:
                 try:
-                    self.health(settings.bind_host, settings.bind_port)
+                    self._verify_health(settings)
                 except Exception:
                     service_operation_attempted = True
                     self.service.restart()
                     service_changed = True
-                    self.health(settings.bind_host, settings.bind_port)
+                    self._verify_health(settings)
 
             if not was_enabled:
                 enable_attempted = True
@@ -98,7 +99,7 @@ class DeploymentReconciler:
                 try:
                     if was_active:
                         self.service.restart()
-                        self.health(settings.bind_host, settings.bind_port)
+                        self._verify_health(settings)
                     else:
                         self.service.stop()
                 except Exception as rollback_error:
@@ -110,3 +111,11 @@ class DeploymentReconciler:
             raise TransactionFailedError(
                 "Manager deployment reconciliation failed; prior manager state was restored."
             ) from error
+
+    def _verify_health(self, settings: ManagerSettings) -> None:
+        verify_managed_health(
+            self.service,
+            self.health,
+            settings.bind_host,
+            settings.bind_port,
+        )
