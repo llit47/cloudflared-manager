@@ -553,6 +553,97 @@ def test_failed_first_install_health_rolls_back_manager_owned_state(tmp_path: Pa
     assert service.calls == ["daemon-reload", "start", "daemon-reload", "stop"]
 
 
+def test_failed_first_install_start_attempt_restores_inactive_service_and_files(
+    tmp_path: Path,
+) -> None:
+    paths, filesystem = _filesystem(tmp_path)
+    previous_environment = (
+        b"# retained before failed install\n"
+        b"CFM_APP_NAME=cloudflared-manager\n"
+        b"CFM_MODE=production\n"
+        b"CFM_BIND_HOST=192.168.1.30\n"
+        b"CFM_BIND_PORT=8000\n"
+        b"CFM_RUNTIME_DISCOVERY_ENABLED=true\n"
+    )
+    paths.environment_file.write_bytes(previous_environment)
+
+    class StartFailsAfterSideEffect(FakeService):
+        def start(self) -> None:
+            self.calls.append("start")
+            self.active = True
+            raise HostOperationError("manager start result was unavailable")
+
+    service = StartFailsAfterSideEffect(active=False, enabled=False)
+    installer = Installer(
+        paths,
+        filesystem,
+        service,
+        lambda host, port: (_ for _ in ()).throw(
+            AssertionError("failed start must not be health-checked")
+        ),
+        lambda: None,
+        environment_owner=None,
+    )
+
+    with pytest.raises(TransactionFailedError, match="changes were rolled back"):
+        installer.install(
+            make_source(tmp_path / "candidate"),
+            NEW_SHA,
+            Path("/usr/bin/python3"),
+            "192.168.1.30",
+            8000,
+        )
+
+    assert not paths.current.exists()
+    assert not paths.unit_path.exists()
+    assert paths.environment_file.read_bytes() == previous_environment
+    assert service.calls == ["daemon-reload", "start", "daemon-reload", "stop"]
+    assert service.active is False
+
+
+def test_failed_first_install_start_and_stop_reports_incomplete_rollback(
+    tmp_path: Path,
+) -> None:
+    paths, filesystem = _filesystem(tmp_path)
+    previous_environment = initial_environment("192.168.1.30", 8000).render().encode()
+    paths.environment_file.write_bytes(previous_environment)
+
+    class StartAndStopFailAfterSideEffects(FakeService):
+        def start(self) -> None:
+            self.calls.append("start")
+            self.active = True
+            raise HostOperationError("manager start result was unavailable")
+
+        def stop(self) -> None:
+            self.calls.append("stop")
+            raise HostOperationError("manager stop failed")
+
+    service = StartAndStopFailAfterSideEffects(active=False, enabled=False)
+    installer = Installer(
+        paths,
+        filesystem,
+        service,
+        lambda host, port: None,
+        lambda: None,
+        environment_owner=None,
+    )
+
+    with pytest.raises(RollbackError, match="rollback was incomplete"):
+        installer.install(
+            make_source(tmp_path / "candidate"),
+            NEW_SHA,
+            Path("/usr/bin/python3"),
+            "192.168.1.30",
+            8000,
+        )
+
+    assert not paths.current.exists()
+    assert not paths.unit_path.exists()
+    assert paths.environment_file.read_bytes() == previous_environment
+    assert service.calls == ["daemon-reload", "start", "daemon-reload", "stop"]
+    assert service.active is True
+
+
 def test_first_install_preserves_existing_environment_comments_and_values(
     tmp_path: Path,
 ) -> None:

@@ -103,7 +103,7 @@ class Installer:
         current_target: str | None = None
         unit_install_completed = False
         environment_attempted = False
-        service_started = False
+        service_start_attempted = False
         enable_attempted = False
         try:
             environment_attempted = True
@@ -116,8 +116,8 @@ class Installer:
             unit_install_completed = True
             self.service.daemon_reload()
             current_target = self.filesystem.switch_current(revision)
+            service_start_attempted = True
             self.service.start()
-            service_started = True
             self.health(settings.bind_host, settings.bind_port)
             enable_attempted = True
             self.service.enable()
@@ -140,7 +140,7 @@ class Installer:
                     self.service.daemon_reload()
             except Exception as rollback_error:
                 rollback_errors.append(rollback_error)
-            if service_started:
+            if service_start_attempted:
                 try:
                     self.service.stop()
                 except Exception as rollback_error:
