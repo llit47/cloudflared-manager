@@ -1,5 +1,6 @@
 """Routes for the dashboard shell and monitoring health check."""
 
+import os
 from pathlib import Path
 
 from fastapi import APIRouter, Request
@@ -36,3 +37,15 @@ async def health() -> dict[str, str]:
     """Return a minimal response that reveals no runtime configuration."""
 
     return {"status": "ok", "app": "cloudflared-manager"}
+
+
+@router.get("/deployment-readiness", name="deployment-readiness")
+async def deployment_readiness(request: Request) -> dict[str, str | int]:
+    """Return only the identity needed by local deployment transactions."""
+
+    return {
+        "status": "ready",
+        "app": "cloudflared-manager",
+        "pid": os.getpid(),
+        "config_id": request.app.state.settings.config_id,
+    }

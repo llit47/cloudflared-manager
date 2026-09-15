@@ -12,12 +12,15 @@ a server-rendered dashboard, a minimal health endpoint, isolated tests, and CI.
 When an explicit cloudflared configuration path is provided, the dashboard
 reads it and displays detected hostname ingress routes in read-only mode.
 Optional local runtime discovery can also report sanitized cloudflared binary
-and systemd service facts when it is explicitly enabled.
+and systemd service facts when it is explicitly enabled. A production
+deployment foundation installs immutable release-specific environments and
+runs the application as a dedicated unprivileged system user.
 
 Detected routes are existing configuration, not routes owned or managed by
 Cloudflared Manager. This version does **not** modify cloudflared configuration,
-contact the Cloudflare API, change DNS, control cloudflared or systemd, configure
+contact the Cloudflare API, change DNS, control `cloudflared.service`, configure
 sudo, persist ownership, or implement Add, Edit, Enable, Disable, or Delete.
+Deployment scripts control only `cloudflared-manager.service`.
 
 ## Architecture
 
@@ -34,13 +37,18 @@ layout:
   runtime discovery, and an allowlisted local command runner.
 - `cloudflared_manager.web` keeps thin HTTP routes separate from dashboard
   presentation models and server-rendered UI code.
+- `cloudflared_manager.deployment` separates exact-source bootstrap, input and
+  LAN validation, environment-file handling, release filesystem operations,
+  fixed systemd commands, health checks, and install/update/config transactions.
+- `install.sh` and `deploy/` provide the small root-facing bootstrap, stable
+  command wrappers, and hardened manager-only systemd unit.
 - `templates/` and `static/` define the accessible, responsive dashboard shell.
 - `tests/fixtures/cloudflared/config.yml` is entirely fake documentation and
   test input. The running application does not use it by default.
 
-Future configuration mutation, DNS, service-control, persistence, and
-transaction code will remain outside the HTTP and presentation layers. No
-speculative integration interfaces or empty database are included.
+Future cloudflared configuration mutation, DNS, cloudflared service-control,
+persistence, and transaction code will remain outside the HTTP and presentation
+layers. No speculative integration interfaces or empty database are included.
 
 ## Prerequisites
 
@@ -48,7 +56,213 @@ speculative integration interfaces or empty database are included.
 - `pip` and Python's `venv` module
 
 Cloudflare credentials, cloudflared, systemd, root access, and network access
-are not required to install or test this version.
+are not required for development installation or tests.
+
+## Production deployment
+
+Production deployment targets Linux hosts using systemd and Python 3.12 or
+newer. It creates one Cloudflared Manager installation. This release exposes
+only **READ-ONLY** capability; there is no hidden read/write switch and no
+Cloudflare API token is accepted or required.
+
+Install the current `main` revision non-interactively:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/llit47/cloudflared-manager/main/install.sh | sudo bash
+```
+
+The bootstrap resolves `main` through the public GitHub API, validates the
+result as an exact 40-character Git SHA, downloads the bootstrap and source
+archive for that immutable revision over HTTPS, rejects unsafe archive paths
+and entry types, then prepares the release. Git and a GitHub token are not
+required on the production host. The selected Python must already be version
+3.12 or newer and include `venv`; otherwise installation fails with an
+actionable message rather than installing an alternate Python distribution.
+
+Installation never prompts on stdin, because stdin carries the installer
+itself. It chooses the interface used by the lowest-metric IPv4 default route,
+then accepts the address only when exactly one global RFC1918 address is
+present on that interface. No address or multiple equally plausible addresses
+causes a safe failure. It never chooses `0.0.0.0`, loopback, link-local,
+multicast, or a public address.
+
+An administrator can supply a strictly validated private address and
+unprivileged port when automatic selection is unsuitable:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/llit47/cloudflared-manager/main/install.sh \
+  | sudo env CFM_INSTALL_BIND_HOST=192.168.1.20 CFM_INSTALL_BIND_PORT=8000 bash
+```
+
+An explicit address must also be present on a local global IPv4 interface at
+the time it is configured. It may belong to a secondary LAN interface and does
+not need to be on the default-route interface.
+
+The supported port range is 1024 through 65535. The installer does not add
+firewall rules or expose the manager through a Cloudflare Tunnel.
+
+### Production layout and identity
+
+| Path | Intended ownership/mode | Purpose |
+| --- | --- | --- |
+| `/opt/cloudflared-manager/` | `root:root`, `0755` | Root-owned deployment root |
+| `/opt/cloudflared-manager/releases/<sha>/` | `root:root`, no group/other writes | Exact source and release-local `.venv` |
+| `/opt/cloudflared-manager/current` | root-owned atomic symlink | Active immutable release |
+| `/opt/cloudflared-manager/update.sh` | `root:root`, `0755` | Stable updater |
+| `/opt/cloudflared-manager/config.sh` | `root:root`, `0755` | Stable configurator |
+| `/etc/cloudflared-manager/` | `root:root`, `0750` | Persistent manager configuration |
+| `/etc/cloudflared-manager/cloudflared-manager.env` | `root:root`, `0600` | systemd EnvironmentFile |
+| `/etc/systemd/system/cloudflared-manager.service` | `root:root`, `0644` | Manager service unit |
+| `/usr/local/sbin/cfm-update` | root-owned symlink | Stable update command |
+| `/usr/local/sbin/cfm-config` | root-owned symlink | Stable configuration command |
+
+The `cloudflared-manager` system user and group are system identities with
+home `/nonexistent`, a non-login shell, and no supplementary or privileged
+group membership. The service runs as this user. Application releases,
+deployment scripts, and persistent configuration remain root-owned and are
+not writable by the service process. Existing cloudflared users, groups,
+permissions, and files are never altered.
+
+For the supported Debian/Ubuntu deployment target, an existing identity must
+also use the conventional system-account UID/GID range below 1000. That
+numeric boundary is a platform assumption used to reject collisions with
+ordinary login accounts; the actual privilege boundary is the non-root,
+non-login identity with no supplementary groups and no writable deployment
+files.
+
+The EnvironmentFile initially contains only the application name, production
+mode, selected concrete bind address and port, and
+`CFM_RUNTIME_DISCOVERY_ENABLED=true`. It does not contain
+`CFM_CLOUDFLARED_CONFIG_PATH` or a Cloudflare token. Environment data is parsed
+as data and is never sourced or evaluated as shell code. Unknown keys and
+comments, including future secret-bearing assignments, are preserved opaquely
+by supported updates. This release does not interpret, print, request, or use
+those unknown values.
+
+### Service and health model
+
+`cloudflared-manager.service` starts the console entry point from
+`/opt/cloudflared-manager/current/.venv/` as the dedicated service user. The
+unit enables automatic restart on failure, removes all capabilities, and uses
+systemd protections including `NoNewPrivileges`, `PrivateTmp`,
+`PrivateDevices`, `ProtectHome`, `ProtectSystem=strict`, kernel/control-group
+protections, and a restricted address-family set.
+
+`GET /healthz` is the minimal public monitoring endpoint. Its response contract
+remains exactly:
+
+```json
+{"status":"ok","app":"cloudflared-manager"}
+```
+
+Deployment transactions use the separate internal `GET /deployment-readiness`
+endpoint. Installation, update, and configuration success additionally require
+the readiness responder PID to match the systemd manager `MainPID`, require that
+`MainPID` to remain stable across verification, require the returned `config_id`
+to match the expected persisted runtime configuration, and confirm that the
+managed service remains active. The readiness response contains no paths,
+environment contents, command lines, or secrets.
+
+Runtime discovery is enabled in production. It performs only the read-only
+observations documented below. A systemd-discovered cloudflared configuration
+path remains an observation: it is not placed in the manager EnvironmentFile,
+adopted, or read as YAML. Installer output reports only sanitized binary and
+service state, never raw `ExecStart`, tokens, token-file paths, credentials, or
+filesystem paths.
+
+### Administration
+
+Run the interactive configuration menu with:
+
+```bash
+sudo cfm-config
+```
+
+Automation-friendly commands are also available:
+
+```bash
+sudo cfm-config status
+sudo cfm-config set-bind 192.168.1.20
+sudo cfm-config set-port 8000
+sudo cfm-config discovery enable
+sudo cfm-config discovery disable
+```
+
+Status shows the bind address, port, runtime discovery setting, sanitized
+manager service state, **READ-ONLY** capability, and that Cloudflare API setup
+is unsupported. There are no API-token, account, zone, config-adoption, or
+read/write options.
+
+A changed setting is validated before any write. The configurator atomically
+replaces the manager EnvironmentFile, restarts only
+`cloudflared-manager.service`, and verifies `/healthz`. Failed health restores
+the exact previous file, restarts the manager, and verifies the restored
+configuration. The requested operation returns non-zero even when rollback
+succeeds; a failed rollback is reported distinctly. An unchanged value is a
+no-op and causes no restart.
+
+Update to the latest exact `main` revision with:
+
+```bash
+sudo cfm-update
+```
+
+The updater holds an advisory lock and resolves and validates the latest SHA.
+When that SHA is already active, it still verifies health and reconciles the
+manager unit, enablement, stable administration scripts, and command links
+from the active release; a complete deployment remains a no-op without a
+restart. Otherwise it downloads and validates the exact source archive,
+creates the candidate `.venv` directly in its final `releases/<sha>/`
+directory, installs dependencies, and runs an application preflight before
+switching `current` atomically. Every release has its own environment, and old
+releases are retained.
+
+If a candidate includes a changed manager unit, the old unit is retained for
+rollback. The updater installs the candidate unit, reloads systemd, switches
+the release, restarts only the manager, and checks actual health. Failure
+restores the prior release and unit, reloads systemd, restarts the prior
+manager, and verifies its health. Stable `update.sh` and `config.sh` files are
+replaced atomically only after candidate health succeeds, so a failed update
+keeps the previous administration tools. Persistent configuration is never
+replaced during update.
+
+The deployment root contains a fixed ownership marker. Installer reruns use a
+valid marked `current` release to repair an interrupted first installation
+without replacing operator EnvironmentFile values. They can also resume the
+narrow pre-`current` state where the requested release is ready and the unit on
+disk exactly matches that release. Existing unit, stable script, and
+command-link paths are replaced only when they are missing or can be matched to
+tracked assets from a ready retained manager release; unknown collisions are
+rejected. Install and update transactions reload systemd before switching
+`current`, including when an interrupted attempt already wrote the candidate
+unit and the bytes therefore appear unchanged on retry.
+
+No persistent transaction journal is present in this release. If power is lost
+after `current` switches but before candidate health is verified, the next
+installer or same-SHA updater validates and attempts to start the active
+release. If it is unhealthy, the operation fails without selecting an
+arbitrary older release. Automatic power-loss rollback to the precise prior
+release would require durable transaction metadata and remains deferred.
+
+Release-specific virtual environments preserve the dependency set of prior
+releases for rollback. Package installation uses isolated Python and pip modes
+with the public HTTPS PyPI index, but dependencies are not yet hash-locked;
+fresh builds are therefore not guaranteed to be bit-for-bit reproducible.
+
+Useful operational commands include:
+
+```bash
+sudo cfm-config status
+systemctl status cloudflared-manager.service
+journalctl -u cloudflared-manager.service
+```
+
+The deployment scripts never start, stop, restart, reload, enable, disable, or
+edit the existing `cloudflared.service`. They never modify anything under
+`/etc/cloudflared`, install cloudflared, call the Cloudflare API, modify DNS, or
+read tunnel tokens, token files, credential JSON, or `cert.pem`.
+
+An automated uninstaller is not included in this release.
 
 ## Local installation
 

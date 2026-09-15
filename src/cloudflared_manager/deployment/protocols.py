@@ -1,0 +1,35 @@
+"""Small interfaces shared by deployment transactions."""
+
+from collections.abc import Callable
+from typing import Protocol
+
+
+class ManagerRuntimeState(Protocol):
+    active: bool
+    main_pid: int
+    needs_daemon_reload: bool
+
+
+class ManagerService(Protocol):
+    def daemon_reload(self) -> None: ...
+
+    def enable(self) -> None: ...
+
+    def disable(self) -> None: ...
+
+    def start(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+    def restart(self) -> None: ...
+
+    def is_active(self) -> bool: ...
+
+    def is_enabled(self) -> bool: ...
+
+    def runtime_state(self) -> ManagerRuntimeState: ...
+
+    def sanitized_status(self) -> tuple[str | None, str | None, str | None]: ...
+
+
+HealthVerifier = Callable[[str, int], object]
