@@ -92,6 +92,27 @@ def test_root_python_and_pip_execution_use_isolated_mode() -> None:
     assert '"${manager_python}" -I -m' in config_wrapper
 
 
+def test_installer_exercises_real_pip_enabled_venv_before_download() -> None:
+    installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+    trap = "trap cleanup EXIT"
+    probe_path = 'venv_probe="${temporary_dir}/venv-probe"'
+    create = '"${python_path}" -I -m venv "${venv_probe}"'
+    verify_pip = '"${venv_probe}/bin/python" -I -m pip --version'
+    first_download = '"${curl_path}" --disable'
+
+    assert "venv --help" not in installer
+    assert "--without-pip" not in installer
+    assert installer.index(trap) < installer.index(probe_path)
+    assert installer.index(probe_path) < installer.index(create)
+    assert installer.index(create) < installer.index(verify_pip)
+    assert installer.index(verify_pip) < installer.index(first_download)
+    assert '"${rm_path}" -rf -- "${venv_probe}"' in installer
+    assert (
+        "the selected Python cannot create the required pip-enabled virtual environment; "
+        "install the matching distribution venv package"
+    ) in installer
+
+
 def test_installer_curl_disables_ambient_config_before_other_options() -> None:
     installer = (ROOT / "install.sh").read_text(encoding="utf-8")
     invocations = [

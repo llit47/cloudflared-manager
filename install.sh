@@ -37,7 +37,6 @@ if [[ -z ${python_path} ]]; then
     fi
 fi
 [[ -n ${python_path} ]] || fail 'Python 3.12 or newer is required; install it from your configured distribution repositories'
-"${python_path}" -I -m venv --help >/dev/null 2>&1 || fail 'the selected Python lacks venv support; install the matching distribution venv package'
 
 temporary_dir=$(${mktemp_path} -d -- /tmp/cloudflared-manager-install.XXXXXXXX) || fail 'could not create a temporary directory'
 cleanup() {
@@ -46,6 +45,13 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+
+venv_probe="${temporary_dir}/venv-probe"
+if ! "${python_path}" -I -m venv "${venv_probe}" >/dev/null 2>&1 \
+    || ! "${venv_probe}/bin/python" -I -m pip --version >/dev/null 2>&1; then
+    fail 'the selected Python cannot create the required pip-enabled virtual environment; install the matching distribution venv package'
+fi
+"${rm_path}" -rf -- "${venv_probe}"
 
 revision_json="${temporary_dir}/revision.json"
 "${curl_path}" --disable --fail --silent --show-error --location \
