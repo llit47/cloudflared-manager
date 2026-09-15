@@ -223,6 +223,7 @@ class ReleaseFilesystem:
             raise HostOperationError("The candidate release could not be prepared.") from error
 
     def read_current_sha(self, *, required: bool = True) -> str | None:
+        self._require_owned_releases()
         current = self.paths.current
         if not current.exists() and not current.is_symlink():
             if required:
@@ -638,6 +639,7 @@ class ReleaseFilesystem:
         )
 
     def _known_release_contents(self, relative: str) -> set[bytes]:
+        self._require_owned_releases()
         contents: set[bytes] = set()
         try:
             releases = tuple(self.paths.releases.iterdir())
@@ -660,6 +662,7 @@ class ReleaseFilesystem:
         return contents
 
     def _is_ready_release(self, path: Path, sha: str) -> bool:
+        self._require_owned_releases()
         marker_path = path / READY_MARKER
         executable = path / ".venv" / "bin" / "cloudflared-manager"
         try:
@@ -700,6 +703,7 @@ class ReleaseFilesystem:
         )
 
     def _remove_release(self, path: Path) -> None:
+        self._require_owned_releases()
         expected_parent = self.paths.releases.resolve()
         if path.is_symlink() or path.parent.resolve() != expected_parent:
             raise HostOperationError("Refusing to remove an unsafe release path.")

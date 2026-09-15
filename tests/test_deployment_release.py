@@ -252,6 +252,111 @@ def test_prepare_rejects_releases_symlink_before_touching_external_candidate(
 
 
 @pytest.mark.parametrize(
+    "operation",
+    [
+        "read-current",
+        "switch-current",
+        "restore-current",
+        "validate-assets",
+        "install-unit",
+        "install-administration",
+    ],
+)
+def test_existing_release_operations_reject_symlinked_releases_boundary(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    paths = make_paths(tmp_path)
+    filesystem = ReleaseFilesystem(
+        paths,
+        owner=None,
+        process_runner=FakePreparationRunner(),
+    )
+    filesystem.ensure_layout()
+    old_release = filesystem.prepare_release(
+        make_source(tmp_path / "old"),
+        OLD_SHA,
+        Path("/usr/bin/python3"),
+    )
+    new_source = make_source(tmp_path / "new")
+    (new_source / "deploy" / "cloudflared-manager.service").write_text(
+        "candidate unit must not be installed\n",
+        encoding="utf-8",
+    )
+    (new_source / "deploy" / "update.sh").write_text(
+        "#!/bin/sh\n# candidate script must not be installed\n",
+        encoding="utf-8",
+    )
+    filesystem.prepare_release(
+        new_source,
+        NEW_SHA,
+        Path("/usr/bin/python3"),
+    )
+    filesystem.switch_current(OLD_SHA)
+    filesystem.install_unit(old_release)
+    filesystem.install_stable_administration(old_release)
+    previous_unit = paths.unit_path.read_bytes()
+    previous_update = paths.stable_update.read_bytes()
+
+    external_releases = tmp_path / "external-releases"
+    paths.releases.rename(external_releases)
+    paths.releases.symlink_to(external_releases, target_is_directory=True)
+    sentinel = external_releases / "operator-data"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    external_new_release = paths.release(NEW_SHA)
+
+    operations = {
+        "read-current": lambda: filesystem.read_current_sha(),
+        "switch-current": lambda: filesystem.switch_current(NEW_SHA),
+        "restore-current": lambda: filesystem.restore_current(f"releases/{NEW_SHA}"),
+        "validate-assets": lambda: filesystem.validate_deployment_assets(
+            external_new_release
+        ),
+        "install-unit": lambda: filesystem.install_unit(external_new_release),
+        "install-administration": lambda: filesystem.install_stable_administration(
+            external_new_release
+        ),
+    }
+
+    with pytest.raises(HostOperationError, match="releases directory is unsafe"):
+        operations[operation]()
+
+    assert os.readlink(paths.current) == f"releases/{OLD_SHA}"
+    assert paths.unit_path.read_bytes() == previous_unit
+    assert paths.stable_update.read_bytes() == previous_update
+    assert sentinel.read_text() == "keep\n"
+
+
+@pytest.mark.parametrize("kind", ["file", "writable"])
+def test_read_current_rejects_other_unsafe_releases_boundaries(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    paths = make_paths(tmp_path)
+    filesystem = ReleaseFilesystem(
+        paths,
+        owner=None,
+        process_runner=FakePreparationRunner(),
+    )
+    filesystem.ensure_layout()
+    filesystem.prepare_release(
+        make_source(tmp_path / "release"),
+        NEW_SHA,
+        Path("/usr/bin/python3"),
+    )
+    filesystem.switch_current(NEW_SHA)
+
+    if kind == "file":
+        paths.releases.rename(tmp_path / "external-releases")
+        paths.releases.write_text("unrelated\n", encoding="utf-8")
+    else:
+        paths.releases.chmod(0o777)
+
+    with pytest.raises(HostOperationError, match="releases directory is unsafe"):
+        filesystem.read_current_sha()
+
+
+@pytest.mark.parametrize(
     "collision",
     ["unit", "stable-update", "stable-config", "update-link", "config-link"],
 )
