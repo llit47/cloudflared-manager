@@ -36,11 +36,13 @@ class DeploymentReconciler:
         was_enabled = self.service.is_enabled()
         unit_changed = False
         service_changed = False
+        service_operation_attempted = False
         enable_attempted = False
         try:
             unit_changed = self.filesystem.install_unit(release)
             if unit_changed:
                 self.service.daemon_reload()
+                service_operation_attempted = True
                 if was_active:
                     self.service.restart()
                 else:
@@ -48,6 +50,7 @@ class DeploymentReconciler:
                 service_changed = True
                 self.health(settings.bind_host, settings.bind_port)
             elif not was_active:
+                service_operation_attempted = True
                 self.service.start()
                 service_changed = True
                 self.health(settings.bind_host, settings.bind_port)
@@ -55,6 +58,7 @@ class DeploymentReconciler:
                 try:
                     self.health(settings.bind_host, settings.bind_port)
                 except Exception:
+                    service_operation_attempted = True
                     self.service.restart()
                     service_changed = True
                     self.health(settings.bind_host, settings.bind_port)
@@ -83,7 +87,7 @@ class DeploymentReconciler:
                     self.service.daemon_reload()
                 except Exception as rollback_error:
                     rollback_errors.append(rollback_error)
-            if service_changed:
+            if service_operation_attempted:
                 try:
                     if was_active:
                         self.service.restart()

@@ -16,7 +16,9 @@ from cloudflared_manager.deployment.errors import (
 )
 from cloudflared_manager.deployment.configurator import Configurator
 from cloudflared_manager.deployment.installer import Installer
+from cloudflared_manager.deployment.reconciliation import DeploymentReconciler
 from cloudflared_manager.deployment.release import ReleaseFilesystem
+from cloudflared_manager.deployment.settings import settings_from_document
 from cloudflared_manager.deployment.updater import Updater
 from tests.deployment_support import (
     FakePreparationRunner,
@@ -338,6 +340,153 @@ def test_installer_rerun_repairs_missing_unit_and_starts_manager(tmp_path: Path)
     assert paths.unit_path.read_bytes() == b"old unit\n"
     assert service.calls == ["is-active", "is-enabled", "daemon-reload", "start"]
     assert health == [("192.168.1.20", 8000)]
+
+
+def test_reconciliation_failed_changed_unit_restart_restores_prior_active_manager(
+    tmp_path: Path,
+) -> None:
+    paths, filesystem = _installed(tmp_path)
+    candidate = filesystem.prepare_release(
+        make_source(tmp_path / "new", unit=b"new unit\n"),
+        NEW_SHA,
+        Path("/usr/bin/python3"),
+    )
+    filesystem.switch_current(NEW_SHA)
+
+    class FailedFirstRestart(FakeService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_next_restart = True
+
+        def restart(self) -> None:
+            self.calls.append("restart")
+            if self.fail_next_restart:
+                self.fail_next_restart = False
+                self.active = False
+                raise HostOperationError("replacement manager restart failed")
+            self.active = True
+
+    service = FailedFirstRestart()
+    checked: list[tuple[str, int]] = []
+
+    def health(host: str, port: int) -> None:
+        assert paths.unit_path.read_bytes() == b"old unit\n"
+        assert service.calls == [
+            "is-active", "is-enabled", "daemon-reload", "restart",
+            "daemon-reload", "restart",
+        ]
+        checked.append((host, port))
+
+    settings = settings_from_document(read_environment(paths.environment_file)[0])
+    with pytest.raises(TransactionFailedError, match="prior manager state was restored"):
+        DeploymentReconciler(filesystem, service, health).reconcile(candidate, settings)
+
+    assert paths.unit_path.read_bytes() == b"old unit\n"
+    assert service.active is True
+    assert checked == [("192.168.1.20", 8000)]
+
+
+def test_reconciliation_failed_unhealthy_service_restart_restores_prior_active_state(
+    tmp_path: Path,
+) -> None:
+    paths, filesystem = _installed(tmp_path)
+
+    class FailedFirstRestart(FakeService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_next_restart = True
+
+        def restart(self) -> None:
+            self.calls.append("restart")
+            if self.fail_next_restart:
+                self.fail_next_restart = False
+                self.active = False
+                raise HostOperationError("recovery restart failed")
+            self.active = True
+
+    service = FailedFirstRestart()
+    health_calls = 0
+
+    def health(host: str, port: int) -> None:
+        nonlocal health_calls
+        health_calls += 1
+        if health_calls == 1:
+            raise HealthCheckError("manager is unhealthy")
+        assert service.calls == ["is-active", "is-enabled", "restart", "restart"]
+        assert service.active is True
+
+    settings = settings_from_document(read_environment(paths.environment_file)[0])
+    with pytest.raises(TransactionFailedError, match="prior manager state was restored"):
+        DeploymentReconciler(filesystem, service, health).reconcile(
+            paths.release(OLD_SHA), settings
+        )
+
+    assert health_calls == 2
+    assert service.active is True
+    assert paths.unit_path.read_bytes() == b"old unit\n"
+
+
+def test_reconciliation_reports_rollback_failure_if_prior_active_state_cannot_return(
+    tmp_path: Path,
+) -> None:
+    paths, filesystem = _installed(tmp_path)
+    candidate = filesystem.prepare_release(
+        make_source(tmp_path / "new", unit=b"new unit\n"),
+        NEW_SHA,
+        Path("/usr/bin/python3"),
+    )
+    filesystem.switch_current(NEW_SHA)
+
+    class AlwaysFailedRestart(FakeService):
+        def restart(self) -> None:
+            self.calls.append("restart")
+            self.active = False
+            raise HostOperationError("manager restart failed")
+
+    service = AlwaysFailedRestart()
+    settings = settings_from_document(read_environment(paths.environment_file)[0])
+
+    with pytest.raises(RollbackError, match="rollback was incomplete"):
+        DeploymentReconciler(
+            filesystem,
+            service,
+            lambda host, port: (_ for _ in ()).throw(
+                AssertionError("unrestored manager must not be health-checked")
+            ),
+        ).reconcile(candidate, settings)
+
+    assert paths.unit_path.read_bytes() == b"old unit\n"
+    assert service.calls == [
+        "is-active", "is-enabled", "daemon-reload", "restart",
+        "daemon-reload", "restart",
+    ]
+    assert service.active is False
+
+
+def test_reconciliation_failed_start_restores_prior_inactive_state(tmp_path: Path) -> None:
+    paths, filesystem = _installed(tmp_path)
+
+    class FailedStart(FakeService):
+        def start(self) -> None:
+            self.calls.append("start")
+            self.active = True
+            raise HostOperationError("manager start failed after being attempted")
+
+    service = FailedStart(active=False)
+    settings = settings_from_document(read_environment(paths.environment_file)[0])
+
+    def unexpected_health(host: str, port: int) -> None:
+        raise AssertionError("failed start must not be health-checked")
+
+    with pytest.raises(TransactionFailedError, match="prior manager state was restored"):
+        DeploymentReconciler(
+            filesystem,
+            service,
+            unexpected_health,
+        ).reconcile(paths.release(OLD_SHA), settings)
+
+    assert service.calls == ["is-active", "is-enabled", "start", "stop"]
+    assert service.active is False
 
 
 def test_installer_refuses_unowned_current_collision(tmp_path: Path) -> None:

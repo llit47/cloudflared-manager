@@ -161,8 +161,8 @@ def parse_all_global_addresses(output: str) -> tuple[str, ...]:
 
 
 def _is_unsuitable_explicit_interface(interface: str) -> bool:
-    """Exclude obvious local-only bridge/loopback interfaces from LAN overrides."""
+    """Exclude obvious local-only/container interfaces from LAN overrides."""
 
     return interface == "lo" or interface.startswith(
-        ("docker", "veth", "virbr", "podman", "br-")
+        ("docker", "veth", "virbr", "podman")
     )

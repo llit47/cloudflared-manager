@@ -88,6 +88,27 @@ def test_explicit_unassigned_rfc1918_override_is_rejected() -> None:
         select_lan_address(network, "10.20.30.40")
 
 
+@pytest.mark.parametrize("interface", ["br-lan", "br0"])
+def test_explicit_assigned_lan_bridge_address_is_accepted(interface: str) -> None:
+    network = FakeNetwork(
+        "",
+        f"3: {interface} inet 10.20.30.40/24 scope global {interface}\n",
+    )
+
+    assert select_lan_address(network, "10.20.30.40") == "10.20.30.40"
+
+
+@pytest.mark.parametrize("interface", ["docker0", "veth123", "virbr0", "podman0"])
+def test_explicit_container_or_local_only_interface_is_rejected(interface: str) -> None:
+    network = FakeNetwork(
+        "",
+        f"3: {interface} inet 10.20.30.40/24 scope global {interface}\n",
+    )
+
+    with pytest.raises(NetworkSelectionError, match="not assigned"):
+        select_lan_address(network, "10.20.30.40")
+
+
 def test_explicit_override_rejects_non_global_or_virtual_interface_address() -> None:
     network = FakeNetwork(
         "",
