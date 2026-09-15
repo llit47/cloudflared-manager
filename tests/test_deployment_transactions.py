@@ -489,6 +489,86 @@ def test_reconciliation_failed_start_restores_prior_inactive_state(tmp_path: Pat
     assert service.active is False
 
 
+def test_reconciliation_restores_unit_when_install_mutates_then_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths, filesystem = _installed(tmp_path)
+    prior_unit = paths.unit_path.read_bytes()
+    service = FakeService()
+    settings = settings_from_document(read_environment(paths.environment_file)[0])
+
+    def partially_install_unit(_release: Path) -> bool:
+        paths.unit_path.write_bytes(b"candidate unit\n")
+        raise HostOperationError("synthetic unit installation failure")
+
+    monkeypatch.setattr(filesystem, "install_unit", partially_install_unit)
+
+    with pytest.raises(TransactionFailedError, match="prior manager state was restored"):
+        DeploymentReconciler(filesystem, service, lambda host, port: None).reconcile(
+            paths.release(OLD_SHA), settings
+        )
+
+    assert paths.unit_path.read_bytes() == prior_unit
+    assert service.calls == ["is-active", "is-enabled"]
+
+
+def test_reconciliation_reports_failure_if_partial_unit_install_cannot_be_restored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths, filesystem = _installed(tmp_path)
+    service = FakeService()
+    settings = settings_from_document(read_environment(paths.environment_file)[0])
+
+    def partially_install_unit(_release: Path) -> bool:
+        paths.unit_path.write_bytes(b"candidate unit\n")
+        raise HostOperationError("synthetic unit installation failure")
+
+    def fail_restoration(_path: Path, _snapshot: object) -> None:
+        raise HostOperationError("synthetic snapshot restoration failure")
+
+    monkeypatch.setattr(filesystem, "install_unit", partially_install_unit)
+    monkeypatch.setattr(filesystem, "restore_snapshot", fail_restoration)
+
+    with pytest.raises(RollbackError, match="rollback was incomplete"):
+        DeploymentReconciler(filesystem, service, lambda host, port: None).reconcile(
+            paths.release(OLD_SHA), settings
+        )
+
+    assert paths.unit_path.read_bytes() == b"candidate unit\n"
+    assert service.calls == ["is-active", "is-enabled"]
+
+
+def test_reconciliation_does_not_restore_unchanged_unit_after_later_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths, filesystem = _installed(tmp_path)
+    service = FakeService()
+    settings = settings_from_document(read_environment(paths.environment_file)[0])
+    prior_unit = paths.unit_path.read_bytes()
+    restore_calls: list[Path] = []
+
+    monkeypatch.setattr(filesystem, "install_unit", lambda release: False)
+    monkeypatch.setattr(
+        filesystem,
+        "restore_snapshot",
+        lambda path, snapshot: restore_calls.append(path),
+    )
+
+    def fail_administration(_release: Path) -> bool:
+        raise HostOperationError("synthetic administration failure")
+
+    monkeypatch.setattr(filesystem, "install_stable_administration", fail_administration)
+
+    with pytest.raises(TransactionFailedError, match="prior manager state was restored"):
+        DeploymentReconciler(filesystem, service, lambda host, port: None).reconcile(
+            paths.release(OLD_SHA), settings
+        )
+
+    assert restore_calls == []
+    assert paths.unit_path.read_bytes() == prior_unit
+    assert service.calls == ["is-active", "is-enabled"]
+
+
 def test_installer_refuses_unowned_current_collision(tmp_path: Path) -> None:
     paths, filesystem = _installed(tmp_path)
     (paths.install_root / ".cloudflared-manager-owned").unlink()

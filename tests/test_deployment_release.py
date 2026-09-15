@@ -1,10 +1,16 @@
 import os
+import stat
 from pathlib import Path
 
 import pytest
 
 from cloudflared_manager.deployment.errors import HostOperationError, UpdateLockedError
-from cloudflared_manager.deployment.release import DeploymentLock, ReleaseFilesystem
+from cloudflared_manager.deployment.release import (
+    INCOMPLETE_MARKER,
+    READY_MARKER,
+    DeploymentLock,
+    ReleaseFilesystem,
+)
 from tests.deployment_support import FakePreparationRunner, make_paths, make_source
 
 OLD_SHA = "1" * 40
@@ -41,6 +47,75 @@ def test_release_venv_is_created_at_final_sha_path(tmp_path: Path) -> None:
     assert (release / ".release-ready").read_text().strip() == NEW_SHA
     assert release.stat().st_mode & 0o022 == 0
     assert (expected_venv / "bin" / "cloudflared-manager").stat().st_mode & 0o022 == 0
+
+
+def test_hardening_failure_cannot_publish_ready_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = make_paths(tmp_path)
+    filesystem = ReleaseFilesystem(
+        paths, owner=None, process_runner=FakePreparationRunner()
+    )
+    filesystem.ensure_layout()
+    source = make_source(tmp_path / "candidate")
+    target = paths.release(NEW_SHA)
+
+    def fail_hardening(_release: Path) -> None:
+        raise OSError("synthetic hardening failure")
+
+    monkeypatch.setattr(filesystem, "_harden_tree", fail_hardening)
+
+    with pytest.raises(HostOperationError, match="could not be prepared"):
+        filesystem.prepare_release(source, NEW_SHA, Path("/usr/bin/python3"))
+
+    assert not (target / READY_MARKER).exists()
+    assert filesystem._is_ready_release(target, NEW_SHA) is False
+    with pytest.raises(HostOperationError, match="not ready"):
+        filesystem.switch_current(NEW_SHA)
+    assert not paths.current.exists()
+
+
+def test_ready_marker_is_atomically_published_after_full_hardening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = make_paths(tmp_path)
+    filesystem = ReleaseFilesystem(
+        paths, owner=None, process_runner=FakePreparationRunner()
+    )
+    filesystem.ensure_layout()
+    events: list[str] = []
+    original_harden = filesystem._harden_tree
+    original_atomic_write = filesystem.atomic_write
+
+    def record_hardening(release: Path) -> None:
+        assert (release / INCOMPLETE_MARKER).exists()
+        assert not (release / READY_MARKER).exists()
+        original_harden(release)
+        events.append("hardened")
+
+    def record_atomic_write(path: Path, content: bytes, mode: int) -> None:
+        if path.name == READY_MARKER:
+            assert events == ["hardened"]
+            assert not (path.parent / INCOMPLETE_MARKER).exists()
+            assert content == (NEW_SHA + "\n").encode("ascii")
+            assert mode == 0o644
+            events.append("ready published")
+        original_atomic_write(path, content, mode)
+
+    monkeypatch.setattr(filesystem, "_harden_tree", record_hardening)
+    monkeypatch.setattr(filesystem, "atomic_write", record_atomic_write)
+
+    release = filesystem.prepare_release(
+        make_source(tmp_path / "candidate"), NEW_SHA, Path("/usr/bin/python3")
+    )
+
+    ready = release / READY_MARKER
+    metadata = ready.stat()
+    assert events == ["hardened", "ready published"]
+    assert ready.read_bytes() == (NEW_SHA + "\n").encode("ascii")
+    assert stat.S_IMODE(metadata.st_mode) == 0o644
+    assert (metadata.st_uid, metadata.st_gid) == (os.geteuid(), os.getegid())
+    assert filesystem._is_ready_release(release, NEW_SHA) is True
 
 
 def test_current_symlink_switch_is_atomic_and_reversible(tmp_path: Path) -> None:

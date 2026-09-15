@@ -34,13 +34,19 @@ class DeploymentReconciler:
         unit_snapshot = self.filesystem.snapshot(self.filesystem.paths.unit_path)
         was_active = self.service.is_active()
         was_enabled = self.service.is_enabled()
+        unit_install_attempted = False
+        unit_install_completed = False
         unit_changed = False
+        unit_reload_attempted = False
         service_changed = False
         service_operation_attempted = False
         enable_attempted = False
         try:
+            unit_install_attempted = True
             unit_changed = self.filesystem.install_unit(release)
+            unit_install_completed = True
             if unit_changed:
+                unit_reload_attempted = True
                 self.service.daemon_reload()
                 service_operation_attempted = True
                 if was_active:
@@ -78,13 +84,14 @@ class DeploymentReconciler:
                     self.service.disable()
                 except Exception as rollback_error:
                     rollback_errors.append(rollback_error)
-            if unit_changed:
+            if unit_changed or (unit_install_attempted and not unit_install_completed):
                 try:
                     self.filesystem.restore_snapshot(
                         self.filesystem.paths.unit_path,
                         unit_snapshot,
                     )
-                    self.service.daemon_reload()
+                    if unit_reload_attempted:
+                        self.service.daemon_reload()
                 except Exception as rollback_error:
                     rollback_errors.append(rollback_error)
             if service_operation_attempted:

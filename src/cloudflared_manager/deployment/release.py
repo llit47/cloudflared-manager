@@ -187,9 +187,13 @@ class ReleaseFilesystem:
             executable = venv / "bin" / "cloudflared-manager"
             if not executable.is_file() or not os.access(executable, os.X_OK):
                 raise HostOperationError("The candidate manager executable is missing.")
-            (target / INCOMPLETE_MARKER).unlink()
-            (target / READY_MARKER).write_text(revision + "\n", encoding="ascii")
             self._harden_tree(target)
+            (target / INCOMPLETE_MARKER).unlink()
+            self.atomic_write(
+                target / READY_MARKER,
+                (revision + "\n").encode("ascii"),
+                0o644,
+            )
             return target
         except (OSError, shutil.Error) as error:
             raise HostOperationError("The candidate release could not be prepared.") from error
