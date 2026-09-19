@@ -180,6 +180,89 @@ def test_applied_same_value_config_is_a_true_noop(tmp_path: Path) -> None:
     assert "restart" not in service.calls
 
 
+@pytest.mark.parametrize("corrective_failure", ["restart", "verification"])
+@pytest.mark.parametrize("recovery", ["healthy", "restart-failure", "wrong-pid", "wrong-config"])
+def test_unchanged_config_restart_failure_recovers_only_persisted_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corrective_failure: str,
+    recovery: str,
+) -> None:
+    paths = make_paths(tmp_path)
+    paths.config_root.mkdir(parents=True)
+    document = initial_environment("192.168.1.20", 8081).updated(
+        {"CFM_RUNTIME_DISCOVERY_ENABLED": "false"}
+    )
+    persisted = ("# preserve exactly\nFUTURE=opaque\n" + document.render()).encode()
+    paths.environment_file.write_bytes(persisted)
+    desired_id = config_id(port=8081, discovery=False)
+    service = RuntimeService()
+    events: list[str] = []
+    writes: list[object] = []
+    restart_count = 0
+    original_restart = service.restart
+
+    def reject_write(*args, **kwargs) -> None:
+        writes.append(args)
+        raise AssertionError("Unchanged configuration must never be written")
+
+    def restart() -> None:
+        nonlocal restart_count
+        restart_count += 1
+        events.append(f"restart-{restart_count}")
+        assert paths.environment_file.read_bytes() == persisted
+        original_restart()
+        if (restart_count == 1 and corrective_failure == "restart") or (
+            restart_count == 2 and recovery == "restart-failure"
+        ):
+            service.active = False
+            service.main_pid = 0
+            raise HostOperationError("Synthetic failure after service side effects")
+
+    def observe(host: str, port: int) -> DeploymentReadiness:
+        events.append(f"readiness-{restart_count}")
+        assert (host, port) == ("192.168.1.20", 8081)
+        assert paths.environment_file.read_bytes() == persisted
+        if restart_count < 2:
+            return readiness(identity=config_id())  # Old/unproven runtime A.
+        if recovery == "wrong-pid":
+            return readiness(pid=9999, identity=desired_id)
+        if recovery == "wrong-config":
+            return readiness(identity=config_id())
+        return readiness(pid=service.main_pid, identity=desired_id)
+
+    monkeypatch.setattr(service, "restart", restart)
+    monkeypatch.setattr(
+        "cloudflared_manager.deployment.configurator.atomic_write_environment",
+        reject_write,
+    )
+    expected_error = TransactionFailedError if recovery == "healthy" else RollbackError
+    expected_message = (
+        "corrective operation failed; the persisted configuration is healthy again"
+        if recovery == "healthy"
+        else "healthy operation using the persisted configuration could not be re-established"
+    )
+
+    with pytest.raises(expected_error, match=expected_message):
+        Configurator(paths, service, observe, environment_owner=None).apply(
+            {"CFM_BIND_PORT": "8081"}
+        )
+
+    expected_events = ["readiness-0", "restart-1"]
+    if corrective_failure == "verification":
+        expected_events.append("readiness-1")
+    expected_events.append("restart-2")
+    if recovery != "restart-failure":
+        expected_events.append("readiness-2")
+    assert events == expected_events
+    assert restart_count == 2
+    assert writes == []
+    assert paths.environment_file.read_bytes() == persisted
+    if recovery == "healthy":
+        assert service.active
+        assert service.calls[-2:] == ["runtime-state", "runtime-state"]
+
+
 @pytest.mark.parametrize("rollback_identity", ["pid", "config"])
 def test_config_rollback_requires_previous_runtime_identity(
     tmp_path: Path, rollback_identity: str

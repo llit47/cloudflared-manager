@@ -51,11 +51,29 @@ class Configurator:
                 )
                 return ConfigResult(changed=False, settings=previous_settings)
             except Exception:
-                self.service.restart()
-                verify_managed_health(
-                    self.service, self.health, previous_settings.bind_host,
-                    previous_settings.bind_port, previous_settings.config_id,
-                )
+                try:
+                    self.service.restart()
+                    verify_managed_health(
+                        self.service, self.health, previous_settings.bind_host,
+                        previous_settings.bind_port, previous_settings.config_id,
+                    )
+                except Exception as error:
+                    # The persisted settings remain authoritative for both attempts.
+                    try:
+                        self.service.restart()
+                        verify_managed_health(
+                            self.service, self.health, previous_settings.bind_host,
+                            previous_settings.bind_port, previous_settings.config_id,
+                        )
+                    except Exception as recovery_error:
+                        raise RollbackError(
+                            "The corrective operation failed; healthy operation using the "
+                            "persisted configuration could not be re-established."
+                        ) from recovery_error
+                    raise TransactionFailedError(
+                        "The corrective operation failed; the persisted configuration "
+                        "is healthy again."
+                    ) from error
                 return ConfigResult(changed=True, settings=previous_settings)
 
         try:
