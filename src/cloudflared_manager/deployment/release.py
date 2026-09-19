@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import ctypes
 import os
 import secrets
 import shutil
@@ -19,6 +20,7 @@ from cloudflared_manager.deployment.errors import (
     UpdateLockedError,
 )
 from cloudflared_manager.deployment.paths import DeploymentPaths
+from cloudflared_manager.deployment.environment import require_safe_environment
 from cloudflared_manager.deployment.validation import validate_sha
 
 READY_MARKER = ".release-ready"
@@ -301,6 +303,7 @@ class ReleaseFilesystem:
         if snapshot.kind == "missing":
             if path.is_symlink() or path.exists():
                 path.unlink()
+                self._sync_directory(path.parent)
             return
         if snapshot.kind == "symlink":
             if snapshot.target is None:
@@ -352,6 +355,15 @@ class ReleaseFilesystem:
         owned_root = self.paths.install_root.exists() or self.paths.install_root.is_symlink()
         if owned_root:
             self.require_owned_layout()
+
+        environment = self.paths.environment_file
+        if environment.exists() or environment.is_symlink():
+            if not owned_root or sha is None:
+                raise HostOperationError("First installation collides with an unowned environment file.")
+            revision = validate_sha(sha)
+            if not self._is_ready_release(self.paths.release(revision), revision):
+                raise HostOperationError("The existing environment has no prepared manager release.")
+            require_safe_environment(environment, owner=self.owner)
 
         unit_exists = self.paths.unit_path.exists() or self.paths.unit_path.is_symlink()
         if unit_exists:
@@ -482,8 +494,15 @@ class ReleaseFilesystem:
             raise HostOperationError("A manager command link could not be installed safely.") from error
 
     def _ensure_directory(self, path: Path, mode: int) -> None:
-        if path.is_symlink():
-            raise HostOperationError("A manager deployment directory is a symlink.")
+        if path.exists() or path.is_symlink():
+            metadata = path.lstat()
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_mode & 0o022
+                or (self.owner is not None and (metadata.st_uid, metadata.st_gid) != self.owner)
+            ):
+                raise HostOperationError("A manager deployment directory is unsafe.")
+            return
         path.mkdir(mode=mode, parents=True, exist_ok=True)
         metadata = path.lstat()
         if not stat.S_ISDIR(metadata.st_mode):
@@ -497,14 +516,42 @@ class ReleaseFilesystem:
         if root.exists() or root.is_symlink():
             self.require_owned_layout()
             return
+        temporary: Path | None = None
         try:
-            root.mkdir(mode=0o755, parents=True, exist_ok=False)
-            os.chmod(root, 0o755)
+            self._ensure_system_directory(root.parent)
+            metadata = root.parent.lstat()
+            if metadata.st_mode & 0o022 or (
+                self.owner is not None and (metadata.st_uid, metadata.st_gid) != self.owner
+            ):
+                raise HostOperationError("The manager installation parent is unsafe.")
+            temporary = Path(tempfile.mkdtemp(prefix=".cloudflared-manager.", dir=root.parent))
             if self.owner is not None:
-                os.chown(root, self.owner[0], self.owner[1])
-            self.atomic_write(root / DEPLOYMENT_MARKER, DEPLOYMENT_MARKER_CONTENT, 0o644)
+                os.chown(temporary, *self.owner)
+            self.atomic_write(temporary / DEPLOYMENT_MARKER, DEPLOYMENT_MARKER_CONTENT, 0o644)
+            os.chmod(temporary, 0o755)
+            self._sync_directory(temporary)
+            self._publish_install_root(temporary, root)
+            temporary = None
+            self._sync_directory(root.parent)
         except OSError as error:
             raise HostOperationError("The manager installation root could not be created.") from error
+        finally:
+            if temporary is not None and temporary.exists():
+                # Only this invocation's private staging directory is removable.
+                shutil.rmtree(temporary)
+
+    @staticmethod
+    def _publish_install_root(temporary: Path, root: Path) -> None:
+        """Linux atomic rename with RENAME_NOREPLACE: never replace a collision."""
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        rename = getattr(libc, "renameat2", None)
+        if rename is None:
+            raise HostOperationError("Atomic manager root publication is unavailable.")
+        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        if rename(-100, os.fsencode(temporary), -100, os.fsencode(root), 1) != 0:
+            raise OSError(ctypes.get_errno(), "Manager root publication failed")
 
     def _ensure_owned_releases(self) -> None:
         releases = self.paths.releases

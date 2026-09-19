@@ -10,6 +10,7 @@ from cloudflared_manager.deployment.environment import (
     atomic_write_environment,
     initial_environment,
     read_environment,
+    require_safe_environment,
 )
 from cloudflared_manager.deployment.errors import (
     RollbackError,
@@ -19,7 +20,7 @@ from cloudflared_manager.deployment.health import verify_managed_health
 from cloudflared_manager.deployment.paths import DeploymentPaths
 from cloudflared_manager.deployment.protocols import HealthVerifier, ManagerService
 from cloudflared_manager.deployment.reconciliation import DeploymentReconciler
-from cloudflared_manager.deployment.release import ReleaseFilesystem
+from cloudflared_manager.deployment.release import PathSnapshot, ReleaseFilesystem
 from cloudflared_manager.deployment.settings import (
     ManagerSettings,
     complete_existing_environment,
@@ -59,6 +60,7 @@ class Installer:
         """Repair a recognizable active installation without changing its configuration."""
 
         self.filesystem.require_owned_layout()
+        require_safe_environment(self.paths.environment_file, owner=self.environment_owner)
         self.ensure_identity()
         revision = self.filesystem.read_current_sha()
         document, _ = read_environment(self.paths.environment_file)
@@ -121,7 +123,7 @@ class Installer:
             self.service.start()
             verify_managed_health(
                 self.service, self.health, settings.bind_host, settings.bind_port,
-                settings.config_id,
+                settings.config_id, revision,
             )
             enable_attempted = True
             self.service.enable()
@@ -152,7 +154,9 @@ class Installer:
             if environment_attempted:
                 try:
                     if previous_environment is None:
-                        self.paths.environment_file.unlink(missing_ok=True)
+                        self.filesystem.restore_snapshot(
+                            self.paths.environment_file, PathSnapshot(kind="missing")
+                        )
                     else:
                         atomic_write_environment(
                             self.paths.environment_file,

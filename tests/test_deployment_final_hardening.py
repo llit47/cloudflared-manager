@@ -1,6 +1,7 @@
 """Frozen PR #5 deployment transaction regressions."""
 
 from pathlib import Path
+from functools import partial
 
 import pytest
 
@@ -27,6 +28,7 @@ from tests.deployment_support import (
 
 A_SHA = "a" * 40
 B_SHA = "b" * 40
+fake_readiness = partial(fake_readiness, release_id=A_SHA)
 
 
 def installed(tmp_path: Path) -> tuple[ReleaseFilesystem, Path]:
@@ -149,7 +151,7 @@ def test_rollback_cannot_claim_health_when_http_succeeds_but_service_is_inactive
     def http_health(host: str, port: int) -> None:
         nonlocal calls
         calls += 1
-        if (transaction == "config" and calls == 1) or (
+        if (transaction == "config" and calls == 2) or (
             transaction == "update" and filesystem.read_current_sha() == B_SHA
         ):
             raise HealthCheckError("candidate failed")

@@ -97,6 +97,28 @@ def initial_environment(bind_host: str, bind_port: int) -> EnvironmentDocument:
     )
 
 
+def require_safe_environment(path: Path, *, owner: tuple[int, int] | None) -> None:
+    """Validate owned configuration before reading it or changing any metadata."""
+
+    try:
+        parent = path.parent.lstat()
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_mode & 0o022
+            or (owner is not None and (parent.st_uid, parent.st_gid) != owner)
+        ):
+            raise EnvironmentFileError("The manager configuration directory is unsafe.")
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or (owner is not None and (metadata.st_uid, metadata.st_gid) != owner)
+        ):
+            raise EnvironmentFileError("The manager environment file has unsafe ownership or permissions.")
+    except OSError as error:
+        raise EnvironmentFileError("The manager environment file cannot be inspected safely.") from error
+
+
 def read_environment(path: Path) -> tuple[EnvironmentDocument, bytes]:
     """Read a small regular file without following a final symlink."""
 

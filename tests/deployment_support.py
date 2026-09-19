@@ -9,9 +9,9 @@ from cloudflared_manager.runtime_identity import runtime_config_id
 
 
 def fake_readiness(
-    host: str, port: int, *, discovery: bool = True, pid: int = 1234
+    host: str, port: int, *, discovery: bool = True, pid: int = 1234, release_id: str = "3" * 40
 ) -> DeploymentReadiness:
-    return DeploymentReadiness(pid, runtime_config_id(host, port, discovery))
+    return DeploymentReadiness(pid, runtime_config_id(host, port, discovery), release_id)
 
 
 def make_paths(root: Path) -> DeploymentPaths:

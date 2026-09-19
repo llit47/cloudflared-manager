@@ -9,6 +9,7 @@ from cloudflared_manager.deployment.errors import RollbackError, TransactionFail
 from cloudflared_manager.deployment.health import verify_managed_health
 from cloudflared_manager.deployment.paths import DeploymentPaths
 from cloudflared_manager.deployment.protocols import HealthVerifier, ManagerService
+from cloudflared_manager.deployment.release import ReleaseFilesystem
 from cloudflared_manager.deployment.settings import ManagerSettings, settings_from_document
 
 
@@ -43,11 +44,21 @@ class Configurator:
         previous_settings = settings_from_document(document)
         candidate = document.updated(updates)
         candidate_settings = settings_from_document(candidate)
+        filesystem = ReleaseFilesystem(self.paths, owner=self.environment_owner)
+        filesystem.require_owned_layout()
+        expected_release = filesystem.read_current_sha()
+        # A config-only operation must not adopt a pending release switch. Prove
+        # the running release first, allowing an unapplied persisted config.
+        verify_managed_health(
+            self.service, self.health, previous_settings.bind_host,
+            previous_settings.bind_port, None, expected_release,
+        )
         if candidate.render() == document.render():
             try:
                 verify_managed_health(
                     self.service, self.health, previous_settings.bind_host,
                     previous_settings.bind_port, previous_settings.config_id,
+                    expected_release,
                 )
                 return ConfigResult(changed=False, settings=previous_settings)
             except Exception:
@@ -56,6 +67,7 @@ class Configurator:
                     verify_managed_health(
                         self.service, self.health, previous_settings.bind_host,
                         previous_settings.bind_port, previous_settings.config_id,
+                        expected_release,
                     )
                 except Exception as error:
                     # The persisted settings remain authoritative for both attempts.
@@ -64,6 +76,7 @@ class Configurator:
                         verify_managed_health(
                             self.service, self.health, previous_settings.bind_host,
                             previous_settings.bind_port, previous_settings.config_id,
+                            expected_release,
                         )
                     except Exception as recovery_error:
                         raise RollbackError(
@@ -89,6 +102,7 @@ class Configurator:
                 candidate_settings.bind_host,
                 candidate_settings.bind_port,
                 candidate_settings.config_id,
+                expected_release,
             )
             return ConfigResult(changed=True, settings=candidate_settings)
         except Exception as error:
@@ -105,6 +119,7 @@ class Configurator:
                     previous_settings.bind_host,
                     previous_settings.bind_port,
                     previous_settings.config_id,
+                    expected_release,
                 )
             except Exception as rollback_error:
                 raise RollbackError(

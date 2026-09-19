@@ -58,21 +58,21 @@ class DeploymentReconciler:
                 else:
                     self.service.start()
                 service_changed = True
-                self._verify_health(settings)
+                self._verify_health(settings, release.name)
                 unit_repair_verified = True
             elif not was_active:
                 service_operation_attempted = True
                 self.service.start()
                 service_changed = True
-                self._verify_health(settings)
+                self._verify_health(settings, release.name)
             else:
                 try:
-                    self._verify_health(settings)
+                    self._verify_health(settings, release.name)
                 except Exception:
                     service_operation_attempted = True
                     self.service.restart()
                     service_changed = True
-                    self._verify_health(settings)
+                    self._verify_health(settings, release.name)
 
             if not was_enabled:
                 enable_attempted = True
@@ -106,7 +106,7 @@ class DeploymentReconciler:
                 try:
                     if was_active:
                         self.service.restart()
-                        self._verify_health(settings)
+                        self._verify_health(settings, release.name)
                     else:
                         self.service.stop()
                 except Exception as rollback_error:
@@ -119,11 +119,12 @@ class DeploymentReconciler:
                 "Manager deployment reconciliation failed after safe manager recovery."
             ) from error
 
-    def _verify_health(self, settings: ManagerSettings) -> None:
+    def _verify_health(self, settings: ManagerSettings, release_id: str) -> None:
         verify_managed_health(
             self.service,
             self.health,
             settings.bind_host,
             settings.bind_port,
             settings.config_id,
+            release_id,
         )

@@ -74,7 +74,7 @@ class Updater:
             self.service.restart()
             verify_managed_health(
                 self.service, self.health, settings.bind_host, settings.bind_port,
-                settings.config_id,
+                settings.config_id, revision,
             )
             self.filesystem.install_stable_administration(release)
             return UpdateResult(sha=revision, changed=True)
@@ -87,7 +87,7 @@ class Updater:
                 self.service.restart()
                 verify_managed_health(
                     self.service, self.health, settings.bind_host, settings.bind_port,
-                    settings.config_id,
+                    settings.config_id, previous_sha,
                 )
             except Exception as rollback_error:
                 rollback_errors.append(rollback_error)

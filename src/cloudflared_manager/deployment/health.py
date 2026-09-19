@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -14,7 +15,7 @@ from cloudflared_manager.deployment.protocols import HealthVerifier, ManagerServ
 from cloudflared_manager.deployment.validation import validate_bind_host, validate_port
 
 EXPECTED_HEALTH = {"status": "ok", "app": "cloudflared-manager"}
-EXPECTED_READINESS_KEYS = {"status", "app", "pid", "config_id"}
+EXPECTED_READINESS_KEYS = {"status", "app", "pid", "config_id", "release_id"}
 MAX_HEALTH_BYTES = 1024
 
 
@@ -31,6 +32,7 @@ HealthFetcher = Callable[[str, float], HealthResponse]
 class DeploymentReadiness:
     pid: int
     config_id: str
+    release_id: str
 
 
 def verify_managed_health(
@@ -38,10 +40,13 @@ def verify_managed_health(
     http_health: HealthVerifier,
     bind_host: str,
     bind_port: int,
-    expected_config_id: str,
+    expected_config_id: str | None,
+    expected_release_id: str,
 ) -> None:
     """Require both the HTTP contract and the managed systemd unit to be healthy."""
 
+    if re.fullmatch(r"[0-9a-f]{40}", expected_release_id) is None:
+        raise HealthCheckError("The expected manager release identity is invalid.")
     before = service.runtime_state()
     if not before.active or before.main_pid <= 0:
         raise HealthCheckError("The managed Cloudflared Manager service is not active.")
@@ -52,7 +57,8 @@ def verify_managed_health(
         or before.main_pid != after.main_pid
         or not isinstance(readiness, DeploymentReadiness)
         or readiness.pid != after.main_pid
-        or readiness.config_id != expected_config_id
+        or (expected_config_id is not None and readiness.config_id != expected_config_id)
+        or readiness.release_id != expected_release_id
     ):
         raise HealthCheckError("The managed Cloudflared Manager readiness identity is invalid.")
 
@@ -87,9 +93,11 @@ def wait_for_readiness(
                 and isinstance(payload["config_id"], str)
                 and len(payload["config_id"]) == 64
                 and all(character in "0123456789abcdef" for character in payload["config_id"])
+                and isinstance(payload["release_id"], str)
+                and re.fullmatch(r"[0-9a-f]{40}", payload["release_id"]) is not None
             )
             if valid:
-                return DeploymentReadiness(payload["pid"], payload["config_id"])
+                return DeploymentReadiness(payload["pid"], payload["config_id"], payload["release_id"])
         except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError):
             pass
         if attempt + 1 < attempts:

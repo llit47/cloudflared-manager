@@ -71,7 +71,7 @@ class RuntimeService(FakeService):
 
 
 def readiness(pid: int = 1234, identity: str | None = None) -> DeploymentReadiness:
-    return DeploymentReadiness(pid, identity or config_id())
+    return DeploymentReadiness(pid, identity or config_id(), SHA)
 
 
 def installed(tmp_path: Path) -> tuple[ReleaseFilesystem, Path]:
@@ -100,6 +100,7 @@ def test_application_has_separate_pid_and_config_bound_deployment_readiness() ->
     assert response.json() == {
         "status": "ready", "app": "cloudflared-manager", "pid": os.getpid(),
         "config_id": config_id("127.0.0.1", 8000, False),
+        "release_id": None,
     }
 
 
@@ -119,14 +120,14 @@ def test_managed_verifier_rejects_wrong_responder_or_runtime_identity(
     with pytest.raises(HealthCheckError):
         verify_managed_health(
             service, lambda host, port: readiness(responder_pid, responder_id),
-            "192.168.1.20", 8000, config_id(),
+            "192.168.1.20", 8000, config_id(), SHA,
         )
 
 
 def test_managed_verifier_accepts_stable_pid_and_matching_config() -> None:
     service = RuntimeService()
     verify_managed_health(
-        service, lambda host, port: readiness(), "192.168.1.20", 8000, config_id()
+        service, lambda host, port: readiness(), "192.168.1.20", 8000, config_id(), SHA
     )
     assert service.calls == ["runtime-state", "runtime-state"]
 
@@ -188,8 +189,8 @@ def test_unchanged_config_restart_failure_recovers_only_persisted_settings(
     corrective_failure: str,
     recovery: str,
 ) -> None:
-    paths = make_paths(tmp_path)
-    paths.config_root.mkdir(parents=True)
+    filesystem, _ = installed(tmp_path)
+    paths = filesystem.paths
     document = initial_environment("192.168.1.20", 8081).updated(
         {"CFM_RUNTIME_DISCOVERY_ENABLED": "false"}
     )
@@ -248,7 +249,7 @@ def test_unchanged_config_restart_failure_recovers_only_persisted_settings(
             {"CFM_BIND_PORT": "8081"}
         )
 
-    expected_events = ["readiness-0", "restart-1"]
+    expected_events = ["readiness-0", "readiness-0", "restart-1"]
     if corrective_failure == "verification":
         expected_events.append("readiness-1")
     expected_events.append("restart-2")
@@ -275,6 +276,8 @@ def test_config_rollback_requires_previous_runtime_identity(
         nonlocal calls
         calls += 1
         if calls == 1:
+            return readiness()
+        if calls == 2:
             raise HealthCheckError("candidate failed")
         if rollback_identity == "pid":
             return readiness(pid=9999)

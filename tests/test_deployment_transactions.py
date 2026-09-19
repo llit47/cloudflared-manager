@@ -75,7 +75,7 @@ def test_first_install_creates_environment_release_and_stable_commands(tmp_path:
         paths,
         filesystem,
         service,
-        lambda host, port: (health.append((host, port)) or fake_readiness(host, port)),
+        lambda host, port: (health.append((host, port)) or fake_readiness(host, port, release_id=NEW_SHA)),
         lambda: identities.append("created"),
         environment_owner=None,
     )
@@ -152,7 +152,7 @@ def test_first_install_recovers_unit_written_before_current_switch(tmp_path: Pat
         paths,
         filesystem,
         service,
-        fake_readiness,
+        lambda host, port: fake_readiness(host, port, release_id=NEW_SHA),
         lambda: None,
         environment_owner=None,
     ).install(
@@ -379,7 +379,7 @@ def test_reconciliation_failed_changed_unit_restart_restores_prior_active_manage
             "daemon-reload", "restart",
         ]
         checked.append((host, port))
-        return fake_readiness(host, port)
+        return fake_readiness(host, port, release_id=NEW_SHA)
 
     settings = settings_from_document(read_environment(paths.environment_file)[0])
     with pytest.raises(TransactionFailedError, match="safe manager recovery"):
@@ -642,6 +642,7 @@ def test_failed_first_install_start_attempt_restores_inactive_service_and_files(
     tmp_path: Path,
 ) -> None:
     paths, filesystem = _filesystem(tmp_path)
+    filesystem.prepare_release(make_source(tmp_path / "prepared"), NEW_SHA, Path("/usr/bin/python3"))
     previous_environment = (
         b"# retained before failed install\n"
         b"CFM_APP_NAME=cloudflared-manager\n"
@@ -651,6 +652,7 @@ def test_failed_first_install_start_attempt_restores_inactive_service_and_files(
         b"CFM_RUNTIME_DISCOVERY_ENABLED=true\n"
     )
     paths.environment_file.write_bytes(previous_environment)
+    paths.environment_file.chmod(0o600)
 
     class StartFailsAfterSideEffect(FakeService):
         def start(self) -> None:
@@ -690,8 +692,10 @@ def test_failed_first_install_start_and_stop_reports_incomplete_rollback(
     tmp_path: Path,
 ) -> None:
     paths, filesystem = _filesystem(tmp_path)
+    filesystem.prepare_release(make_source(tmp_path / "prepared"), NEW_SHA, Path("/usr/bin/python3"))
     previous_environment = initial_environment("192.168.1.30", 8000).render().encode()
     paths.environment_file.write_bytes(previous_environment)
+    paths.environment_file.chmod(0o600)
 
     class StartAndStopFailAfterSideEffects(FakeService):
         def start(self) -> None:
@@ -733,6 +737,7 @@ def test_first_install_preserves_existing_environment_comments_and_values(
     tmp_path: Path,
 ) -> None:
     paths, filesystem = _filesystem(tmp_path)
+    filesystem.prepare_release(make_source(tmp_path / "prepared"), NEW_SHA, Path("/usr/bin/python3"))
     existing = (
         "# retained operator note\n"
         "FUTURE_OPTION=retained\n"
@@ -743,12 +748,13 @@ def test_first_install_preserves_existing_environment_comments_and_values(
         "CFM_RUNTIME_DISCOVERY_ENABLED=false\n"
     )
     paths.environment_file.write_text(existing, encoding="utf-8")
+    paths.environment_file.chmod(0o600)
     service = FakeService()
     installer = Installer(
         paths,
         filesystem,
         service,
-        lambda host, port: fake_readiness(host, port, discovery=False),
+        lambda host, port: fake_readiness(host, port, discovery=False, release_id=NEW_SHA),
         lambda: None,
         environment_owner=None,
     )
@@ -826,7 +832,7 @@ def test_update_same_sha_replaces_stale_scripts_from_ready_retained_release(
     filesystem.switch_current(NEW_SHA)
     service = FakeService()
 
-    result = Updater(paths, filesystem, service, fake_readiness).update(
+    result = Updater(paths, filesystem, service, lambda host, port: fake_readiness(host, port, release_id=NEW_SHA)).update(
         None,
         NEW_SHA,
         Path("/usr/bin/python3"),
@@ -855,7 +861,7 @@ def test_successful_update_switches_release_after_preflight_and_preserves_config
             return fake_readiness(host, port)
         assert filesystem.read_current_sha() == NEW_SHA
         assert "old update" in paths.stable_update.read_text()
-        return fake_readiness(host, port)
+        return fake_readiness(host, port, release_id=NEW_SHA)
 
     result = Updater(paths, filesystem, service, health).update(
         source,
@@ -886,7 +892,7 @@ def test_update_reloads_unit_already_written_by_interrupted_attempt(tmp_path: Pa
         if filesystem.read_current_sha() == OLD_SHA:
             return fake_readiness(host, port)
         assert filesystem.read_current_sha() == NEW_SHA
-        return fake_readiness(host, port)
+        return fake_readiness(host, port, release_id=NEW_SHA)
 
     result = Updater(paths, filesystem, service, health).update(
         source,
@@ -971,7 +977,7 @@ def test_config_change_restarts_and_preserves_unknown_content(tmp_path: Path) ->
 
     assert result.changed is True
     assert service.calls == ["restart"]
-    assert health == [("192.168.1.20", 9000)]
+    assert health == [("192.168.1.20", 8000), ("192.168.1.20", 9000)]
     assert "# custom\nFUTURE=keep\n" in paths.environment_file.read_text()
 
 
@@ -1014,7 +1020,7 @@ def test_config_health_failure_restores_exact_previous_file(tmp_path: Path) -> N
     def health(host: str, port: int) -> None:
         nonlocal health_calls
         health_calls += 1
-        if health_calls == 1:
+        if health_calls == 2:
             raise HealthCheckError("candidate failed")
         return fake_readiness(host, port)
 
@@ -1028,17 +1034,19 @@ def test_config_health_failure_restores_exact_previous_file(tmp_path: Path) -> N
 
     assert paths.environment_file.read_bytes() == previous
     assert service.calls == ["restart", "restart"]
-    assert health_calls == 2
+    assert health_calls == 3
 
 
 def test_config_rollback_health_failure_is_critical(tmp_path: Path) -> None:
     paths, _ = _installed(tmp_path)
+    service = FakeService()
 
     with pytest.raises(RollbackError):
         Configurator(
             paths,
-            FakeService(),
-            lambda host, port: (_ for _ in ()).throw(HealthCheckError("failed")),
+            service,
+            lambda host, port: (fake_readiness(host, port) if not service.calls else
+                               (_ for _ in ()).throw(HealthCheckError("failed"))),
             environment_owner=None,
         ).apply({"CFM_BIND_PORT": "9000"})
 
