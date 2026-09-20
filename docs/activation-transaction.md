@@ -60,9 +60,15 @@ and local configuration require a separate design.
   read.
 - **Backup**: a durable, restrictive copy of the exact pre-transaction active
   bytes plus authenticated restoration metadata. It is not a YAML re-render.
-- **Transaction journal**: the minimal root-owned durable record that identifies
-  an incomplete transaction and its expected source, candidate, backup, and
-  phase. It must not contain raw YAML or credentials.
+- **Transaction journal**: the minimal root-owned durable recovery record for a
+  transaction that has not yet reached a fully cleaned final outcome. It
+  identifies expected source, candidate, backup, cleanup allowlist, and phase;
+  it is not historical storage and must not contain raw YAML or credentials.
+- **Durably clean journal namespace**: the verified condition, established
+  under the shared outer lock, that the fixed root-owned journal directory has
+  retained its fixed-path/parent identity, has been fsynced, and has then been
+  rechecked through the same descriptor with no current, temporary, alternate,
+  or ambiguous transaction-journal object present.
 - **Activation**: both committing the candidate at the active name and, when
   service integration exists, making cloudflared run from it and proving
   readiness.
@@ -187,10 +193,10 @@ Future implementation MUST preserve all of the following:
     `cloudflared.service` baseline before active namespace mutation. An
     initially inactive, failed, mismatched, or unstable service is an
     unsupported precondition, not a condition the transaction repairs.
-25. Rollback/recovery artifacts are never deleted before a durable terminal
-    commit or rollback decision. Cleanup after that decision is authenticated,
-    idempotent, directory-fsynced, and complete before a user-visible terminal
-    result.
+25. Rollback/recovery artifacts are never deleted before a durable final
+    cleanup decision. Cleanup after that decision is authenticated, idempotent,
+    directory-fsynced, and followed by journal retirement, journal-directory
+    fsync, and clean-namespace verification before a user-visible result.
 26. After durable commit intent, the source, candidate, adopted authority, and
     complete service baseline are freshly rechecked immediately before
     exchange. A proven pre-exchange failure aborts without active-config or
@@ -198,11 +204,11 @@ Future implementation MUST preserve all of the following:
     rollback rather than precommit cleanup.
 27. A persistent activation-recovery barrier protects authority after process
     locks are released. Under the shared outer manager lock, every root manager
-    mutation must reject a valid nonterminal or unverifiable activation journal
+    mutation must reject a valid recovery-required or unverifiable journal
     before changing the active release, adopted path, or related manager state.
-    A valid terminal journal is not ignored: it must authenticate against the
-    current authority, be securely retired, and have that retirement made
-    directory-durable before any such authority change.
+    It may proceed only after establishing a durably clean journal namespace;
+    pathname absence alone is insufficient. Any journal left after a final
+    cleanup decision is a recovery artifact to retire, never permanent history.
 
 ## Recommended privileged boundary
 
@@ -315,13 +321,15 @@ IDLE
   -> SERVICE_ACTIVATING
   -> SERVICE_VERIFIED
   -> COMMIT_CLEANUP_PENDING
-  -> COMMITTED_SUCCESS
+  -> DURABLY_CLEAN_JOURNAL_NAMESPACE
+  -> COMMITTED_SUCCESS (logical result only)
 
 Failure after durable commit intent but before any active-name change:
 
 CONFIG_COMMITTING
   -> PRECOMMIT_ABORT
-  -> FAILED_PRECOMMIT
+  -> DURABLY_CLEAN_JOURNAL_NAMESPACE
+  -> FAILED_PRECOMMIT (logical result only)
 
 Failure after the active name changed or may have changed:
 
@@ -330,7 +338,8 @@ ACTIVATION_FAILED
   -> ROLLBACK_SERVICE
   -> ROLLBACK_VERIFIED
   -> ROLLBACK_CLEANUP_PENDING
-  -> FAILED_ROLLED_BACK
+  -> DURABLY_CLEAN_JOURNAL_NAMESPACE
+  -> FAILED_ROLLED_BACK (logical result only)
 
 Any unverified restoration or service recovery:
 
@@ -369,30 +378,45 @@ unhealthy service causes rejection before `CONFIG_COMMITTING`; the transaction
 does not attempt to turn that state into a supported baseline.
 
 `COMMIT_CLEANUP_PENDING` and `ROLLBACK_CLEANUP_PENDING` are durable terminal
-decisions. Once either is fsynced, the selected outcome no longer depends on
-rollback artifacts remaining present. Cleanup can then remove authenticated
-artifacts idempotently. User-visible success or verified-rollback failure is
-not returned until cleanup, affected-directory fsync, and the corresponding
-durable terminal journal state are complete.
+decisions, but they are still recovery journal states. Once either is fsynced,
+the selected outcome no longer depends on rollback artifacts remaining present.
+Cleanup can then remove authenticated artifacts idempotently. User-visible
+success or verified-rollback failure is not returned until cleanup and all
+affected-directory fsyncs complete, the journal is securely unlinked, its
+directory is fsynced, and the journal namespace is rechecked as clean.
 
 A cleanup error after either durable decision does not reverse that decision.
-The journal remains in its cleanup-pending state, no new transaction may begin,
-and root recovery resumes the same idempotent cleanup. An existing artifact
-with the wrong identity is not treated as already cleaned and requires manual
-intervention; an allowlisted artifact that is absent is safe to skip.
+Before journal unlink, the journal remains in its cleanup-pending state, no new
+transaction may begin, and root recovery resumes the same idempotent cleanup.
+Once unlink has been attempted, the journal may appear present or absent, but
+the lifecycle remains open until its directory is fsynced and absence is
+rechecked. An existing artifact with the wrong identity is not treated as
+already cleaned and requires manual intervention; an allowlisted artifact that
+is absent is safe to skip only with the required directory fsync.
 
 `PRECOMMIT_ABORT` is also a durable cleanup decision, but it is not rollback:
 it is permitted only after proving the active name still identifies the exact
 original source. It authorizes idempotent deletion of only the journaled
 candidate, backup, and transaction artifacts. It never changes the active
-config or invokes cloudflared service control. `FAILED_PRECOMMIT` is recorded
-durably only after authenticated cleanup and affected-directory fsync finish.
+config or invokes cloudflared service control. It remains the durable journal
+decision until cleanup, journal retirement, journal-directory fsync, and clean
+namespace verification finish.
+
+`COMMITTED_SUCCESS`, `FAILED_PRECOMMIT`, and `FAILED_ROLLED_BACK` are logical
+result states, not persistent journal phases. They may be returned and captured
+by a separately secured audit mechanism only after
+`DURABLY_CLEAN_JOURNAL_NAMESPACE` is established. A transaction journal is
+intentionally retained only while transaction recovery, cleanup, or durable
+retirement work may remain; it is never retained to remember history. An
+interrupted unlink can make the name appear absent while retirement durability
+is still unproven, which is why observed absence never closes the lifecycle by
+itself.
 
 ### State and transition contract
 
 | Transition | Prerequisites and verification | Side effects and durable state | Failure behavior |
 | --- | --- | --- | --- |
-| `IDLE -> SOURCE_VERIFIED` | Shared outer lock held; activation barrier is absent or a valid terminal state authenticated against current authority and safely superseded under the lock; helper/release and adopted path independently valid; canonical path opened without symlinks; bounded snapshot succeeds | Read-only descriptors and immutable snapshot only | Close descriptors; sanitized rejection; no rollback |
+| `IDLE -> SOURCE_VERIFIED` | Shared outer lock held; durably clean journal namespace established; helper/release and adopted path independently valid; canonical path opened without symlinks; bounded snapshot succeeds | Read-only descriptors and immutable snapshot only | Close descriptors; sanitized rejection; no rollback |
 | `SOURCE_VERIFIED -> CANDIDATE_PREPARED` | Narrow mutation accepts structure and reports a real change | Exclusive random `0600` same-directory candidate, complete write and candidate file `fsync`; retained file/directory identity | Remove only the verified candidate; source untouched |
 | `CANDIDATE_PREPARED -> CANDIDATE_VALIDATED` | Candidate identity intact | Existing application parser succeeds, then fixed cloudflared ingress validation succeeds through FD-bound path; sanitized report retained | Discard candidate; source untouched |
 | `CANDIDATE_VALIDATED -> SERVICE_BASELINE_VERIFIED` | Unit is loaded; state is active with the expected running substate; positive MainPID, process start identity, executable identity, adopted-config relationship, and readiness remain stable across a bounded observation | Read-only checks only; sanitized baseline facts retained in memory | Reject before active mutation; discard candidate; do not start/restart/reload an unhealthy service |
@@ -402,16 +426,16 @@ durably only after authenticated cleanup and affected-directory fsync finish.
 | `CONFIG_COMMITTING -> PRE_EXCHANGE_REVALIDATED` | After durable intent, freshly recheck exact original source at active name, candidate identity/content/metadata, adopted authority, parent identity, and the complete healthy service baseline against journaled facts | Read-only, in-memory state only; perform no journal write or unrelated work before exchange | If any fact differs while active is exact original, durably choose `PRECOMMIT_ABORT`; if active is not exact original, classify candidate versus unknown before proceeding |
 | `PRE_EXCHANGE_REVALIDATED -> CONFIG_COMMITTED` | Immediately invoke the race-aware same-directory exchange; displaced object must be exact expected source and new active object exact candidate | Atomic namespace exchange, then active file fsync as applicable and parent directory fsync; journal advances only after durability | Once exchange may have occurred, any mismatch/failure enters `ACTIVATION_FAILED` and rollback; it cannot use precommit abort |
 | `CONFIG_COMMITTING -> PRECOMMIT_ABORT` | Final revalidation failed or crash recovery ran, and descriptor/digest/metadata checks prove the active name is still the exact original source | Journal durably records precommit-abort decision and authenticated cleanup allowlist before deletion | No active-config or service action; unknown/candidate active identity cannot take this path |
-| `PRECOMMIT_ABORT -> FAILED_PRECOMMIT` | Durable abort decision authentic; each existing transaction artifact matches its journaled identity | Remove only authenticated candidate/backup/journaled artifacts idempotently, tolerate already-absent allowlisted artifacts, fsync affected directories, then durably record `FAILED_PRECOMMIT` | Resume abort cleanup after crash; no service action and no config rollback; do not finalize failure until terminal durability completes |
+| `PRECOMMIT_ABORT -> DURABLY_CLEAN_JOURNAL_NAMESPACE -> FAILED_PRECOMMIT` | Durable abort decision authentic; each existing transaction artifact matches its journaled identity | Remove only authenticated candidate/backup/journaled artifacts idempotently, tolerate already-absent allowlisted artifacts, fsync affected directories, securely unlink the journal, fsync its directory, recheck the namespace clean, then expose the logical failure result | Resume abort cleanup/retirement after crash; no service action and no config rollback; do not finalize failure while a journal may remain or absence is not durable |
 | `CONFIG_COMMITTED -> SERVICE_ACTIVATING` | Active bytes/digest, metadata, and adopted name reverified; post-exchange observation confirms the pre-activation service baseline did not disappear/change across the unavoidable race; service phase implemented | Fixed allowlisted restart or verified reload begins; journal records phase durably first | A baseline mismatch after exchange enters `ACTIVATION_FAILED` immediately; rollback required even if no service command has yet run |
 | `SERVICE_ACTIVATING -> SERVICE_VERIFIED` | systemd command succeeded and bounded readiness checks prove expected service/process/config stability | Read-only service observations; journal records verification evidence without secrets | Enter `ACTIVATION_FAILED`; rollback required while no commit decision exists |
 | `SERVICE_VERIFIED -> COMMIT_CLEANUP_PENDING` | Active candidate and service stability reverified; success is now irrevocably selected | Journal durably records commit decision, complete cleanup allowlist, and `COMMIT_CLEANUP_PENDING` before any rollback artifact is removed | Journal/fsync failure leaves artifacts intact and no user-visible success; recovery still follows pre-decision rules |
-| `COMMIT_CLEANUP_PENDING -> COMMITTED_SUCCESS` | Durable commit decision authentic; each existing cleanup artifact matches its journaled identity | Remove authenticated artifacts idempotently, tolerate already-absent allowlisted artifacts, fsync every affected directory, then durably record `COMMITTED_SUCCESS` | Resume cleanup on restart; never roll back solely because a cleanup artifact is absent; do not report success until terminal durability completes |
+| `COMMIT_CLEANUP_PENDING -> DURABLY_CLEAN_JOURNAL_NAMESPACE -> COMMITTED_SUCCESS` | Durable commit decision authentic; each existing cleanup artifact matches its journaled identity | Remove authenticated artifacts idempotently, tolerate already-absent allowlisted artifacts, fsync every affected directory, securely unlink the journal, fsync its directory, recheck the namespace clean, then expose the logical success result | Resume cleanup/retirement on restart; never roll back solely because a cleanup artifact is absent; do not report success while a journal may remain or absence is not durable |
 | `ACTIVATION_FAILED -> ROLLBACK_CONFIG` | Durable backup and/or retained displaced original authenticated against journal | Restore exact old bytes/metadata using secure same-directory staging and atomic namespace operation; fsync file and directory | Any uncertainty becomes `ROLLBACK_FAILED` |
 | `ROLLBACK_CONFIG -> ROLLBACK_SERVICE` | Old config digest and metadata verified at adopted name | Fixed service activation for restored config | Distinguish config-restored/service-unrecovered outcome |
 | `ROLLBACK_SERVICE -> ROLLBACK_VERIFIED` | Old file is exact; service is again loaded, active, ready, and stably equivalent to the journaled healthy baseline, with the expected executable/config relationship | Read-only verification; durable journal update | Failure becomes a distinct config-restored/service-recovery or rollback failure |
 | `ROLLBACK_VERIFIED -> ROLLBACK_CLEANUP_PENDING` | Exact old config and a healthy baseline-equivalent service are proven; rollback is irrevocably selected | Journal durably records rollback-complete decision, cleanup allowlist, and `ROLLBACK_CLEANUP_PENDING` before artifact deletion | Journal/fsync failure leaves artifacts intact and rollback outcome unfinalized |
-| `ROLLBACK_CLEANUP_PENDING -> FAILED_ROLLED_BACK` | Durable rollback decision authentic; each existing cleanup artifact matches its journaled identity | Remove authenticated artifacts idempotently, tolerate already-absent allowlisted artifacts, fsync every affected directory, then durably record `FAILED_ROLLED_BACK` | Resume cleanup on restart; missing allowlisted artifacts alone are not indeterminate; return activation failure only after terminal durability |
+| `ROLLBACK_CLEANUP_PENDING -> DURABLY_CLEAN_JOURNAL_NAMESPACE -> FAILED_ROLLED_BACK` | Durable rollback decision authentic; each existing cleanup artifact matches its journaled identity | Remove authenticated artifacts idempotently, tolerate already-absent allowlisted artifacts, fsync every affected directory, securely unlink the journal, fsync its directory, recheck the namespace clean, then expose the logical verified-rollback result | Resume cleanup/retirement on restart; missing allowlisted artifacts alone are not indeterminate; return activation failure only after the namespace is durably clean |
 
 Implementation PR A, if intentionally limited to filesystem mechanics, stops
 with a test-only/internal transaction boundary and does not advertise a
@@ -586,22 +610,25 @@ artifacts to remove. Only then may the ephemeral backup and other rollback
 artifacts be removed. Each deletion is idempotent: an existing object must
 match its journaled identity before deletion, while an already-absent
 allowlisted object is expected after a cleanup crash. Every affected directory
-is fsynced before `COMMITTED_SUCCESS` is recorded durably and success is
-reported.
+is fsynced before the journal is unlinked. The journal directory is then
+fsynced and rechecked clean before logical result `COMMITTED_SUCCESS` is
+reported. No persistent `COMMITTED_SUCCESS` journal is written.
 
 After verified rollback, the same ordering applies through
-`ROLLBACK_CLEANUP_PENDING` before artifacts are removed and
-`FAILED_ROLLED_BACK` is recorded durably. Before either cleanup-pending decision,
-a missing required backup remains a rollback/recovery failure. On rollback
-failure or ambiguous pre-decision recovery, artifacts are retained for root
-administrator recovery. Automatic age-based deletion MUST NOT remove an
-artifact referenced by a nonterminal journal.
+`ROLLBACK_CLEANUP_PENDING` before artifacts are removed, their directories are
+fsynced, and the journal is durably retired. Only then is logical result
+`FAILED_ROLLED_BACK` exposed. Before either cleanup-pending decision, a missing
+required backup remains a rollback/recovery failure. On rollback failure or
+ambiguous pre-decision recovery, artifacts are retained for root administrator
+recovery. Automatic age-based deletion MUST NOT remove an artifact referenced
+by any transaction journal.
 
 For a proven pre-exchange abort, `PRECOMMIT_ABORT` is durably recorded before
 the backup or candidate is deleted. Cleanup then follows the same authenticated,
-idempotent deletion and directory-fsync rules and ends in durable
-`FAILED_PRECOMMIT`. Because the exact original source remains active, this path
-never restores config bytes and never invokes service control.
+idempotent deletion, directory-fsync, journal-retirement, and clean-namespace
+rules and ends by exposing logical result `FAILED_PRECOMMIT`. Because the exact
+original source remains active, this path never restores config bytes and never
+invokes service control.
 
 Bounded historical backups are not required for the first implementation.
 They increase secret retention and require a separate retention/audit policy.
@@ -713,8 +740,10 @@ Failure after durable `CONFIG_COMMITTING` intent does not by itself require
 rollback. If descriptor, digest, and metadata checks prove the active name is
 still the exact original source, the transaction enters `PRECOMMIT_ABORT`,
 durably records its cleanup allowlist, removes only authenticated transaction
-artifacts, fsyncs their directories, and records `FAILED_PRECOMMIT`. It performs
-no active-config write and no cloudflared start, stop, restart, or reload.
+artifacts, fsyncs their directories, retires and directory-fsyncs the journal,
+rechecks the journal namespace clean, and only then returns
+`FAILED_PRECOMMIT`. It performs no active-config write and no cloudflared start,
+stop, restart, or reload.
 
 Any failure after the active namespace changed or may have changed enters
 rollback. The rollback procedure:
@@ -746,11 +775,12 @@ The result model distinguishes at least:
   attempted;
 - `FAILED_PRECOMMIT`: durable commit intent existed, but fresh pre-exchange
   revalidation or recovery aborted while the active name was proven to remain
-  the exact original source; authenticated cleanup completed durably and no
-  service action occurred;
+  the exact original source; authenticated cleanup completed durably, the
+  journal namespace was proven clean, and no service action occurred;
 - `ACTIVATION_FAILED_ROLLBACK_VERIFIED`: activation failed; exact prior config
   and a healthy service state equivalent to the captured baseline were proven
-  restored, and rollback cleanup reached its durable terminal state;
+  restored, rollback cleanup is durable, and the journal namespace was proven
+  durably clean;
 - `CONFIG_RESTORED_SERVICE_RECOVERY_FAILED`: exact config restoration was
   proven but cloudflared could not be returned to verified health;
 - `ROLLBACK_PARTIAL_FAILURE`: some restoration step failed and current state is
@@ -758,16 +788,17 @@ The result model distinguishes at least:
 - `ROLLBACK_FAILED_STATE_INDETERMINATE`: current file/service state cannot be
   safely classified; automatic mutation stops;
 - `TERMINAL_CLEANUP_REQUIRED`: commit or verified rollback has a durable
-  decision, but authenticated cleanup or terminal journal durability is not
-  complete; it is neither user-visible success nor a new rollback decision;
-- `RECOVERY_REQUIRED`: a valid nonterminal or unverifiable journal was found
-  before a new activation or root manager mutation; the barrier rejected the
-  operation without changing release, adopted authority, journal, config, or
-  service; and
-- `TERMINAL_JOURNAL_RETIREMENT_FAILED`: a completed terminal record
-  authenticated, but its secure removal or journal-directory fsync did not
-  complete; the requested authority mutation did not begin, and config and
-  service were untouched.
+  decision, but authenticated cleanup, journal retirement, or namespace
+  durability is not complete; it is neither user-visible success nor a new
+  rollback decision;
+- `RECOVERY_REQUIRED`: a valid recovery-required or unverifiable journal was
+  found before a new activation or root manager mutation; the barrier rejected
+  the operation without changing release, adopted authority, journal, config,
+  or service; and
+- `JOURNAL_NAMESPACE_NOT_DURABLY_CLEAN`: secure journal retirement, journal-
+  directory fsync, or post-fsync absence verification did not complete. No
+  final transaction result or authority mutation may be reported, and config
+  and service remain untouched by an authority-gate failure.
 
 All are failures. None may produce an HTTP or CLI success result for the
 requested mutation. Details exposed outside the root boundary remain
@@ -804,26 +835,47 @@ transition, unsafe permissions, identity mismatch, or multiple journals cause
 fail-closed manual recovery. No artifact path from the journal may escape its
 fixed directory.
 
-Artifact presence is interpreted by phase. Before a durable terminal decision,
-every artifact required for rollback must exist and authenticate; absence is a
-rollback/recovery failure. In `PRECOMMIT_ABORT`, `COMMIT_CLEANUP_PENDING`, or
-`ROLLBACK_CLEANUP_PENDING`, the journal proves that the corresponding outcome
-has already been selected and records the complete cleanup allowlist. Existing
-allowlisted artifacts must still authenticate before deletion, but missing
-allowlisted artifacts mean cleanup already progressed and are not by themselves
-indeterminate. Recovery resumes cleanup, fsyncs affected directories, and
-writes the corresponding durable terminal state. A durable
-`FAILED_PRECOMMIT`, `COMMITTED_SUCCESS`, or `FAILED_ROLLED_BACK` record can be
-retained as the bounded single terminal record and replaced only when a new
-transaction safely begins. Deleting the journal is not required to report the
-terminal result while release and adopted-config authority remain unchanged.
-Before either authority changes, however, the terminal record must authenticate
-against that **current** authority and be retired through the fixed verified
-journal directory. Retirement removes only that authenticated journal, fsyncs
-the journal directory, and succeeds only after the directory fsync. A failed
-unlink or directory fsync aborts the authority-changing operation before it
-changes release, adoption, config, or service state. An unverifiable terminal
-record is a closed barrier, never an obsolete record to ignore or delete.
+### One journal lifecycle
+
+The governing invariant is: **the activation journal exists only while
+transaction or recovery state may still require durable recovery**. It is not
+an audit log. `COMMITTED_SUCCESS`, `FAILED_PRECOMMIT`, and
+`FAILED_ROLLED_BACK` are final result names only and MUST NOT be intentionally
+left on disk as journal phases.
+
+Artifact presence is interpreted by the durable decision phase. Before a
+cleanup decision, every artifact required for rollback must exist and
+authenticate; absence is a rollback/recovery failure. In `PRECOMMIT_ABORT`,
+`COMMIT_CLEANUP_PENDING`, or `ROLLBACK_CLEANUP_PENDING`, the journal proves that
+the corresponding outcome has already been selected and records the complete
+cleanup allowlist. Existing allowlisted artifacts must still authenticate
+before deletion, but missing allowlisted artifacts mean cleanup may already
+have progressed and are not by themselves indeterminate.
+
+After any of those decisions, the only permitted finalization sequence is:
+
+1. authenticate the journal, its current release/adopted authority, and every
+   remaining allowlisted artifact;
+2. remove allowlisted artifacts idempotently and reject any existing object
+   with an unexpected identity;
+3. fsync every directory affected by artifact cleanup;
+4. securely unlink the fixed journal through the verified journal-directory
+   descriptor;
+5. fsync the journal directory;
+6. rescan through that same descriptor and prove that no current, temporary,
+   alternate, or ambiguous journal object exists; and
+7. only then expose the corresponding logical final result.
+
+If any step fails, the final result is not exposed. Recovery repeats the same
+decision-specific cleanup and retirement. A crash after journal unlink but
+before its directory fsync is safe: authority is still unchanged. On the next
+run the journal may be visible or absent. If visible, it is authenticated and
+cleanup/retirement resumes; if absent, absence still must be made durable by
+the directory-fsync-and-recheck procedure below. If that crash lost the
+in-memory final result, even a subsequently proven clean namespace does not
+authorize reconstructing one; any historical result must come from a separate
+audit channel. Only successful directory fsync and clean rescan establish that
+no activation recovery remains.
 
 `CONFIG_COMMITTING` is intentionally ambiguous. Recovery MUST first classify
 the active name using retained/journaled identity, full digest, size, and
@@ -840,40 +892,41 @@ The same classification governs a crash in the in-memory
 `PRE_EXCHANGE_REVALIDATED` state because its durable journal still says
 `CONFIG_COMMITTING`.
 
-### Persistent activation-recovery barrier
+### Durably clean journal namespace and recovery barrier
 
 Descriptor-held locks prevent concurrent work only while their owning process
-is alive. The durable journal therefore also acts as an authority barrier after
-a crash. The barrier classifies journal state as follows:
+is alive. The fixed journal namespace therefore remains an authority barrier
+after a crash. `DURABLY_CLEAN_JOURNAL_NAMESPACE` is a proven condition, not a
+journal state or a remembered pathname lookup. It is established only while
+holding the shared outer lock and a verified descriptor for the fixed,
+root-owned, restrictive journal directory.
 
-- no journal means no activation recovery is pending;
-- a valid terminal completed state (`COMMITTED_SUCCESS`, `FAILED_PRECOMMIT`, or
-  `FAILED_ROLLED_BACK`) means no activation recovery or cleanup is pending, but
-  an authority-changing operation must authenticate and durably retire it
-  before proceeding;
-- every other valid state, including cleanup-pending and rollback-failed/manual
-  recovery states, blocks authority-changing manager operations; and
-- malformed content, unknown schema/state, impossible transition, unsafe type,
-  ownership or permissions, multiple/ambiguous journal objects, or any failure
-  to authenticate the fixed journal fails closed and also blocks those
-  operations. It is never interpreted as journal absence or terminal success.
+The implementation performs a bounded no-follow scan of that directory and
+classifies it as follows. The fixed path-to-directory-descriptor binding,
+parent identity, directory type, ownership, and restrictive mode are verified
+before and after the scan/fsync sequence; a rename, replacement, or identity
+change fails closed.
 
-Inspection uses the fixed privileged journal location and the same strict
-bounded parser and no-follow identity rules as recovery. A blocked operation
-returns a sanitized instruction for the root administrator to run activation
-status/recovery. Rejection for a pending or unverifiable journal MUST NOT change
-`current`, a release, the adopted config setting, the activation journal or
-artifacts, the cloudflared config, or either cloudflared service state.
+- a valid journal whose transaction, cleanup, or recovery work remains blocks
+  authority mutation unchanged and directs the root administrator to recovery;
+- malformed content, unknown schema/state, impossible state, unsafe type,
+  ownership or permissions, identity mismatch, unexpected journal-shaped
+  entries, or an ambiguous/multiple-journal namespace fails closed unchanged;
+- a cleanup-decision journal left after its allowlisted artifacts are absent is
+  authenticated against the **current** release and adopted-config authority;
+  artifact absence is reverified, every affected artifact directory is fsynced
+  again, and retirement finishes using steps 4 through 6 above; and
+- if the scan observes no journal, absence alone is insufficient. The helper
+  fsyncs the verified journal directory, rescans it through the same descriptor,
+  and requires the journal namespace still to be empty and unambiguous.
 
-A permitted terminal record is a separate case, not a bypass. While holding the
-outer lock, the operation MUST authenticate its release identity and adopted
-config fingerprint against the current authority, verify that its state is one
-of the three completed terminal states, unlink it through the already verified
-journal-directory descriptor, and fsync that directory. Only successful fsync
-opens the barrier for the authority mutation. Retirement or fsync failure
-aborts the mutation: `current`, releases, the adopted setting, cloudflared
-config, and service state remain unchanged. A terminal identity mismatch is
-unverifiable and blocks; it MUST NOT be treated as absence or silently removed.
+Only the last two paths can establish `DURABLY_CLEAN_JOURNAL_NAMESPACE`.
+Directory fsync or post-fsync rescan failure closes the barrier. A cleanup-
+decision journal identity mismatch is unverifiable; it is never treated as
+obsolete history, absence, or permission to delete. A blocked operation
+returns a sanitized instruction for activation status/recovery and MUST NOT
+change `current`, a release, the adopted setting, journal/artifacts,
+cloudflared config, or service state.
 
 The conservative first policy is that all root manager mutation transactions
 refuse while this barrier is closed, rather than trying to decide whether a
@@ -887,26 +940,27 @@ barrier applies before:
 - `cfm-config cloudflared-config clear`.
 
 Read-only status may remain available and should report only a sanitized
-"activation recovery required" condition when appropriate. A valid terminal
-record may remain as the bounded journal while authority is unchanged and may
-be replaced safely by a later activation under the lock. It MUST instead be
-durably retired before an update, adoption, clear, or reconciliation changes
-the authority that authenticates it.
+"activation recovery required" condition when appropriate. A historical audit
+record, if one is later implemented, is separate from the transaction journal,
+does not authenticate recovery, and cannot open or close this barrier.
 
 ### Crash matrix
 
 | Crash point | Durable state that may remain | Required next-run behavior |
 | --- | --- | --- |
-| Before candidate creation | Source only; no journal | Normal start; nothing to recover |
+| Before candidate creation | Source only; no journal observed | No transaction recovery is indicated, but any privileged transaction or authority mutation still fsyncs the verified journal directory and rechecks absence before proceeding |
 | During candidate write, before candidate fsync | Incomplete hidden candidate | Never activate it; remove only after name/inode/type/ownership checks, otherwise fail closed |
 | After candidate fsync or validation | Valid disposable candidate; active unchanged; normally no journal | Revalidate and explicitly resume only within same live transaction; after process loss, securely discard it |
 | During or after service baseline observation, before durable journal | Active config/service unchanged; candidate may remain; no durable baseline authority | Securely discard candidate after identity checks; a new transaction must establish a fresh bounded healthy baseline |
 | Baseline is unhealthy or becomes unstable | Active config namespace unchanged | Fail closed with `SERVICE_BASELINE_UNAVAILABLE`; never start/restart/reload service and never enter commit |
-| Any crash leaves a valid nonterminal journal | Descriptor locks are released, but journaled release/adopted authority and recovery artifacts remain | Persistent barrier blocks update/install/reconciliation/adopt/clear under the shared outer lock until root recovery reaches a valid terminal state |
+| Any crash leaves a valid recovery journal | Descriptor locks are released, but journaled release/adopted authority or cleanup/retirement work remains | Persistent barrier blocks update/install/reconciliation/adopt/clear under the shared outer lock until recovery retires the journal and proves the namespace durably clean |
 | Journal is malformed, unknown, unsafe, ambiguous, or unverifiable after crash | Authority cannot be authenticated safely | Barrier fails closed exactly like pending recovery; perform no manager/config/service mutation and direct root to status/manual recovery |
-| Authority mutation finds a valid terminal journal | Completed transaction and journal authenticated against current release/adopted authority | Under the outer lock, securely remove only that fixed journal and fsync its directory before changing authority; failure aborts the manager mutation without touching config/service |
-| During terminal-journal retirement, before its directory fsync | Authority is unchanged; after power loss the authenticated terminal journal may be present or absent | Do not infer that the requested authority mutation occurred; re-inspect under the outer lock, retire again if terminal is present, and proceed only after journal absence or a fresh retirement is durable |
-| After terminal-journal retirement directory fsync, before authority mutation | No journal; prior completed transaction has no recovery work; current release/adopted authority is still unchanged | Safe clean boundary: a later operation revalidates its inputs and may proceed normally; no activation recovery or cloudflared action is needed |
+| Cleanup-decision journal remains after all allowlisted artifacts are absent | Logical outcome is selected, but journal retirement may still require durability | Authenticate against current authority, reverify and fsync affected artifact directories, then securely unlink/fsync/recheck the journal namespace; do not expose the final result earlier |
+| Immediately before journal unlink | Durable cleanup decision and clean artifact directories; journal still provides recovery authority | Crash leaves the journal authoritative; next recovery revalidates completed cleanup and retries retirement; authority remains blocked |
+| Immediately after journal unlink or after reboot observes absence, before journal-directory fsync | Namespace mutation may not yet be durable; authority is unchanged | Fsync the verified journal directory and recheck absence under the outer lock; if the journal reappears, authenticate and resume its recorded cleanup decision; never infer cleanliness from `ENOENT` alone |
+| Second crash while making observed absence durable | Authority mutation has not begun; disk may recover journal-present or journal-absent namespace | Repeat the same descriptor-bound fsync and absence recheck; operation is idempotent and remains blocked until it proves durable cleanliness |
+| After journal-directory fsync and clean rescan, before authority mutation | Durably clean journal namespace; current release/adopted authority is still unchanged | Safe boundary: a later operation re-establishes the clean condition and revalidates current authority; no activation recovery or cloudflared action is needed |
+| After authority mutation begins | Old activation journal unlink and clean namespace are already durable; the update/adopt/clear transaction may have its own incomplete state | Recover only through that operation's own transaction contract; no old activation journal may legitimately reappear and no activation recovery step may require old release/adopted authority |
 | During backup write, before backup fsync | Incomplete backup; active unchanged | Journal must not claim `BACKUP_DURABLE`; remove authenticated incomplete artifacts or require manual recovery on mismatch |
 | After backup fsync but before backup-directory fsync | Backup existence is not durable | Active unchanged; repeat/clean backup creation; do not commit |
 | After durable backup but before journal fsync | Active unchanged; orphan durable backup possible | Discover only through fixed bounded artifact policy; never infer authority from filename alone; clean if identity can be proven |
@@ -914,8 +968,7 @@ the authority that authenticates it.
 | After durable `CONFIG_COMMITTING`, before fresh recheck | Commit intent is durable but active-name mutation is unknown; prior healthy baseline is durable | Classify active name first: exact original means durably select `PRECOMMIT_ABORT`; exact candidate means recover as committed; anything else is indeterminate/manual recovery |
 | After in-memory `PRE_EXCHANGE_REVALIDATED`, before exchange | Journal still says `CONFIG_COMMITTING`; active should be original but crash timing is authoritative only through current identity | Apply the same three-way classification; never infer exchange from the in-memory phase |
 | Fresh pre-exchange source/candidate/adopted/baseline check fails with exact original active | Active config has not changed and the transaction has invoked no service action; durable intent and artifacts remain | Durably record `PRECOMMIT_ABORT`; do not exchange or invoke service control; perform only authenticated abort cleanup |
-| During `PRECOMMIT_ABORT` cleanup | Original source remains active; some allowlisted artifacts may already be absent | Authenticate/delete remaining artifacts idempotently, fsync affected directories, and durably record `FAILED_PRECOMMIT`; identity mismatch requires manual recovery |
-| After durable `FAILED_PRECOMMIT` | Original source was never changed and no service operation was invoked; transaction artifacts absent; bounded terminal journal remains | Return/reconstruct precommit failure; a later activation may replace it under unchanged authority, but an authority mutation must first authenticate, retire, and directory-fsync it |
+| During `PRECOMMIT_ABORT` cleanup | Original source remains active; some allowlisted artifacts may already be absent | Authenticate/delete remaining artifacts idempotently, fsync affected directories, retire/fsync/recheck the journal namespace, then expose logical `FAILED_PRECOMMIT`; identity mismatch requires manual recovery |
 | Immediately after atomic exchange | Candidate may be active; old source at transaction name; directory change may not be durable | Use journal plus identities to classify; fsync/restore according to conservative recovery; never start a new transaction |
 | Service baseline changes after the final check, during exchange, or after exchange | Candidate may be active while the process no longer matches the baseline | Post-commit continuity verification detects the mismatch; enter `ACTIVATION_FAILED` and restore config plus baseline-equivalent service state through rollback |
 | After active file fsync but before active-directory fsync | File data durable; name swap may not be | Same classification; do not assume either namespace survived power loss |
@@ -925,23 +978,22 @@ the authority that authenticates it.
 | After service becomes healthy but before `SERVICE_VERIFIED` journal | New active and possibly healthy service; journal incomplete | Repeat idempotent readiness/stability verification; success may be recorded only after all identities match |
 | After `SERVICE_VERIFIED` but before commit decision | Successful active/service state plus all required rollback artifacts | Do not delete artifacts; reverify active/service state, then durably choose `COMMIT_CLEANUP_PENDING` or roll back if verification fails |
 | After durable `COMMIT_CLEANUP_PENDING`, before or during cleanup | Commit is irrevocably selected; some or all rollback artifacts may remain | Never roll back solely for missing cleanup artifacts; authenticate and remove those still present, accept already-absent allowlisted artifacts, and fsync affected directories |
-| After commit cleanup directory fsync but before `COMMITTED_SUCCESS` | Commit decision and completed cleanup are durable, journal still says cleanup pending | Repeat idempotent absence/authentication checks and directory fsync, then durably record `COMMITTED_SUCCESS`; do not report success earlier |
-| After durable `COMMITTED_SUCCESS` | New config/service verified; rollback artifacts absent; bounded terminal journal remains | Return/reconstruct success safely; a later activation may replace it under unchanged authority, but an authority mutation must first authenticate, retire, and directory-fsync it |
+| After commit cleanup directory fsync, before journal retirement | Commit decision and completed cleanup are durable; journal still says `COMMIT_CLEANUP_PENDING` | Reverify cleanup, securely unlink/fsync/recheck the journal namespace, then expose logical `COMMITTED_SUCCESS`; never write a persistent success journal or report success earlier |
 | During rollback staging or namespace restoration | Journal says rollback; active may be candidate or restored source | Classify only known digests and artifacts; continue exact restoration if safe; otherwise `ROLLBACK_FAILED_STATE_INDETERMINATE` |
 | After restored file fsync but before directory fsync | Restored bytes exist but namespace durability uncertain | Repeat classification and required fsync; service recovery waits for durable namespace |
 | During rollback service recovery | Old config durable; service state unknown | Verify/retry bounded fixed activation and readiness; distinguish config-restored/service-failed |
 | After `ROLLBACK_VERIFIED` but before rollback decision | Old config and baseline-equivalent service proven; all required recovery artifacts remain | Do not delete artifacts; durably record `ROLLBACK_CLEANUP_PENDING` first |
 | After durable `ROLLBACK_CLEANUP_PENDING`, before or during cleanup | Verified rollback is irrevocably selected; artifacts may be partially absent | Authenticate and remove remaining allowlisted artifacts idempotently, accept already-absent allowlisted artifacts, and fsync affected directories |
-| After rollback cleanup directory fsync but before `FAILED_ROLLED_BACK` | Restored config/service and cleanup are durable; journal still says cleanup pending | Repeat idempotent cleanup verification and fsync, then durably record `FAILED_ROLLED_BACK`; only then return verified-rollback failure |
-| After durable `FAILED_ROLLED_BACK` | Exact old config and baseline-equivalent service restored; rollback artifacts absent; bounded terminal journal remains | Return/reconstruct the verified-rollback failure; a later activation may replace it under unchanged authority, but an authority mutation must first authenticate, retire, and directory-fsync it |
+| After rollback cleanup directory fsync, before journal retirement | Restored config/service and cleanup are durable; journal still says `ROLLBACK_CLEANUP_PENDING` | Reverify cleanup, securely unlink/fsync/recheck the journal namespace, then expose logical `FAILED_ROLLED_BACK`; never write a persistent rollback-result journal |
 
 Recovery is invoked explicitly inside the privileged boundary before any new
 transaction. Merely starting the web service MUST NOT mutate cloudflared or
 auto-recover an incomplete transaction. An implementation may provide a
 root-only status/recover operation, but it cannot offer arbitrary artifact
-selection. Until recovery reaches a valid terminal completed state, the
-persistent barrier also prevents manager update/configuration transactions from
-changing the release or adopted authority on which recovery depends.
+selection. Until recovery retires its journal and establishes a durably clean
+journal namespace, the persistent barrier prevents manager update/configuration
+transactions from changing the release or adopted authority on which recovery
+depends.
 
 ## Locking and concurrency
 
@@ -954,49 +1006,61 @@ regular, root-owned, `0600`, and descriptor-held.
 The current manager deployment/configuration lock protects updates and adopted
 setting changes. It becomes the shared outer manager-operation lock for this
 contract. A runtime activation lock is not enough: after a crash it is released
-while a nonterminal journal can still depend on the old active release and
-adopted path.
+while a recovery journal can still depend on the old active release and adopted
+path.
 
 Every root manager mutation transaction follows this order:
 
 1. acquire the shared outer manager/deployment lock;
-2. inspect and strictly authenticate the fixed activation journal barrier;
-3. if the journal is valid nonterminal or is malformed, ambiguous, unsafe, or
-   otherwise unverifiable, reject without any mutation and direct the root
-   administrator to activation status/recovery;
-4. if the journal is valid terminal, authenticate it against the **current**
-   release and adopted-config authority, verify its completed terminal state,
-   remove it securely through the verified journal directory, and fsync that
-   directory; and
-5. only after the journal was absent or terminal retirement completed durably
-   may the operation change manager release/configuration authority.
+2. open and verify the fixed root-owned journal directory and establish
+   `DURABLY_CLEAN_JOURNAL_NAMESPACE`, including directory fsync plus post-fsync
+   absence rescan even when the first lookup returned `ENOENT`;
+3. revalidate the current manager release and adopted-config authority only
+   after the namespace is durably clean;
+4. perform the update/configuration operation's own transaction; and
+5. release the outer lock only after that operation reaches its own safe
+   boundary.
+
+Step 2 rejects a valid journal with remaining recovery or cleanup work, and it
+rejects malformed, ambiguous, unsafe, or otherwise unverifiable journal state.
+If an authenticated cleanup-decision journal remains but all allowlisted
+artifacts are absent, step 2 repeats every affected artifact-directory fsync
+and may then finish retirement before performing the journal fsync-and-rescan
+proof. It does not perform substantive rollback or service recovery as an
+incidental part of update/adopt/clear.
 
 This ordering is mandatory for `cfm-update`, installer/reconciliation release
 switching, adoption, and clear. The barrier check occurs inside the lock and
 immediately before the operation's own authority validation/mutation; checking
-before lock acquisition is insufficient. The rejection path does not reconcile
-units, switch `current`, rewrite the EnvironmentFile, restart the manager,
-touch activation state, or control cloudflared.
+before lock acquisition is insufficient, and pathname `ENOENT` is not the
+gate. The rejection path does not reconcile units, switch `current`, rewrite
+the EnvironmentFile, restart the manager, touch activation state, or control
+cloudflared.
 
-Terminal retirement is part of the locked precondition, not best-effort
-housekeeping. If unlink or directory fsync fails, the manager mutation aborts
-without changing the active release, adopted setting, cloudflared config, or
-cloudflared service. A process crash after the retirement directory fsync but
-before the authority mutation is safe: the completed transaction has no
-recovery work or artifacts, the old authority is still current, and a later
-operation can begin again from journal absence. A crash before that fsync also
-cannot expose changed authority because the ordering forbids the authority
-mutation; the next operation must re-inspect whatever terminal-or-absent state
-the filesystem durably presents.
+Journal retirement and the clean-namespace proof are locked preconditions, not
+best-effort housekeeping. If unlink, directory fsync, or absence rescan fails,
+the manager mutation aborts without changing the active release, adopted
+setting, cloudflared config, or cloudflared service. A process crash after the
+journal-directory fsync and clean rescan but before authority mutation is safe:
+no recovery state remains and the old authority is still current. A crash
+before that proof also cannot expose changed authority because the ordering
+forbids authority mutation. The next operation repeats the proof, including
+fsync after initially observed absence.
+
+Once an authority mutation is allowed to begin, the old transaction journal
+cannot legitimately reappear: its unlink was directory-durable, its namespace
+was rescanned clean, and the outer lock excludes another manager transaction.
+Disk corruption or an independently created lookalike is not old recovery
+state; it is unsafe/ambiguous state and fails closed. Consequently no recovery
+step begun after the gate needs the old release or adopted authority.
 
 Activation status/recovery also acquires the same shared outer lock before it
-classifies or changes a nonterminal journal. If a separate activation lock is
-retained, the order is always outer manager lock first, activation lock second,
-and both remain held through classification plus recovery/cleanup. A new
-activation may proceed only when the barrier is absent or a terminal journal
-has authenticated against current authority and can be safely superseded; a
-pending journal routes to recovery instead. No code may acquire these locks in
-reverse order.
+classifies or changes a journal. If a separate activation lock is retained, the
+order is always outer manager lock first, activation lock second, and both
+remain held through classification plus recovery/cleanup/retirement. A new
+activation first establishes the same durably clean namespace; a pending
+journal routes to recovery instead. No code may acquire these locks in reverse
+order.
 
 Holding the outer lock for the entire activation/recovery transaction is the
 conservative first design. It prevents update, install/reconciliation, adopt,
@@ -1026,7 +1090,9 @@ messages; being root-only is not permission to persist secrets.
 Audit facts may include sanitized operation type, transaction ID, release ID,
 source/candidate digest prefixes only if collision/confusion risk is addressed,
 state transition, result code, timestamps, and whether rollback was verified.
-The audit record is not used as transaction authority.
+The audit record is not used as transaction authority, does not live in the
+transaction-journal namespace, and cannot participate in recovery or block an
+authority change. This document does not otherwise design audit persistence.
 
 ## PR10 invariants that must survive privilege
 
@@ -1069,11 +1135,14 @@ Keep the first code review narrow:
 - stale source and candidate rejection;
 - metadata inventory and fail-closed unsupported-metadata policy;
 - secure ephemeral backup plus minimal durable journal;
-- strict terminal/nonterminal/unverifiable journal barrier classification under
-  the shared outer manager lock;
-- authenticated retirement of completed terminal journals, including journal
-  directory fsync, before update/adopt/clear/reconciliation can change the
-  release or adopted-config authority that authenticates those journals;
+- strict valid/recovery-required/unverifiable journal classification under the
+  shared outer manager lock;
+- one recovery-only journal lifecycle: durable cleanup decision, authenticated
+  idempotent artifact cleanup, affected-directory fsync, secure journal unlink,
+  journal-directory fsync, clean rescan, and only then a logical final result;
+- a durably clean journal-namespace gate, including fsync and absence rescan
+  when initial lookup returns `ENOENT`, before update/adopt/clear/reconciliation
+  may change activation authority;
 - integration of that barrier into `cfm-update`, release-switching
   installer/reconciliation, adopted-config adoption, and clear before any
   authority mutation;
@@ -1094,9 +1163,9 @@ before merge. No candidate may be committed from dashboard traffic.
 
 Production activation MUST NOT be enabled until every existing root manager
 operation that can change the active release, adopted config identity, or
-related persistent authority enforces both journal blocking and authenticated,
-directory-durable terminal retirement under the shared outer lock. This is a
-required integration invariant, not optional follow-up hardening. If barrier
+related persistent authority establishes the durably clean journal namespace
+under the shared outer lock before it revalidates and changes authority. This
+is a required integration invariant, not optional follow-up hardening. If gate
 integration is split into a separate prerequisite PR, activation remains
 unwired/disabled until that PR is merged and verified.
 
@@ -1146,13 +1215,13 @@ touches `/etc/cloudflared`, the real systemd manager, DNS, or Cloudflare.
 | Candidate integrity | candidate renamed, unlinked, replaced, chmodded, hard-linked, truncated, or rewritten; directory swapped; retained FD differs from visible name; procfs unavailable; unrelated FD inheritance; candidate on another filesystem |
 | Validation | application parser rejects before external acceptance; exact fixed cloudflared argv; FD-bound path survives ancestor swap; `pass_fds` contains only verified directory FD; `shell=False`; bounded timeout/output; unavailable executable; nonzero result; raw secret output absent from errors |
 | No-op | no candidate, backup, journal, command, service action, or active-file write for semantic no-op |
-| Locking | second activation rejected; manager update/config action contention; shared outer lock precedes barrier inspection and any activation lock; reverse order rejected; lock symlink/type/owner/mode attacks; crash releases descriptor locks but barrier remains; manual edit still detected despite manager lock |
-| Persistent recovery barrier | valid nonterminal journal blocks release update, installer/reconciliation switching, adopt, and clear; malformed/unknown-schema/impossible-state/unsafe-permission/ambiguous journal also blocks; terminal identity mismatch blocks and is never ignored; every rejection leaves current release, adopted setting, journal/artifacts, cloudflared config, and both services byte/state unchanged |
-| Terminal journal retirement | each of `COMMITTED_SUCCESS`, `FAILED_PRECOMMIT`, and `FAILED_ROLLED_BACK` authenticates against current authority and is retired before release update; each is retired before adopt and clear; retirement uses the verified fixed journal and directory fsync; unlink failure or injected retirement-directory-fsync failure blocks authority mutation; crash after durable retirement and before update/adopt/clear is a safe journal-absent state; verify no config/service action |
+| Locking | second activation rejected; manager update/config action contention; shared outer lock precedes journal-directory verification, clean-namespace proof, authority revalidation, and any activation lock; reverse order rejected; lock symlink/type/owner/mode attacks; crash releases descriptor locks but journal barrier remains; manual edit still detected despite manager lock |
+| Persistent recovery barrier | every valid journal with remaining transaction/recovery/cleanup work blocks release update, installer/reconciliation switching, adopt, and clear; malformed/unknown-schema/impossible-state/unsafe-permission/ambiguous journal also blocks; cleanup-decision identity mismatch blocks and is never ignored; every rejection leaves current release, adopted setting, journal/artifacts, cloudflared config, and both services byte/state unchanged |
+| Durably clean journal namespace | initially absent fixed journal still requires verified-directory fsync and post-fsync absence rescan; directory/ancestor rename, replacement, or identity change around scan/fsync fails closed; injected fsync/rescan failure blocks update/adopt/clear; cleanup-decision journal with already-absent artifacts authenticates against current authority, repeats affected-directory fsyncs, and retires; crash immediately before unlink, immediately after unlink, after unlink before fsync, after reboot with observed absence, and a second crash all resume deterministically; journal reappearance resumes recovery rather than becoming history; authority change immediately after the clean proof cannot resurrect the old journal or require old authority; no authority action or final result before the clean proof |
 | Recovery contention | activation recovery and update/config acquire the same outer lock; recovery holding it blocks authority mutation; update/config holding it blocks recovery until release; after acquisition each rechecks the barrier; repeated rejection and recovery are deterministic and deadlock-free |
 | Backup | exact bytes, digest, size, UID/GID/mode metadata; exclusive random/fixed-policy name; `0600` root ownership; partial write; fsync failure; directory-fsync failure; collision/symlink; backup tamper; backup cannot be confused with candidate; secrets never logged |
 | Pre-exchange revalidation | `CONFIG_COMMITTING` file/directory fsync occurs before the fresh check; source, candidate, adopted authority, parent/metadata, and complete service baseline are rechecked; any mismatch with exact original active takes `PRECOMMIT_ABORT`; assert no exchange and no service command |
-| Precommit abort | durable abort decision precedes artifact deletion; only authenticated transaction artifacts are removed; crash before/after every deletion and directory fsync resumes idempotently; wrong-identity artifact fails closed; durable `FAILED_PRECOMMIT` required before final result |
+| Precommit abort | durable abort decision precedes artifact deletion; only authenticated transaction artifacts are removed; crash before/after every deletion, affected-directory fsync, journal unlink, journal-directory fsync, and clean rescan resumes idempotently; wrong-identity artifact fails closed; `FAILED_PRECOMMIT` is logical only and requires a durably clean namespace |
 | Final asynchronous race | service exits/changes immediately after final check, during exchange, and after exchange; tests and implementation cannot claim atomic liveness coupling; post-commit continuity check detects each case and requires activation rollback |
 | Precommit race | replacement before final check; replacement between check and exchange; rename of ancestor; in-place writer holding old FD; unexpected displaced inode; exchange-back failure; candidate mutation during exchange; any possible active-name change uses rollback, never precommit abort; operator state is never silently overwritten |
 | Commit durability | unavailable `renameat2`/exchange support fails closed; candidate and source filesystem mismatch; metadata application failure; active exchange failure; active verification failure; file-fsync failure; directory-fsync failure; journal update failure at each phase |
@@ -1161,10 +1230,10 @@ touches `/etc/cloudflared`, the real systemd manager, DNS, or Cloudflare.
 | Baseline journal | sanitized enums, PID/start identity, executable identity, adopted-config fingerprint/digest relationship, and stability evidence round-trip; no raw `ExecStart`, paths, YAML, token, command line, stdout, or stderr; baseline change before intent or during the mandatory post-intent pre-exchange recheck rejects |
 | Service command | fixed absolute executable and unit; no caller-controlled argv/env; timeout; nonzero systemctl result; active-but-zero PID; PID changes during check; wrong executable/config; restart loop; readiness never arrives; readiness arrives then process dies |
 | Rollback | activation failure with exact rollback to baseline-equivalent health; config restored but service recovery fails; backup corrupt/missing before terminal decision; active matches unknown third-party state; metadata restore failure; rollback fsync failure; reverse exchange failure; restoration verification mismatch; distinct sanitized outcomes |
-| Commit cleanup | crash before commit decision retains every rollback artifact; durable `COMMIT_CLEANUP_PENDING` precedes deletion; crash before/after each unlink and directory fsync; existing artifact identity mismatch rejects; already-absent allowlisted artifact resumes safely; no success before durable `COMMITTED_SUCCESS` |
-| Rollback cleanup | crash before rollback decision retains every recovery artifact; durable `ROLLBACK_CLEANUP_PENDING` precedes deletion; crash before/after each unlink and directory fsync; identity mismatch rejects; already-absent allowlisted artifact resumes safely; no verified-rollback result before durable `FAILED_ROLLED_BACK` |
+| Commit cleanup | crash before commit decision retains every rollback artifact; durable `COMMIT_CLEANUP_PENDING` precedes deletion; crash before/after each artifact unlink, affected-directory fsync, journal unlink, journal-directory fsync, and clean rescan; existing artifact identity mismatch rejects; already-absent allowlisted artifact resumes safely; no success or persistent `COMMITTED_SUCCESS` journal before namespace cleanliness |
+| Rollback cleanup | crash before rollback decision retains every recovery artifact; durable `ROLLBACK_CLEANUP_PENDING` precedes deletion; crash before/after each artifact unlink, affected-directory fsync, journal unlink, journal-directory fsync, and clean rescan; identity mismatch rejects; already-absent allowlisted artifact resumes safely; no verified-rollback result or persistent `FAILED_ROLLED_BACK` journal before namespace cleanliness |
 | `CONFIG_COMMITTING` recovery | exact original active selects precommit abort/cleanup with no service action; exact candidate continues committed recovery/rollback; any other identity is indeterminate/manual recovery; identical classification after an in-memory `PRE_EXCHANGE_REVALIDATED` crash |
-| Crash recovery | every row in the crash matrix; old/candidate/unknown active digest; malformed or impossible journal; stale release/adopted path; journal symlink/permissions/tamper; phase-sensitive required versus cleanup-optional missing artifacts; multiple artifacts; idempotent repeated recovery; no new transaction while recovery is incomplete |
+| Crash recovery | every row in the crash matrix; old/candidate/unknown active digest; malformed or impossible journal; stale release/adopted path; journal symlink/permissions/tamper; phase-sensitive required versus cleanup-optional missing artifacts; multiple artifacts; idempotent repeated recovery and retirement; no new transaction or authority change until the journal namespace is durably clean |
 | Information safety | secret-looking YAML, paths, stdout/stderr, environment and tokens never appear in exceptions, reprs, logs, journal, CLI safe output, or browser models |
 | Scope regression | web routes remain GET-only; Add/Edit/Delete remain disabled; no Cloudflare API/DNS calls; no production config writes from web; no sudoers/unit privilege broadening; no cloudflared service call in PR A |
 

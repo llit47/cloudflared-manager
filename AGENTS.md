@@ -139,16 +139,13 @@ changes, configuration validation, and service restarts.
   artifacts, then make authenticated cleanup idempotent and directory-fsynced.
   A failed activation is never success; distinguish verified rollback from
   partial or failed rollback.
-- Under the shared outer manager lock, treat every valid nonterminal or
-  unverifiable activation journal as a persistent recovery barrier. Update,
-  release reconciliation, adopt, and clear must reject without mutation until
-  privileged recovery reaches a valid terminal state; recovery takes the same
-  outer lock.
-- Before update, release reconciliation, adopt, or clear changes authority,
-  authenticate any terminal activation journal against the current authority,
-  securely retire it, and fsync its directory under that lock. Retirement
-  failure aborts the authority change; never ignore a terminal identity
-  mismatch.
+- Under the shared outer manager lock, update, release reconciliation, adopt,
+  and clear may change authority only after proving the fixed activation-
+  journal namespace durably clean. Pathname absence alone is insufficient:
+  fsync the verified journal directory and recheck absence; journal retirement
+  is not complete before that fsync. A journal left after a final cleanup
+  decision is a recovery artifact to retire, not permanent history. Recovery
+  takes the same outer lock, and any unverifiable state fails closed unchanged.
 - Keep privileged operations allowlisted with fixed executable/service
   identities, strict bounded inputs, fixed argv, bounded timeouts,
   `shell=False`, minimal environment, and sanitized errors. Never create a
