@@ -130,6 +130,11 @@ changes, configuration validation, and service restarts.
   config mutation; an initially inactive, failed, mismatched, or unstable
   service fails closed. Treat command completion, state, process identity,
   readiness, and stability as separate checks.
+- After durable commit intent, freshly recheck source/candidate/adopted identity
+  and the complete service baseline immediately before exchange. A proven
+  pre-exchange failure aborts without config or service mutation; once the
+  active name may have changed, use rollback. Do not claim process liveness and
+  filesystem exchange are atomic.
 - Record a durable commit-or-rollback cleanup decision before deleting recovery
   artifacts, then make authenticated cleanup idempotent and directory-fsynced.
   A failed activation is never success; distinguish verified rollback from

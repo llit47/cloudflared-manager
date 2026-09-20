@@ -191,6 +191,11 @@ Future implementation MUST preserve all of the following:
     commit or rollback decision. Cleanup after that decision is authenticated,
     idempotent, directory-fsynced, and complete before a user-visible terminal
     result.
+26. After durable commit intent, the source, candidate, adopted authority, and
+    complete service baseline are freshly rechecked immediately before
+    exchange. A proven pre-exchange failure aborts without active-config or
+    service mutation; once exchange may have occurred, failure requires
+    rollback rather than precommit cleanup.
 
 ## Recommended privileged boundary
 
@@ -298,13 +303,20 @@ IDLE
   -> PRECOMMIT_REVALIDATED
   -> BACKUP_DURABLE
   -> CONFIG_COMMITTING
+  -> PRE_EXCHANGE_REVALIDATED
   -> CONFIG_COMMITTED
   -> SERVICE_ACTIVATING
   -> SERVICE_VERIFIED
   -> COMMIT_CLEANUP_PENDING
   -> COMMITTED_SUCCESS
 
-Failure after CONFIG_COMMITTING:
+Failure after durable commit intent but before any active-name change:
+
+CONFIG_COMMITTING
+  -> PRECOMMIT_ABORT
+  -> FAILED_PRECOMMIT
+
+Failure after the active name changed or may have changed:
 
 ACTIVATION_FAILED
   -> ROLLBACK_CONFIG
@@ -323,6 +335,23 @@ namespace operation before a later journal update. `BACKUP_DURABLE` is the last
 state that is still purely read-only with respect to the active name. The
 atomic exchange/replace that leaves candidate bytes at the active name is the
 point of no longer purely read-only staging.
+
+`PRE_EXCHANGE_REVALIDATED` is the fresh, in-memory result of rechecking the
+source, candidate, adopted authority, and complete healthy service baseline
+after the durable `CONFIG_COMMITTING` record has been written and fsynced. No
+journal write, filesystem preparation, service operation, or other deliberate
+work occurs between that final observation and the namespace exchange. If the
+check already differs and the active name is still provably the exact original
+source, the transaction takes `PRECOMMIT_ABORT` without touching the active
+name or controlling cloudflared.
+
+This does not create an impossible atomic guarantee. Process liveness and a
+filesystem exchange cannot be atomically coupled: cloudflared may exit or
+change state immediately after the last observation. If the baseline changes
+after the final check, during the exchange, or after it, post-commit service
+verification detects the mismatch and treats the transaction as activation
+failure requiring rollback. `PRE_EXCHANGE_REVALIDATED` narrows the race; it
+does not claim to eliminate it.
 
 `SERVICE_BASELINE_VERIFIED` is a mandatory precommit gate, not merely an
 observation for diagnostics. The first production implementation accepts only
@@ -345,6 +374,13 @@ and root recovery resumes the same idempotent cleanup. An existing artifact
 with the wrong identity is not treated as already cleaned and requires manual
 intervention; an allowlisted artifact that is absent is safe to skip.
 
+`PRECOMMIT_ABORT` is also a durable cleanup decision, but it is not rollback:
+it is permitted only after proving the active name still identifies the exact
+original source. It authorizes idempotent deletion of only the journaled
+candidate, backup, and transaction artifacts. It never changes the active
+config or invokes cloudflared service control. `FAILED_PRECOMMIT` is recorded
+durably only after authenticated cleanup and affected-directory fsync finish.
+
 ### State and transition contract
 
 | Transition | Prerequisites and verification | Side effects and durable state | Failure behavior |
@@ -355,9 +391,12 @@ intervention; an allowlisted artifact that is absent is safe to skip.
 | `CANDIDATE_VALIDATED -> SERVICE_BASELINE_VERIFIED` | Unit is loaded; state is active with the expected running substate; positive MainPID, process start identity, executable identity, adopted-config relationship, and readiness remain stable across a bounded observation | Read-only checks only; sanitized baseline facts retained in memory | Reject before active mutation; discard candidate; do not start/restart/reload an unhealthy service |
 | `SERVICE_BASELINE_VERIFIED -> PRECOMMIT_REVALIDATED` | Baseline is still current; candidate rechecked; adopted setting reread; active path/parent reopened through no-follow descriptor walk; source bytes and metadata compared with original snapshot | Read-only checks only | Reject stale source or service state; never merge/rebase; discard candidate |
 | `PRECOMMIT_REVALIDATED -> BACKUP_DURABLE` | Source still bound by retained descriptors; service baseline remains valid; backup/journal storage verified root-owned and restrictive | Exact source bytes copied from verified descriptor with pre/post identity checks; restoration metadata and digests recorded; backup file and directory fsynced; minimal journal atomically records identities, sanitized baseline facts, and `BACKUP_DURABLE`, then its directory is fsynced | Remove incomplete artifacts only when identity is proven; source untouched |
-| `BACKUP_DURABLE -> CONFIG_COMMITTING` | Final candidate/source/adopted-path checks; live service still matches the verified baseline; journal already contains baseline and exact artifact identities; commit primitive available | Journal durably records intent to modify active name | On failure before namespace change, recover as precommit and leave source untouched |
-| `CONFIG_COMMITTING -> CONFIG_COMMITTED` | Race-aware same-directory commit; displaced active object verified as exact expected source; new active object verified as exact candidate with intended metadata | One atomic namespace commit, then active file fsync as applicable and parent directory fsync; journal advances only after durability | If displaced source differs, immediately restore/exchange it and return stale rejection; after any active-name change, rollback is mandatory |
-| `CONFIG_COMMITTED -> SERVICE_ACTIVATING` | Active bytes/digest, metadata, and adopted name reverified; service phase implemented | Fixed allowlisted restart or verified reload begins; journal records phase durably first | Enter `ACTIVATION_FAILED`; rollback required |
+| `BACKUP_DURABLE -> CONFIG_COMMITTING` | Candidate/source/adopted-path artifacts and earlier baseline facts authenticate; commit primitive available | Journal durably records ambiguous intent to modify the active name and is file/directory-fsynced | A later process must classify the actual active namespace; intent alone does not require rollback |
+| `CONFIG_COMMITTING -> PRE_EXCHANGE_REVALIDATED` | After durable intent, freshly recheck exact original source at active name, candidate identity/content/metadata, adopted authority, parent identity, and the complete healthy service baseline against journaled facts | Read-only, in-memory state only; perform no journal write or unrelated work before exchange | If any fact differs while active is exact original, durably choose `PRECOMMIT_ABORT`; if active is not exact original, classify candidate versus unknown before proceeding |
+| `PRE_EXCHANGE_REVALIDATED -> CONFIG_COMMITTED` | Immediately invoke the race-aware same-directory exchange; displaced object must be exact expected source and new active object exact candidate | Atomic namespace exchange, then active file fsync as applicable and parent directory fsync; journal advances only after durability | Once exchange may have occurred, any mismatch/failure enters `ACTIVATION_FAILED` and rollback; it cannot use precommit abort |
+| `CONFIG_COMMITTING -> PRECOMMIT_ABORT` | Final revalidation failed or crash recovery ran, and descriptor/digest/metadata checks prove the active name is still the exact original source | Journal durably records precommit-abort decision and authenticated cleanup allowlist before deletion | No active-config or service action; unknown/candidate active identity cannot take this path |
+| `PRECOMMIT_ABORT -> FAILED_PRECOMMIT` | Durable abort decision authentic; each existing transaction artifact matches its journaled identity | Remove only authenticated candidate/backup/journaled artifacts idempotently, tolerate already-absent allowlisted artifacts, fsync affected directories, then durably record `FAILED_PRECOMMIT` | Resume abort cleanup after crash; no service action and no config rollback; do not finalize failure until terminal durability completes |
+| `CONFIG_COMMITTED -> SERVICE_ACTIVATING` | Active bytes/digest, metadata, and adopted name reverified; post-exchange observation confirms the pre-activation service baseline did not disappear/change across the unavoidable race; service phase implemented | Fixed allowlisted restart or verified reload begins; journal records phase durably first | A baseline mismatch after exchange enters `ACTIVATION_FAILED` immediately; rollback required even if no service command has yet run |
 | `SERVICE_ACTIVATING -> SERVICE_VERIFIED` | systemd command succeeded and bounded readiness checks prove expected service/process/config stability | Read-only service observations; journal records verification evidence without secrets | Enter `ACTIVATION_FAILED`; rollback required while no commit decision exists |
 | `SERVICE_VERIFIED -> COMMIT_CLEANUP_PENDING` | Active candidate and service stability reverified; success is now irrevocably selected | Journal durably records commit decision, complete cleanup allowlist, and `COMMIT_CLEANUP_PENDING` before any rollback artifact is removed | Journal/fsync failure leaves artifacts intact and no user-visible success; recovery still follows pre-decision rules |
 | `COMMIT_CLEANUP_PENDING -> COMMITTED_SUCCESS` | Durable commit decision authentic; each existing cleanup artifact matches its journaled identity | Remove authenticated artifacts idempotently, tolerate already-absent allowlisted artifacts, fsync every affected directory, then durably record `COMMITTED_SUCCESS` | Resume cleanup on restart; never roll back solely because a cleanup artifact is absent; do not report success until terminal durability completes |
@@ -467,14 +506,23 @@ The ordering for a successful filesystem commit is:
 1. fsync the complete candidate;
 2. create and fsync the exact backup and metadata;
 3. fsync the backup directory;
-4. atomically write/fsync the journal state identifying source, candidate, and
-   backup;
-5. fsync the journal directory;
-6. perform the race-aware same-directory namespace exchange;
-7. verify both the new active file and displaced source identities;
-8. fsync the new active file if the platform/filesystem requires reopening it;
-9. fsync the active parent directory;
-10. atomically advance and fsync the journal before service activation.
+4. atomically write/fsync `BACKUP_DURABLE`, identifying source, candidate,
+   backup, and service baseline, then fsync the journal directory;
+5. atomically write/fsync `CONFIG_COMMITTING`, then fsync the journal directory;
+6. freshly revalidate the exact source and candidate identities, adopted
+   authority, parent identity, metadata, and complete healthy service baseline;
+7. with no intervening journal write or unrelated work, perform the race-aware
+   same-directory namespace exchange;
+8. verify both the new active file and displaced source identities;
+9. fsync the new active file if the platform/filesystem requires reopening it;
+10. fsync the active parent directory; and
+11. atomically advance and fsync the journal before service activation.
+
+If step 6 fails and the active name is still provably the original source, the
+transaction durably selects `PRECOMMIT_ABORT` and cleans only authenticated
+transaction artifacts. If exchange may have occurred in step 7, any subsequent
+failure takes the activation rollback path even if a compensating exchange
+appears to restore the old name.
 
 Failure of any required fsync is failure, not a warning. File fsync does not
 make the directory-entry change durable; directory fsync is required after
@@ -542,6 +590,12 @@ failure or ambiguous pre-decision recovery, artifacts are retained for root
 administrator recovery. Automatic age-based deletion MUST NOT remove an
 artifact referenced by a nonterminal journal.
 
+For a proven pre-exchange abort, `PRECOMMIT_ABORT` is durably recorded before
+the backup or candidate is deleted. Cleanup then follows the same authenticated,
+idempotent deletion and directory-fsync rules and ends in durable
+`FAILED_PRECOMMIT`. Because the exact original source remains active, this path
+never restores config bytes and never invokes service control.
+
 Bounded historical backups are not required for the first implementation.
 They increase secret retention and require a separate retention/audit policy.
 Operators who need historical configuration should use an independently
@@ -552,9 +606,11 @@ secured configuration-management system.
 ### Required healthy baseline
 
 The first production activation implementation supports only a service that is
-already healthy. Before `PRECOMMIT_REVALIDATED`, and again immediately before
-`CONFIG_COMMITTING`, the helper MUST verify a `SERVICE_BASELINE_VERIFIED`
-baseline. At minimum it requires:
+already healthy. The helper verifies a `SERVICE_BASELINE_VERIFIED` baseline
+before `PRECOMMIT_REVALIDATED`, persists sanitized baseline facts before commit
+intent, and freshly rechecks the complete baseline after durable
+`CONFIG_COMMITTING` and immediately before namespace exchange. At minimum the
+baseline requires:
 
 - the fixed `cloudflared.service` unit is loaded;
 - `ActiveState` is `active` and `SubState` is the expected running state for the
@@ -571,10 +627,11 @@ baseline. At minimum it requires:
   executable, and adopted-config relationship.
 
 An inactive, failed, restart-looping, transitional, wrong-executable,
-wrong-config, unstable, or unverifiable service fails closed before active-file
-namespace mutation. The helper does not start, restart, reload, or repair it as
-part of the first activation design. The administrator must establish a healthy
-baseline independently and begin a new transaction.
+wrong-config, unstable, or unverifiable service found by either pre-exchange
+check fails closed before active-file namespace mutation. The helper does not
+start, restart, reload, or repair it as part of the first activation design.
+The administrator must establish a healthy baseline independently and begin a
+new transaction.
 
 The `BACKUP_DURABLE` journal record, which is durable before
 `CONFIG_COMMITTING`, captures only sanitized baseline facts: an allowlisted unit
@@ -584,6 +641,18 @@ identity, an adopted-config fingerprint and source digest relationship, the
 bounded stability duration/result, and any bounded restart-counter/timestamp
 facts required to detect instability. It contains no raw `ExecStart`, config or
 executable path, command line, environment, token, YAML, stdout, or stderr.
+
+Immediately after a successful exchange and before issuing the planned service
+operation, the helper compares live PID/start identity, unit state, executable,
+config relationship, restart counters, and relevant timestamps with the
+journaled baseline. A changed or ambiguous continuity record means the service
+changed after the final pre-exchange check; that is activation failure and
+enters rollback without attempting to reinterpret the new state as healthy.
+Post-operation verification must likewise distinguish the one planned
+lifecycle operation from any unplanned exit or restart. If that distinction
+cannot be proven from bounded systemd/process facts, it fails closed and rolls
+back. These observations detect the race; they do not make process liveness and
+filesystem exchange atomic.
 
 Rollback does not promise to recreate the same PID. "Previous service state
 restored" means that the exact old config is active and a newly observed
@@ -633,8 +702,15 @@ enabled.
 
 ## Rollback contract
 
-Any failure after the active namespace might have changed enters rollback. The
-rollback procedure:
+Failure after durable `CONFIG_COMMITTING` intent does not by itself require
+rollback. If descriptor, digest, and metadata checks prove the active name is
+still the exact original source, the transaction enters `PRECOMMIT_ABORT`,
+durably records its cleanup allowlist, removes only authenticated transaction
+artifacts, fsyncs their directories, and records `FAILED_PRECOMMIT`. It performs
+no active-config write and no cloudflared start, stop, restart, or reload.
+
+Any failure after the active namespace changed or may have changed enters
+rollback. The rollback procedure:
 
 1. authenticates the journal, healthy pre-activation baseline, backup, adopted
    path, and current active state;
@@ -661,6 +737,10 @@ The result model distinguishes at least:
 - `SERVICE_BASELINE_UNAVAILABLE`: no supported healthy baseline existed, so the
   transaction stopped before active namespace mutation and no rollback was
   attempted;
+- `FAILED_PRECOMMIT`: durable commit intent existed, but fresh pre-exchange
+  revalidation or recovery aborted while the active name was proven to remain
+  the exact original source; authenticated cleanup completed durably and no
+  service action occurred;
 - `ACTIVATION_FAILED_ROLLBACK_VERIFIED`: activation failed; exact prior config
   and a healthy service state equivalent to the captured baseline were proven
   restored, and rollback cleanup reached its durable terminal state;
@@ -714,16 +794,32 @@ fixed directory.
 
 Artifact presence is interpreted by phase. Before a durable terminal decision,
 every artifact required for rollback must exist and authenticate; absence is a
-rollback/recovery failure. In `COMMIT_CLEANUP_PENDING` or
-`ROLLBACK_CLEANUP_PENDING`, the journal proves that rollback or commit has
-already been selected and verified. Existing allowlisted artifacts must still
-authenticate before deletion, but missing allowlisted artifacts mean cleanup
-already progressed and are not by themselves indeterminate. Recovery resumes
-cleanup, fsyncs affected directories, and writes the corresponding durable
-terminal state. A durable `COMMITTED_SUCCESS` or `FAILED_ROLLED_BACK` record can
-be retained as the bounded single terminal record and replaced only when a new
+rollback/recovery failure. In `PRECOMMIT_ABORT`, `COMMIT_CLEANUP_PENDING`, or
+`ROLLBACK_CLEANUP_PENDING`, the journal proves that the corresponding outcome
+has already been selected and records the complete cleanup allowlist. Existing
+allowlisted artifacts must still authenticate before deletion, but missing
+allowlisted artifacts mean cleanup already progressed and are not by themselves
+indeterminate. Recovery resumes cleanup, fsyncs affected directories, and
+writes the corresponding durable terminal state. A durable
+`FAILED_PRECOMMIT`, `COMMITTED_SUCCESS`, or `FAILED_ROLLED_BACK` record can be
+retained as the bounded single terminal record and replaced only when a new
 transaction safely begins; deleting the journal is not required to report the
 terminal result.
+
+`CONFIG_COMMITTING` is intentionally ambiguous. Recovery MUST first classify
+the active name using retained/journaled identity, full digest, size, and
+metadata facts:
+
+- exact original source means exchange did not take effect, so durably select
+  `PRECOMMIT_ABORT` and perform authenticated cleanup with no service action;
+- exact candidate means exchange took effect, so continue committed-state
+  recovery and, on failure, activation rollback; and
+- anything else is indeterminate concurrent interference and requires manual
+  recovery without deleting artifacts or controlling the service.
+
+The same classification governs a crash in the in-memory
+`PRE_EXCHANGE_REVALIDATED` state because its durable journal still says
+`CONFIG_COMMITTING`.
 
 ### Crash matrix
 
@@ -738,8 +834,13 @@ terminal result.
 | After backup fsync but before backup-directory fsync | Backup existence is not durable | Active unchanged; repeat/clean backup creation; do not commit |
 | After durable backup but before journal fsync | Active unchanged; orphan durable backup possible | Discover only through fixed bounded artifact policy; never infer authority from filename alone; clean if identity can be proven |
 | After durable `BACKUP_DURABLE` journal, before commit intent | Active unchanged; backup, candidate identities, and sanitized healthy baseline are journaled | Revalidate source/candidate and establish that the live service still matches the recorded baseline; safe recovery may abort and clean without touching active |
-| After durable `CONFIG_COMMITTING`, before exchange | Active normally old, but crash timing is uncertain; prior healthy baseline is durable | Compare active and artifact digests/identities: old source means abort/clean; candidate at active means continue recovery using journaled baseline; anything else requires manual intervention |
+| After durable `CONFIG_COMMITTING`, before fresh recheck | Commit intent is durable but active-name mutation is unknown; prior healthy baseline is durable | Classify active name first: exact original means durably select `PRECOMMIT_ABORT`; exact candidate means recover as committed; anything else is indeterminate/manual recovery |
+| After in-memory `PRE_EXCHANGE_REVALIDATED`, before exchange | Journal still says `CONFIG_COMMITTING`; active should be original but crash timing is authoritative only through current identity | Apply the same three-way classification; never infer exchange from the in-memory phase |
+| Fresh pre-exchange source/candidate/adopted/baseline check fails with exact original active | Active config has not changed and the transaction has invoked no service action; durable intent and artifacts remain | Durably record `PRECOMMIT_ABORT`; do not exchange or invoke service control; perform only authenticated abort cleanup |
+| During `PRECOMMIT_ABORT` cleanup | Original source remains active; some allowlisted artifacts may already be absent | Authenticate/delete remaining artifacts idempotently, fsync affected directories, and durably record `FAILED_PRECOMMIT`; identity mismatch requires manual recovery |
+| After durable `FAILED_PRECOMMIT` | Original source was never changed and no service operation was invoked; transaction artifacts absent; bounded terminal journal remains | Return/reconstruct precommit failure; a later transaction may replace the terminal record under the lock |
 | Immediately after atomic exchange | Candidate may be active; old source at transaction name; directory change may not be durable | Use journal plus identities to classify; fsync/restore according to conservative recovery; never start a new transaction |
+| Service baseline changes after the final check, during exchange, or after exchange | Candidate may be active while the process no longer matches the baseline | Post-commit continuity verification detects the mismatch; enter `ACTIVATION_FAILED` and restore config plus baseline-equivalent service state through rollback |
 | After active file fsync but before active-directory fsync | File data durable; name swap may not be | Same classification; do not assume either namespace survived power loss |
 | After active-directory fsync but before `CONFIG_COMMITTED` journal | New active is durable; journal says committing | Verify candidate digest at active and exact old source/backup, then advance to recovery/service phase or rollback according to implementation policy |
 | After `CONFIG_COMMITTED` but before service operation | New active durable; old process may still use old config | Resume bounded service activation when PR B supports it; PR A must report recovery required rather than success |
@@ -851,6 +952,8 @@ Keep the first code review narrow:
 - metadata inventory and fail-closed unsupported-metadata policy;
 - secure ephemeral backup plus minimal durable journal;
 - race-aware same-directory commit prototype;
+- durable-intent then immediate pre-exchange source/candidate/adopted/service
+  revalidation, with a distinct no-service `PRECOMMIT_ABORT` path;
 - file/directory fsync ordering;
 - filesystem rollback, durable terminal cleanup decisions, idempotent artifact
   cleanup, and crash-recovery classification;
@@ -871,6 +974,9 @@ before merge. No candidate may be committed from dashboard traffic.
   initial service state;
 - durable sanitized baseline facts sufficient to prove baseline-equivalent
   service restoration without storing raw command lines or paths;
+- fresh baseline revalidation after durable `CONFIG_COMMITTING`, immediate
+  exchange with no intervening work, and post-exchange continuity checks that
+  turn any detected/ambiguous asynchronous service change into rollback;
 - verified reload support or an explicit restart decision;
 - systemd job, active-state, stable MainPID, executable/config identity, and
   readiness checks;
@@ -908,15 +1014,19 @@ touches `/etc/cloudflared`, the real systemd manager, DNS, or Cloudflare.
 | No-op | no candidate, backup, journal, command, service action, or active-file write for semantic no-op |
 | Locking | second activation rejected; manager update/config action contention; defined lock order; lock symlink/type/owner/mode attacks; lock released after every failure; manual edit still detected despite manager lock |
 | Backup | exact bytes, digest, size, UID/GID/mode metadata; exclusive random/fixed-policy name; `0600` root ownership; partial write; fsync failure; directory-fsync failure; collision/symlink; backup tamper; backup cannot be confused with candidate; secrets never logged |
-| Precommit race | replacement before final check; replacement between check and exchange; rename of ancestor; in-place writer holding old FD; unexpected displaced inode; exchange-back failure; candidate mutation during exchange; operator state is never silently overwritten |
+| Pre-exchange revalidation | `CONFIG_COMMITTING` file/directory fsync occurs before the fresh check; source, candidate, adopted authority, parent/metadata, and complete service baseline are rechecked; any mismatch with exact original active takes `PRECOMMIT_ABORT`; assert no exchange and no service command |
+| Precommit abort | durable abort decision precedes artifact deletion; only authenticated transaction artifacts are removed; crash before/after every deletion and directory fsync resumes idempotently; wrong-identity artifact fails closed; durable `FAILED_PRECOMMIT` required before final result |
+| Final asynchronous race | service exits/changes immediately after final check, during exchange, and after exchange; tests and implementation cannot claim atomic liveness coupling; post-commit continuity check detects each case and requires activation rollback |
+| Precommit race | replacement before final check; replacement between check and exchange; rename of ancestor; in-place writer holding old FD; unexpected displaced inode; exchange-back failure; candidate mutation during exchange; any possible active-name change uses rollback, never precommit abort; operator state is never silently overwritten |
 | Commit durability | unavailable `renameat2`/exchange support fails closed; candidate and source filesystem mismatch; metadata application failure; active exchange failure; active verification failure; file-fsync failure; directory-fsync failure; journal update failure at each phase |
 | Successful commit | exact candidate at adopted name; exact intended owner/group/mode; supported metadata preserved; displaced source matches snapshot; active directory durable; source was never truncated in place |
 | Service baseline | unit missing/not loaded; inactive, failed, activating, deactivating, or unexpected substate; zero/unstable/reused PID; restart loop; wrong executable; wrong adopted-config relationship; readiness failure; stability-window failure; every case rejects before namespace mutation and performs no service action |
-| Baseline journal | sanitized enums, PID/start identity, executable identity, adopted-config fingerprint/digest relationship, and stability evidence round-trip; no raw `ExecStart`, paths, YAML, token, command line, stdout, or stderr; live baseline change before `CONFIG_COMMITTING` rejects |
+| Baseline journal | sanitized enums, PID/start identity, executable identity, adopted-config fingerprint/digest relationship, and stability evidence round-trip; no raw `ExecStart`, paths, YAML, token, command line, stdout, or stderr; baseline change before intent or during the mandatory post-intent pre-exchange recheck rejects |
 | Service command | fixed absolute executable and unit; no caller-controlled argv/env; timeout; nonzero systemctl result; active-but-zero PID; PID changes during check; wrong executable/config; restart loop; readiness never arrives; readiness arrives then process dies |
 | Rollback | activation failure with exact rollback to baseline-equivalent health; config restored but service recovery fails; backup corrupt/missing before terminal decision; active matches unknown third-party state; metadata restore failure; rollback fsync failure; reverse exchange failure; restoration verification mismatch; distinct sanitized outcomes |
 | Commit cleanup | crash before commit decision retains every rollback artifact; durable `COMMIT_CLEANUP_PENDING` precedes deletion; crash before/after each unlink and directory fsync; existing artifact identity mismatch rejects; already-absent allowlisted artifact resumes safely; no success before durable `COMMITTED_SUCCESS` |
 | Rollback cleanup | crash before rollback decision retains every recovery artifact; durable `ROLLBACK_CLEANUP_PENDING` precedes deletion; crash before/after each unlink and directory fsync; identity mismatch rejects; already-absent allowlisted artifact resumes safely; no verified-rollback result before durable `FAILED_ROLLED_BACK` |
+| `CONFIG_COMMITTING` recovery | exact original active selects precommit abort/cleanup with no service action; exact candidate continues committed recovery/rollback; any other identity is indeterminate/manual recovery; identical classification after an in-memory `PRE_EXCHANGE_REVALIDATED` crash |
 | Crash recovery | every row in the crash matrix; old/candidate/unknown active digest; malformed or impossible journal; stale release/adopted path; journal symlink/permissions/tamper; phase-sensitive required versus cleanup-optional missing artifacts; multiple artifacts; idempotent repeated recovery; no new transaction while recovery is incomplete |
 | Information safety | secret-looking YAML, paths, stdout/stderr, environment and tokens never appear in exceptions, reprs, logs, journal, CLI safe output, or browser models |
 | Scope regression | web routes remain GET-only; Add/Edit/Delete remain disabled; no Cloudflare API/DNS calls; no production config writes from web; no sudoers/unit privilege broadening; no cloudflared service call in PR A |
