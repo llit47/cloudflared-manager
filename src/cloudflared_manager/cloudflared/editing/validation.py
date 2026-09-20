@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import shutil
+import stat
 import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -42,6 +44,7 @@ class ValidationCommandRunner(Protocol):
         argv: Sequence[str],
         *,
         timeout_seconds: float,
+        pass_fds: tuple[int, ...],
     ) -> ValidationCommandResult:
         """Execute a command without a shell and return sanitized process state."""
 
@@ -55,13 +58,17 @@ class SubprocessValidationCommandRunner:
         argv: Sequence[str],
         *,
         timeout_seconds: float,
+        pass_fds: tuple[int, ...],
     ) -> ValidationCommandResult:
+        _require_single_directory_fd(pass_fds)
         try:
             completed = subprocess.run(
                 list(argv),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
+                close_fds=True,
+                pass_fds=pass_fds,
                 shell=False,
                 timeout=timeout_seconds,
             )
@@ -124,18 +131,46 @@ class CloudflaredCandidateValidator:
                 "The cloudflared executable is unavailable for candidate validation."
             )
 
+        binding = candidate.validation_binding()
         argv = (
             str(executable),
             "tunnel",
             "--config",
-            str(candidate.path),
+            str(binding.path),
             "ingress",
             "validate",
         )
-        result = self._runner.run(argv, timeout_seconds=self._timeout_seconds)
+        result = self._runner.run(
+            argv,
+            timeout_seconds=self._timeout_seconds,
+            pass_fds=binding.pass_fds,
+        )
         candidate.require_intact()
         if result.returncode != 0:
             raise CloudflaredValidationRejectedError(
                 "Cloudflared rejected the candidate configuration."
             )
         return CloudflaredValidationReport()
+
+
+def _require_single_directory_fd(pass_fds: tuple[int, ...]) -> None:
+    if (
+        len(pass_fds) != 1
+        or isinstance(pass_fds[0], bool)
+        or not isinstance(pass_fds[0], int)
+        or pass_fds[0] < 0
+    ):
+        raise CloudflaredValidationExecutionError(
+            "Cloudflared validation did not receive one controlled directory descriptor."
+        )
+    try:
+        metadata = os.fstat(pass_fds[0])
+        inheritable = os.get_inheritable(pass_fds[0])
+    except OSError as error:
+        raise CloudflaredValidationExecutionError(
+            "Cloudflared validation directory identity is unavailable."
+        ) from error
+    if not stat.S_ISDIR(metadata.st_mode) or inheritable:
+        raise CloudflaredValidationExecutionError(
+            "Cloudflared validation directory identity is unsafe."
+        )

@@ -3,6 +3,7 @@
 from cloudflared_manager.cloudflared.editing.candidate import (
     CandidateFile,
     CandidateFileStager,
+    CandidateValidationBinding,
 )
 from cloudflared_manager.cloudflared.editing.document import (
     EditableCloudflaredConfig,
@@ -44,6 +45,7 @@ __all__ = [
     "CandidateFile",
     "CandidateFileError",
     "CandidateFileStager",
+    "CandidateValidationBinding",
     "CandidatePreparationResult",
     "CloudflaredCandidateValidator",
     "CloudflaredValidationExecutionError",

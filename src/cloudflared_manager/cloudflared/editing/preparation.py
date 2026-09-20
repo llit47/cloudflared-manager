@@ -95,8 +95,9 @@ def prepare_validated_candidate(
     require_source_unchanged(snapshot)
     candidate = (stager or CandidateFileStager()).stage(snapshot, rendered)
     try:
+        binding = candidate.validation_binding()
         try:
-            application_parser(candidate.path)
+            application_parser(binding.path)
         except CloudflaredConfigError as error:
             raise ApplicationValidationError(
                 "The application parser rejected the candidate configuration."

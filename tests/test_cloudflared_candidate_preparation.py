@@ -62,7 +62,8 @@ def test_success_runs_application_parser_before_external_validation(
 
     def application_parser(path: Path) -> object:
         events.append("application")
-        assert path.parent == tmp_path
+        assert path.parent.parent == Path("/proc/self/fd")
+        assert str(tmp_path) not in str(path)
         assert "new.example.com" in path.read_text(encoding="utf-8")
         return object()
 

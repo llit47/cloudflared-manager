@@ -448,13 +448,22 @@ Candidate preparation follows this bounded sequence:
    that inserts a supplied ingress mapping immediately before a valid terminal
    catch-all. Unknown existing data is not projected into a smaller model.
 3. For a real change only, exclusively create a random `0600` candidate in the
-   source directory, write it completely, and `fsync` it. The adopted source is
-   never opened for writing, replaced, renamed, removed, chmodded, or chowned.
+   source directory, write it completely, and `fsync` it. Retained read-only
+   file and directory descriptors pin its identity until discard. The adopted
+   source is never opened for writing, replaced, renamed, removed, chmodded, or
+   chowned.
 4. Run the existing PyYAML application parser against the candidate, then run
-   the replaceable external validator as the fixed argv
+   the replaceable external validator with the fixed command shape
    `cloudflared tunnel --config <candidate> ingress validate` without a shell
-   and with a finite timeout. Candidate bytes and source identity are checked
-   around validation, and any failed preparation removes its candidate.
+   and with a finite timeout. The actual config argument is
+   `/proc/self/fd/<dirfd>/<candidate>`. Only the verified candidate-directory
+   descriptor is inherited through explicit `pass_fds`; all unrelated
+   descriptors stay close-on-exec. This binds cloudflared lookup to the staged
+   directory even if an ancestor pathname is renamed or swapped. A relative
+   reference resolved beside the config still traverses the same pinned source
+   directory, while process-working-directory resolution is unchanged.
+   Candidate bytes and source identity are checked around validation, and any
+   failed preparation removes its candidate.
 5. Return either an explicit no-op or a validated, disposable candidate. Stop
    there: no code can activate the candidate in this release.
 

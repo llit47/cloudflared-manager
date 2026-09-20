@@ -8,6 +8,7 @@ import re
 import secrets
 import stat
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from cloudflared_manager.cloudflared.editing.errors import (
@@ -19,6 +20,22 @@ from cloudflared_manager.cloudflared.limits import MAX_CLOUDFLARED_CONFIG_BYTES
 
 _TOKEN_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _CREATE_ATTEMPTS = 8
+_PROC_FD_ROOT = Path("/proc/self/fd")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class CandidateValidationBinding:
+    """A Linux procfs path rooted at the verified staged directory identity."""
+
+    path: Path
+    directory_fd: int
+
+    @property
+    def pass_fds(self) -> tuple[int]:
+        return (self.directory_fd,)
+
+    def __repr__(self) -> str:
+        return "CandidateValidationBinding(bound=True)"
 
 
 class CandidateFile:
@@ -128,6 +145,34 @@ class CandidateFile:
             raise CandidateFileError(
                 "The candidate file contents changed unexpectedly."
             )
+
+    def validation_binding(self) -> CandidateValidationBinding:
+        """Bind validation lookup to the pinned directory, not its path ancestors."""
+
+        self.require_intact()
+        proc_directory = _PROC_FD_ROOT / str(self._directory_fd)
+        bound_path = proc_directory / self._name
+        try:
+            directory_metadata = os.fstat(self._directory_fd)
+            proc_directory_metadata = proc_directory.stat()
+            bound_metadata = os.stat(bound_path, follow_symlinks=False)
+        except OSError as error:
+            raise CandidateFileError(
+                "FD-bound candidate validation is unavailable on this host."
+            ) from error
+        if (
+            not stat.S_ISDIR(directory_metadata.st_mode)
+            or not stat.S_ISDIR(proc_directory_metadata.st_mode)
+            or (proc_directory_metadata.st_dev, proc_directory_metadata.st_ino)
+            != (directory_metadata.st_dev, directory_metadata.st_ino)
+            or not stat.S_ISREG(bound_metadata.st_mode)
+            or (bound_metadata.st_dev, bound_metadata.st_ino)
+            != (self._device, self._inode)
+        ):
+            raise CandidateFileError(
+                "FD-bound candidate validation could not preserve staged identity."
+            )
+        return CandidateValidationBinding(bound_path, self._directory_fd)
 
     def discard(self) -> None:
         """Remove this candidate without touching the source configuration."""
