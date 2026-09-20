@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from cloudflared_manager.deployment.environment import atomic_write_environment, read_environment
+from cloudflared_manager.deployment.environment import (
+    atomic_write_environment,
+    read_environment,
+    require_safe_environment,
+)
 from cloudflared_manager.deployment.errors import RollbackError, TransactionFailedError
 from cloudflared_manager.deployment.health import verify_managed_health, verify_running_release
 from cloudflared_manager.deployment.paths import DeploymentPaths
@@ -40,6 +44,10 @@ class Configurator:
         return settings_from_document(document), self.service.sanitized_status()
 
     def apply(self, updates: dict[str, str]) -> ConfigResult:
+        require_safe_environment(
+            self.paths.environment_file,
+            owner=self.environment_owner,
+        )
         document, previous = read_environment(self.paths.environment_file)
         previous_settings = settings_from_document(document)
         candidate = document.updated(updates)
