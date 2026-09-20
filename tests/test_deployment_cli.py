@@ -1,4 +1,7 @@
+from pathlib import Path
+
 from cloudflared_manager.deployment import cli
+from cloudflared_manager.deployment.adoption import AdoptionStatus
 from cloudflared_manager.deployment.configurator import ConfigResult
 from cloudflared_manager.deployment.settings import ManagerSettings
 
@@ -63,3 +66,58 @@ def test_set_bind_accepts_address_on_secondary_local_interface(
 
     assert result == 0
     assert applied == [{"CFM_BIND_HOST": "192.168.50.123"}]
+
+
+def test_cloudflared_config_status_reports_adopted_and_detected_paths(
+    monkeypatch,
+    capsys,
+) -> None:
+    adopted = Path("/etc/cloudflared/config.yml")
+    settings = ManagerSettings("192.168.1.20", 8000, True, adopted)
+    runtime = type(
+        "Runtime",
+        (),
+        {
+            "management_mode": cli.ManagementMode.LOCAL_CONFIG,
+            "explicit_config_path": adopted,
+        },
+    )()
+    status = AdoptionStatus(settings, runtime, True)
+
+    monkeypatch.setattr(cli, "_require_root", lambda: None)
+    monkeypatch.setattr(cli, "SystemdManager", lambda: object())
+    monkeypatch.setattr(cli, "Configurator", lambda *args: object())
+    monkeypatch.setattr(
+        cli,
+        "CloudflaredConfigAdopter",
+        lambda configurator: type("Adopter", (), {"status": lambda self: status})(),
+    )
+
+    assert cli.configure(["cloudflared-config", "status"]) == 0
+    output = capsys.readouterr().out
+    assert "Adoption state: adopted" in output
+    assert f"Adopted config path: {adopted}" in output
+    assert f"Detected local config candidate: {adopted}" in output
+
+
+def test_cloudflared_config_subcommands_dispatch_without_path_argument(
+    monkeypatch,
+) -> None:
+    calls: list[bool] = []
+    settings = ManagerSettings("192.168.1.20", 8000, True)
+
+    monkeypatch.setattr(cli, "_require_root", lambda: None)
+    monkeypatch.setattr(cli, "SystemdManager", lambda: object())
+    monkeypatch.setattr(cli, "Configurator", lambda *args: object())
+    monkeypatch.setattr(cli, "CloudflaredConfigAdopter", lambda configurator: object())
+    monkeypatch.setattr(
+        cli,
+        "_apply_adoption",
+        lambda paths, adopter, *, clear: (
+            calls.append(clear) or ConfigResult(True, settings)
+        ),
+    )
+
+    assert cli.configure(["cloudflared-config", "adopt-detected"]) == 0
+    assert cli.configure(["cloudflared-config", "clear"]) == 0
+    assert calls == [False, True]

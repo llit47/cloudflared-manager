@@ -133,10 +133,13 @@ files.
 The EnvironmentFile initially contains only the application name, production
 mode, selected concrete bind address and port, and
 `CFM_RUNTIME_DISCOVERY_ENABLED=true`. It does not contain
-`CFM_CLOUDFLARED_CONFIG_PATH` or a Cloudflare token. Environment data is parsed
-as data and is never sourced or evaluated as shell code. Unknown keys and
-comments, including future secret-bearing assignments, are preserved opaquely
-by supported updates. This release does not interpret, print, request, or use
+`CFM_CLOUDFLARED_CONFIG_PATH` or a Cloudflare token. A root administrator can
+later add the optional path only through the explicit detected-config adoption
+command described below. Fresh installs, installer reruns, updates, and service
+starts never adopt a path automatically. Environment data is parsed as data and
+is never sourced or evaluated as shell code. Unknown keys and comments,
+including future secret-bearing assignments, are preserved opaquely by
+supported updates. This release does not interpret, print, request, or use
 those unknown values.
 
 ### Service and health model
@@ -160,15 +163,19 @@ endpoint. Installation, update, and configuration success additionally require
 the readiness responder PID to match the systemd manager `MainPID`, require that
 `MainPID` to remain stable across verification, require the returned `config_id`
 to match the expected persisted runtime configuration, and confirm that the
-managed service remains active. The readiness response contains no paths,
-environment contents, command lines, or secrets.
+managed service remains active. Once adopted, the config path participates in
+that identity, proving that a restarted process loaded the requested setting.
+When no path is adopted, the identity retains the exact legacy three-field hash
+used by releases before adoption support so in-place updates remain compatible.
+The readiness response contains no paths, environment contents, command lines,
+or secrets.
 
 Runtime discovery is enabled in production. It performs only the read-only
 observations documented below. A systemd-discovered cloudflared configuration
-path remains an observation: it is not placed in the manager EnvironmentFile,
-adopted, or read as YAML. Installer output reports only sanitized binary and
+path remains an observation until a root administrator explicitly adopts it.
+Installer output does not adopt it and reports only sanitized binary and
 service state, never raw `ExecStart`, tokens, token-file paths, credentials, or
-filesystem paths.
+unrelated command-line contents.
 
 ### Administration
 
@@ -186,20 +193,46 @@ sudo cfm-config set-bind 192.168.1.20
 sudo cfm-config set-port 8000
 sudo cfm-config discovery enable
 sudo cfm-config discovery disable
+sudo cfm-config cloudflared-config status
+sudo cfm-config cloudflared-config adopt-detected
+sudo cfm-config cloudflared-config clear
 ```
 
 Status shows the bind address, port, runtime discovery setting, sanitized
 manager service state, **READ-ONLY** capability, and that Cloudflare API setup
-is unsupported. There are no API-token, account, zone, config-adoption, or
-read/write options.
+is unsupported. `cloudflared-config status` separately distinguishes an
+adopted path, a detected local-config candidate, disabled/unavailable
+discovery, token-managed mode, unknown mode, and a missing explicit candidate.
+It never prints raw `ExecStart` or token-bearing arguments.
+
+`cloudflared-config adopt-detected` accepts no path argument. It uses only the
+explicit `--config` path extracted from `cloudflared.service` by enabled runtime
+discovery, and only when the service is detected in local-config mode. Before
+changing manager state it requires a canonical absolute `.yml`/`.yaml` path,
+rejects symlinks and non-regular or oversized files, checks conventional Unix
+read/traverse permissions for the dedicated service identity, and parses the
+file with the existing safe read-only parser. Missing, unreadable, structurally
+invalid, remote-token, unknown-mode, and pathless candidates fail closed.
+
+The service-readability check deliberately does not change cloudflared file
+ownership or mode. It validates normal owner/group/other permission bits; sites
+using restrictive ACLs or other access-control mechanisms must independently
+ensure the dedicated manager service can read the adopted file. A later loss of
+access is rendered as a safe dashboard load error rather than weakening file
+protections.
+
+`cloudflared-config clear` removes only the manager's optional adopted-path
+setting. It does not remove, edit, or otherwise unadopt anything from
+cloudflared itself. Re-adopting the same exact path and clearing an already
+absent path are healthy no-ops without a restart.
 
 A changed setting is validated before any write. The configurator atomically
 replaces the manager EnvironmentFile, restarts only
-`cloudflared-manager.service`, and verifies `/healthz`. Failed health restores
-the exact previous file, restarts the manager, and verifies the restored
-configuration. The requested operation returns non-zero even when rollback
-succeeds; a failed rollback is reported distinctly. An unchanged value is a
-no-op and causes no restart.
+`cloudflared-manager.service`, and verifies deployment readiness including the
+expected config identity. Failed health restores the exact previous file,
+restarts the manager, and verifies the restored configuration. The requested
+operation returns non-zero even when rollback succeeds; a failed rollback is
+reported distinctly. An unchanged value is a no-op and causes no restart.
 
 Update to the latest exact `main` revision with:
 
@@ -224,7 +257,8 @@ restores the prior release and unit, reloads systemd, restarts the prior
 manager, and verifies its health. Stable `update.sh` and `config.sh` files are
 replaced atomically only after candidate health succeeds, so a failed update
 keeps the previous administration tools. Persistent configuration is never
-replaced during update.
+replaced during update, including an explicitly adopted cloudflared config
+path.
 
 The deployment root contains a fixed ownership marker. Installer reruns use a
 valid marked `current` release to repair an interrupted first installation
@@ -337,9 +371,9 @@ to dashboard presentation models.
 Discovery is strictly observational: it never starts, stops, restarts, reloads,
 enables, disables, or edits cloudflared or systemd. A config path found in
 service arguments is not automatically adopted or read. The separate
-`CFM_CLOUDFLARED_CONFIG_PATH` setting remains required for YAML loading, and it
-still has no default. A future production installer can reuse these discovery
-facts to configure the manager through an explicit reviewed workflow.
+`CFM_CLOUDFLARED_CONFIG_PATH` setting remains required for YAML loading, has no
+default, and can be persisted in production only by the explicit root
+`cfm-config cloudflared-config adopt-detected` workflow.
 
 ### Read-only cloudflared configuration
 
@@ -362,7 +396,10 @@ custom YAML parser or unsafe object construction is used.
 Configuration loading is strictly read-only. It does not write YAML, create
 backups, run cloudflared, contact Cloudflare, change DNS, or control system
 services. A missing or invalid explicit file produces a safe dashboard error
-while the application and `/healthz` remain available.
+while the application and `/healthz` remain available. After explicit adoption,
+the dashboard uses that file to show the tunnel declaration and sanitized
+hostname routes; it never reads or dereferences `credentials-file`, token files,
+credentials JSON, or `cert.pem`.
 
 ## Run the development server
 
@@ -386,9 +423,10 @@ The localhost bind is deliberate. A production LAN bind must be explicitly
 configured during deployment; the manager must not be exposed through a public
 listener or Cloudflare Tunnel route.
 
-Production configuration adoption and mutation, DNS management, system service
-control, transactional rollback, and managed-record ownership tracking remain
-deferred to later reviewed changes.
+Cloudflared configuration mutation, DNS management, cloudflared service control,
+and managed-record ownership tracking remain deferred to later reviewed
+changes. The production adoption workflow is manager-configuration-only and
+strictly read-only toward cloudflared.
 
 ## Run tests
 

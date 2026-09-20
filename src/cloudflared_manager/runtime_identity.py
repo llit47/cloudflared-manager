@@ -36,8 +36,17 @@ def package_release_id(package_file: str) -> str | None:
 PROCESS_RELEASE_ID = package_release_id(__file__)
 
 
-def runtime_config_id(bind_host: str, bind_port: int, discovery_enabled: bool) -> str:
-    encoded = json.dumps(
-        [bind_host, bind_port, discovery_enabled], separators=(",", ":")
-    ).encode("utf-8")
+def runtime_config_id(
+    bind_host: str,
+    bind_port: int,
+    discovery_enabled: bool,
+    cloudflared_config_path: str | Path | None = None,
+) -> str:
+    payload: list[object] = [bind_host, bind_port, discovery_enabled]
+    # Keep the deployed three-field identity byte-for-byte compatible until a
+    # path is explicitly adopted. This lets the legacy updater verify a new
+    # no-path release before the new configurator is available.
+    if cloudflared_config_path is not None:
+        payload.append(str(cloudflared_config_path))
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()

@@ -246,6 +246,35 @@ def test_explicit_config_forms_are_detected(arguments: str) -> None:
     assert result.management_mode is ManagementMode.LOCAL_CONFIG
 
 
+@pytest.mark.parametrize(
+    "config_path",
+    [
+        "/srv/example/../secret.yml",
+        "/srv/example/config with spaces.yml",
+        "/srv/example/config.yml\\nforged",
+    ],
+)
+def test_unsafe_explicit_config_path_is_not_retained(config_path: str) -> None:
+    runner = FakeCommandRunner(
+        {
+            DiscoveryCommand.SYSTEMD_SHOW: command_result(
+                systemd_output(
+                    exec_start=exec_start(
+                        f"tunnel --config '{config_path}' run"
+                    )
+                )
+            ),
+            DiscoveryCommand.SYSTEMD_IS_ENABLED: command_result("enabled\n"),
+        }
+    )
+
+    result = discover_cloudflared(True, runner, executable_finder=no_binary)
+
+    assert result is not None
+    assert result.management_mode is ManagementMode.LOCAL_CONFIG
+    assert result.explicit_config_path is None
+
+
 def test_service_without_config_or_token_has_unknown_management_mode() -> None:
     runner = FakeCommandRunner(
         {

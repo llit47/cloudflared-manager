@@ -5,11 +5,13 @@ from __future__ import annotations
 import ipaddress
 import re
 from collections.abc import Sequence
+from pathlib import Path
 
 from cloudflared_manager.deployment.errors import ValidationError
 
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 _INTERFACE = re.compile(r"^[A-Za-z0-9_.:-]{1,15}$")
+_CLOUDFLARED_CONFIG_PATH = re.compile(r"^/[A-Za-z0-9._+:/-]{1,4094}$")
 _RFC1918 = (
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
@@ -78,3 +80,22 @@ def validate_interface(value: str) -> str:
     if _INTERFACE.fullmatch(value) is None:
         raise ValidationError("The default-route interface name is invalid.")
     return value
+
+
+def validate_cloudflared_config_path(value: str | Path) -> Path:
+    """Accept one canonical, EnvironmentFile-safe absolute YAML path."""
+
+    raw = str(value)
+    path = Path(raw)
+    if (
+        _CLOUDFLARED_CONFIG_PATH.fullmatch(raw) is None
+        or raw.startswith("//")
+        or not path.is_absolute()
+        or str(path) != raw
+        or ".." in path.parts
+        or path.suffix not in {".yml", ".yaml"}
+    ):
+        raise ValidationError(
+            "The cloudflared configuration path is not a safe canonical absolute YAML path."
+        )
+    return path

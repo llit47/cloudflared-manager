@@ -27,7 +27,10 @@ class Settings:
     @property
     def config_id(self) -> str:
         return runtime_config_id(
-            self.bind_host, self.bind_port, self.runtime_discovery_enabled
+            self.bind_host,
+            self.bind_port,
+            self.runtime_discovery_enabled,
+            self.cloudflared_config_path,
         )
 
     def __post_init__(self) -> None:

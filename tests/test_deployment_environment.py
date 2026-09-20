@@ -47,6 +47,39 @@ def test_environment_update_preserves_comments_unknown_keys_and_order() -> None:
     )
 
 
+def test_optional_config_path_can_be_added_and_removed_without_touching_unknown_data() -> None:
+    document = EnvironmentDocument.parse(
+        "# operator note\nFUTURE_SETTING=keep-me\nCFM_BIND_PORT=8000\n# tail\n"
+    )
+
+    adopted = document.updated(
+        {"CFM_CLOUDFLARED_CONFIG_PATH": "/etc/cloudflared/config.yml"}
+    )
+    cleared = adopted.updated({"CFM_CLOUDFLARED_CONFIG_PATH": None})
+
+    assert adopted.render() == (
+        "# operator note\nFUTURE_SETTING=keep-me\nCFM_BIND_PORT=8000\n# tail\n\n"
+        "CFM_CLOUDFLARED_CONFIG_PATH=/etc/cloudflared/config.yml\n"
+    )
+    assert cleared.render() == document.render()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "relative/config.yml",
+        "/etc/cloudflared/../secret.yml",
+        "/etc/cloudflared/config with spaces.yml",
+        "/etc/cloudflared/config.json",
+    ],
+)
+def test_optional_config_path_uses_key_specific_strict_validation(value: str) -> None:
+    document = EnvironmentDocument.parse("CFM_BIND_PORT=8000\n")
+
+    with pytest.raises(EnvironmentFileError, match="path is not safe"):
+        document.updated({"CFM_CLOUDFLARED_CONFIG_PATH": value})
+
+
 def test_environment_data_is_never_executed(tmp_path: Path) -> None:
     marker = tmp_path / "must-not-exist"
     document = EnvironmentDocument.parse(

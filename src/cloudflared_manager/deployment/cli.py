@@ -7,9 +7,15 @@ import contextlib
 import os
 import shutil
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from cloudflared_manager.cloudflared.discovery import discover_cloudflared
+from cloudflared_manager.cloudflared.models import ManagementMode
+from cloudflared_manager.deployment.adoption import (
+    AdoptionStatus,
+    CloudflaredConfigAdopter,
+)
 from cloudflared_manager.deployment.bootstrap import BootstrapError, downloaded_source, resolve_main_sha
 from cloudflared_manager.deployment.configurator import ConfigResult, Configurator
 from cloudflared_manager.deployment.environment import read_environment
@@ -77,6 +83,7 @@ def install_from_source(source: Path, sha: str, python: Path) -> int:
             result.settings.bind_host,
             result.settings.bind_port,
             result.settings.runtime_discovery_enabled,
+            result.settings.cloudflared_config_path,
             runtime,
         )
         return 0
@@ -142,6 +149,23 @@ def configure(arguments: list[str]) -> int:
     port_parser.add_argument("port")
     discovery_parser = subparsers.add_parser("discovery", help="enable or disable runtime discovery")
     discovery_parser.add_argument("state", choices=("enable", "disable"))
+    cloudflared_parser = subparsers.add_parser(
+        "cloudflared-config",
+        help="manage explicit read-only cloudflared config adoption",
+    )
+    cloudflared_commands = cloudflared_parser.add_subparsers(
+        dest="cloudflared_config_command",
+        required=True,
+    )
+    cloudflared_commands.add_parser("status", help="show sanitized adoption state")
+    cloudflared_commands.add_parser(
+        "adopt-detected",
+        help="adopt the local config path detected from cloudflared.service",
+    )
+    cloudflared_commands.add_parser(
+        "clear",
+        help="remove the adopted cloudflared config path",
+    )
     parsed = parser.parse_args(arguments)
 
     try:
@@ -149,12 +173,24 @@ def configure(arguments: list[str]) -> int:
         paths = DeploymentPaths()
         service = SystemdManager()
         configurator = Configurator(paths, service, _health)
+        adopter = CloudflaredConfigAdopter(configurator)
         if parsed.command is None:
             if not sys.stdin.isatty():
                 parser.error("a subcommand is required when stdin is not interactive")
-            return _interactive_config(paths, configurator)
+            return _interactive_config(paths, configurator, adopter)
         if parsed.command == "status":
             _print_status(configurator)
+            return 0
+        if parsed.command == "cloudflared-config":
+            if parsed.cloudflared_config_command == "status":
+                _print_adoption_status(adopter.status())
+                return 0
+            result = _apply_adoption(
+                paths,
+                adopter,
+                clear=parsed.cloudflared_config_command == "clear",
+            )
+            _print_config_result(result)
             return 0
         if parsed.command == "set-bind":
             updates = {
@@ -194,7 +230,11 @@ def main(argv: list[str] | None = None) -> int:
     return configure(parsed.arguments)
 
 
-def _interactive_config(paths: DeploymentPaths, configurator: Configurator) -> int:
+def _interactive_config(
+    paths: DeploymentPaths,
+    configurator: Configurator,
+    adopter: CloudflaredConfigAdopter,
+) -> int:
     while True:
         print("\nCloudflared Manager configuration (capability: READ-ONLY)")
         print("1. Show status")
@@ -202,7 +242,10 @@ def _interactive_config(paths: DeploymentPaths, configurator: Configurator) -> i
         print("3. Change bind port")
         print("4. Enable runtime discovery")
         print("5. Disable runtime discovery")
-        print("6. Exit")
+        print("6. Show cloudflared config adoption status")
+        print("7. Adopt detected cloudflared config (read-only)")
+        print("8. Clear adopted cloudflared config")
+        print("9. Exit")
         choice = input("Selection: ").strip()
         if choice == "1":
             _print_status(configurator)
@@ -236,15 +279,26 @@ def _interactive_config(paths: DeploymentPaths, configurator: Configurator) -> i
                 )
             )
         elif choice == "6":
+            _print_adoption_status(adopter.status())
+        elif choice == "7":
+            _print_config_result(_apply_adoption(paths, adopter, clear=False))
+        elif choice == "8":
+            _print_config_result(_apply_adoption(paths, adopter, clear=True))
+        elif choice == "9":
             return 0
         else:
-            print("Choose a number from 1 through 6.")
+            print("Choose a number from 1 through 9.")
 
 
 def _print_status(configurator: Configurator) -> None:
     settings, states = configurator.status()
     load_state, active_state, sub_state = states
-    _print_settings(settings.bind_host, settings.bind_port, settings.runtime_discovery_enabled)
+    _print_settings(
+        settings.bind_host,
+        settings.bind_port,
+        settings.runtime_discovery_enabled,
+        settings.cloudflared_config_path,
+    )
     print("Capability: READ-ONLY")
     print("Cloudflare API: not configured / not supported by this release")
     print(f"Manager service: {active_state or 'unavailable'}")
@@ -257,7 +311,26 @@ def _print_status(configurator: Configurator) -> None:
 def _apply_config(
     paths: DeploymentPaths,
     configurator: Configurator,
-    updates: dict[str, str],
+    updates: dict[str, str | None],
+) -> ConfigResult:
+    return _locked_config_action(paths, lambda: configurator.apply(updates))
+
+
+def _apply_adoption(
+    paths: DeploymentPaths,
+    adopter: CloudflaredConfigAdopter,
+    *,
+    clear: bool,
+) -> ConfigResult:
+    return _locked_config_action(
+        paths,
+        adopter.clear if clear else adopter.adopt_detected,
+    )
+
+
+def _locked_config_action(
+    paths: DeploymentPaths,
+    action: Callable[[], ConfigResult],
 ) -> ConfigResult:
     with DeploymentLock(paths.lock_path):
         current_release = ReleaseFilesystem(paths).read_current_sha()
@@ -265,7 +338,7 @@ def _apply_config(
             raise HostOperationError(
                 "The configuration process does not match the current manager release."
             )
-        return configurator.apply(updates)
+        return action()
 
 
 def _print_config_result(result: ConfigResult) -> None:
@@ -277,12 +350,48 @@ def _print_config_result(result: ConfigResult) -> None:
         result.settings.bind_host,
         result.settings.bind_port,
         result.settings.runtime_discovery_enabled,
+        result.settings.cloudflared_config_path,
     )
 
 
-def _print_settings(host: str, port: int, discovery: bool) -> None:
+def _print_settings(
+    host: str,
+    port: int,
+    discovery: bool,
+    cloudflared_config_path: Path | None = None,
+) -> None:
     print(f"Manager URL: http://{host}:{port}")
     print(f"Runtime discovery: {'enabled' if discovery else 'disabled'}")
+    print(
+        "Cloudflared config: "
+        + (
+            f"adopted ({cloudflared_config_path})"
+            if cloudflared_config_path is not None
+            else "not adopted"
+        )
+    )
+
+
+def _print_adoption_status(status: AdoptionStatus) -> None:
+    path = status.settings.cloudflared_config_path
+    print(f"Adoption state: {'adopted' if path is not None else 'not adopted'}")
+    if path is not None:
+        print(f"Adopted config path: {path}")
+    if not status.settings.runtime_discovery_enabled:
+        print("Detected local config candidate: unavailable (runtime discovery disabled)")
+        return
+    if not status.discovery_succeeded or status.runtime is None:
+        print("Detected local config candidate: none (runtime discovery unavailable)")
+        return
+    runtime = status.runtime
+    if status.detected_path is not None:
+        print(f"Detected local config candidate: {status.detected_path}")
+    elif runtime.management_mode is ManagementMode.REMOTE_TOKEN:
+        print("Detected local config candidate: none (token-managed mode)")
+    elif runtime.management_mode is ManagementMode.LOCAL_CONFIG:
+        print("Detected local config candidate: none (no explicit config path)")
+    else:
+        print("Detected local config candidate: none (management mode unknown)")
 
 
 def _print_install_summary(
@@ -291,6 +400,7 @@ def _print_install_summary(
     host: str,
     port: int,
     discovery_enabled: bool,
+    cloudflared_config_path: Path | None,
     runtime: object,
 ) -> None:
     binary_detected = getattr(runtime, "executable_exists", False)
@@ -307,7 +417,14 @@ def _print_install_summary(
         print(f"Cloudflared version: {version}")
     print(f"Cloudflared service: {active_state or 'unavailable'}")
     print(f"Cloudflared startup: {enabled_state or 'unavailable'}")
-    print("Cloudflared config: not adopted")
+    print(
+        "Cloudflared config: "
+        + (
+            f"adopted ({cloudflared_config_path})"
+            if cloudflared_config_path is not None
+            else "not adopted"
+        )
+    )
     print("Cloudflare API: not configured")
     print("Commands: sudo cfm-config | sudo cfm-update")
 

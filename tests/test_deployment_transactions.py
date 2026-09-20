@@ -20,6 +20,7 @@ from cloudflared_manager.deployment.reconciliation import DeploymentReconciler
 from cloudflared_manager.deployment.release import ReleaseFilesystem
 from cloudflared_manager.deployment.settings import settings_from_document
 from cloudflared_manager.deployment.updater import Updater
+from cloudflared_manager.runtime_identity import runtime_config_id
 from tests.deployment_support import (
     FakePreparationRunner,
     FakeService,
@@ -878,6 +879,48 @@ def test_successful_update_switches_release_after_preflight_and_preserves_config
     assert paths.unit_path.read_bytes() == b"new unit\n"
     assert "new update" in paths.stable_update.read_text()
     assert "new config" in paths.stable_config.read_text()
+
+
+def test_update_preserves_adopted_path_and_verifies_extended_runtime_identity(
+    tmp_path: Path,
+) -> None:
+    paths, filesystem = _installed(tmp_path)
+    adopted_path = tmp_path / "cloudflared" / "config.yml"
+    adopted_path.parent.mkdir()
+    adopted_path.write_text("ingress:\n  - service: http_status:404\n", encoding="utf-8")
+    document, _ = read_environment(paths.environment_file)
+    adopted = document.updated(
+        {"CFM_CLOUDFLARED_CONFIG_PATH": str(adopted_path)}
+    )
+    atomic_write_environment(paths.environment_file, adopted, owner=None)
+    previous_environment = paths.environment_file.read_bytes()
+    source = make_source(tmp_path / "new", unit=b"new unit\n")
+    service = FakeService()
+    identities: list[str] = []
+
+    def health(host: str, port: int):
+        release_id = NEW_SHA if filesystem.read_current_sha() == NEW_SHA else OLD_SHA
+        response = fake_readiness(
+            host,
+            port,
+            cloudflared_config_path=adopted_path,
+            release_id=release_id,
+        )
+        identities.append(response.config_id)
+        return response
+
+    result = Updater(paths, filesystem, service, health).update(
+        source,
+        NEW_SHA,
+        Path("/usr/bin/python3"),
+    )
+
+    assert result.changed is True
+    assert paths.environment_file.read_bytes() == previous_environment
+    assert identities
+    assert set(identities) == {
+        runtime_config_id("192.168.1.20", 8000, True, adopted_path)
+    }
 
 
 def test_update_reloads_unit_already_written_by_interrupted_attempt(tmp_path: Path) -> None:

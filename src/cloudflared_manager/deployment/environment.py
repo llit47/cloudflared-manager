@@ -9,7 +9,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from cloudflared_manager.deployment.errors import EnvironmentFileError
+from cloudflared_manager.deployment.errors import EnvironmentFileError, ValidationError
+from cloudflared_manager.deployment.validation import validate_cloudflared_config_path
 
 MAX_ENVIRONMENT_BYTES = 65_536
 MANAGED_KEY_ORDER = (
@@ -18,6 +19,7 @@ MANAGED_KEY_ORDER = (
     "CFM_BIND_HOST",
     "CFM_BIND_PORT",
     "CFM_RUNTIME_DISCOVERY_ENABLED",
+    "CFM_CLOUDFLARED_CONFIG_PATH",
 )
 MANAGED_KEYS = frozenset(MANAGED_KEY_ORDER)
 _ASSIGNMENT = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$")
@@ -49,14 +51,11 @@ class EnvironmentDocument:
                 raise EnvironmentFileError(
                     f"The manager environment file contains duplicate {key} entries."
                 )
-            if _SAFE_VALUE.fullmatch(value) is None:
-                raise EnvironmentFileError(
-                    f"The managed value for {key} is not in the supported safe format."
-                )
+            _validate_updates({key: value})
             values[key] = value
         return values
 
-    def updated(self, updates: dict[str, str]) -> EnvironmentDocument:
+    def updated(self, updates: dict[str, str | None]) -> EnvironmentDocument:
         _validate_updates(updates)
         self.managed_values()
         remaining = dict(updates)
@@ -65,7 +64,9 @@ class EnvironmentDocument:
             match = _ASSIGNMENT.fullmatch(line)
             if match is not None and match.group(1) in remaining:
                 key = match.group(1)
-                rendered.append(f"{key}={remaining.pop(key)}")
+                value = remaining.pop(key)
+                if value is not None:
+                    rendered.append(f"{key}={value}")
             else:
                 rendered.append(line)
         if remaining:
@@ -73,7 +74,9 @@ class EnvironmentDocument:
                 rendered.append("")
             for key in MANAGED_KEY_ORDER:
                 if key in remaining:
-                    rendered.append(f"{key}={remaining[key]}")
+                    value = remaining[key]
+                    if value is not None:
+                        rendered.append(f"{key}={value}")
         document = EnvironmentDocument(tuple(rendered))
         document.managed_values()
         return document
@@ -193,11 +196,20 @@ def atomic_write_environment(
                 pass
 
 
-def _validate_updates(updates: dict[str, str]) -> None:
+def _validate_updates(updates: dict[str, str | None]) -> None:
     for key, value in updates.items():
         if key not in MANAGED_KEYS:
             raise EnvironmentFileError(f"{key} is not managed by this release.")
-        if _SAFE_VALUE.fullmatch(value) is None:
+        if value is None:
+            continue
+        if key == "CFM_CLOUDFLARED_CONFIG_PATH":
+            try:
+                validate_cloudflared_config_path(value)
+            except ValidationError as error:
+                raise EnvironmentFileError(
+                    "The cloudflared configuration path is not safe for EnvironmentFile."
+                ) from error
+        elif _SAFE_VALUE.fullmatch(value) is None:
             raise EnvironmentFileError(f"The value for {key} is not safe for EnvironmentFile.")
 
 

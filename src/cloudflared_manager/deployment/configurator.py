@@ -40,10 +40,13 @@ class Configurator:
         self.environment_owner = environment_owner
 
     def status(self) -> tuple[ManagerSettings, tuple[str | None, str | None, str | None]]:
-        document, _ = read_environment(self.paths.environment_file)
-        return settings_from_document(document), self.service.sanitized_status()
+        return self.settings(), self.service.sanitized_status()
 
-    def apply(self, updates: dict[str, str]) -> ConfigResult:
+    def settings(self) -> ManagerSettings:
+        document, _ = read_environment(self.paths.environment_file)
+        return settings_from_document(document)
+
+    def apply(self, updates: dict[str, str | None]) -> ConfigResult:
         require_safe_environment(
             self.paths.environment_file,
             owner=self.environment_owner,
