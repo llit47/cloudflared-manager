@@ -1,0 +1,459 @@
+import os
+import stat
+from pathlib import Path
+
+import pytest
+
+from cloudflared_manager.deployment.errors import HostOperationError, UpdateLockedError
+from cloudflared_manager.deployment.release import (
+    INCOMPLETE_MARKER,
+    READY_MARKER,
+    DeploymentLock,
+    ReleaseFilesystem,
+)
+from tests.deployment_support import FakePreparationRunner, make_paths, make_source
+
+OLD_SHA = "1" * 40
+NEW_SHA = "2" * 40
+
+
+def test_release_venv_is_created_at_final_sha_path(tmp_path: Path) -> None:
+    paths = make_paths(tmp_path)
+    runner = FakePreparationRunner()
+    filesystem = ReleaseFilesystem(paths, owner=None, process_runner=runner)
+    filesystem.ensure_layout()
+    source = make_source(tmp_path)
+
+    release = filesystem.prepare_release(source, NEW_SHA, Path("/usr/bin/python3"))
+
+    expected_venv = paths.release(NEW_SHA) / ".venv"
+    assert release == paths.release(NEW_SHA)
+    assert runner.calls[0][0] == [
+        "/usr/bin/python3",
+        "-I",
+        "-m",
+        "venv",
+        str(expected_venv),
+    ]
+    pip_arguments = runner.calls[1][0]
+    assert pip_arguments[:5] == [
+        str(expected_venv / "bin" / "python"),
+        "-I",
+        "-m",
+        "pip",
+        "--isolated",
+    ]
+    assert pip_arguments[pip_arguments.index("--index-url") + 1] == "https://pypi.org/simple"
+    assert (release / ".release-ready").read_text().strip() == NEW_SHA
+    assert release.stat().st_mode & 0o022 == 0
+    assert (expected_venv / "bin" / "cloudflared-manager").stat().st_mode & 0o022 == 0
+
+
+def test_hardening_failure_cannot_publish_ready_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = make_paths(tmp_path)
+    filesystem = ReleaseFilesystem(
+        paths, owner=None, process_runner=FakePreparationRunner()
+    )
+    filesystem.ensure_layout()
+    source = make_source(tmp_path / "candidate")
+    target = paths.release(NEW_SHA)
+
+    def fail_hardening(_release: Path) -> None:
+        raise OSError("synthetic hardening failure")
+
+    monkeypatch.setattr(filesystem, "_harden_tree", fail_hardening)
+
+    with pytest.raises(HostOperationError, match="could not be prepared"):
+        filesystem.prepare_release(source, NEW_SHA, Path("/usr/bin/python3"))
+
+    assert not (target / READY_MARKER).exists()
+    assert filesystem._is_ready_release(target, NEW_SHA) is False
+    with pytest.raises(HostOperationError, match="not ready"):
+        filesystem.switch_current(NEW_SHA)
+    assert not paths.current.exists()
+
+
+def test_ready_marker_is_atomically_published_after_full_hardening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = make_paths(tmp_path)
+    filesystem = ReleaseFilesystem(
+        paths, owner=None, process_runner=FakePreparationRunner()
+    )
+    filesystem.ensure_layout()
+    events: list[str] = []
+    original_harden = filesystem._harden_tree
+    original_atomic_write = filesystem.atomic_write
+
+    def record_hardening(release: Path) -> None:
+        assert (release / INCOMPLETE_MARKER).exists()
+        assert not (release / READY_MARKER).exists()
+        original_harden(release)
+        events.append("hardened")
+
+    def record_atomic_write(path: Path, content: bytes, mode: int) -> None:
+        if path.name == READY_MARKER:
+            assert events == ["hardened"]
+            assert not (path.parent / INCOMPLETE_MARKER).exists()
+            assert content == (NEW_SHA + "\n").encode("ascii")
+            assert mode == 0o644
+            events.append("ready published")
+        original_atomic_write(path, content, mode)
+
+    monkeypatch.setattr(filesystem, "_harden_tree", record_hardening)
+    monkeypatch.setattr(filesystem, "atomic_write", record_atomic_write)
+
+    release = filesystem.prepare_release(
+        make_source(tmp_path / "candidate"), NEW_SHA, Path("/usr/bin/python3")
+    )
+
+    ready = release / READY_MARKER
+    metadata = ready.stat()
+    assert events == ["hardened", "ready published"]
+    assert ready.read_bytes() == (NEW_SHA + "\n").encode("ascii")
+    assert stat.S_IMODE(metadata.st_mode) == 0o644
+    assert (metadata.st_uid, metadata.st_gid) == (os.geteuid(), os.getegid())
+    assert filesystem._is_ready_release(release, NEW_SHA) is True
+
+
+def test_current_symlink_switch_is_atomic_and_reversible(tmp_path: Path) -> None:
+    paths = make_paths(tmp_path)
+    runner = FakePreparationRunner()
+    filesystem = ReleaseFilesystem(paths, owner=None, process_runner=runner)
+    filesystem.ensure_layout()
+    old_source = make_source(tmp_path / "old")
+    new_source = make_source(tmp_path / "new")
+    filesystem.prepare_release(old_source, OLD_SHA, Path("/usr/bin/python3"))
+    filesystem.prepare_release(new_source, NEW_SHA, Path("/usr/bin/python3"))
+
+    assert filesystem.switch_current(OLD_SHA) is None
+    previous = filesystem.switch_current(NEW_SHA)
+    assert previous == f"releases/{OLD_SHA}"
+    assert filesystem.read_current_sha() == NEW_SHA
+
+    filesystem.restore_current(previous)
+    assert filesystem.read_current_sha() == OLD_SHA
+
+
+def test_update_lock_rejects_concurrent_owner(tmp_path: Path) -> None:
+    lock_path = tmp_path / "update.lock"
+
+    with DeploymentLock(lock_path, owner=None):
+        with pytest.raises(UpdateLockedError):
+            with DeploymentLock(lock_path, owner=None):
+                pass
+
+
+def test_malformed_current_link_is_rejected(tmp_path: Path) -> None:
+    paths = make_paths(tmp_path)
+    filesystem = ReleaseFilesystem(paths, owner=None)
+    filesystem.ensure_layout()
+    paths.current.symlink_to("../../etc/cloudflared")
+
+    with pytest.raises(HostOperationError, match="unsafe"):
+        filesystem.read_current_sha()
+
+
+def test_existing_system_command_directory_mode_is_not_changed(tmp_path: Path) -> None:
+    paths = make_paths(tmp_path)
+    paths.update_link.parent.mkdir(parents=True, mode=0o750)
+    filesystem = ReleaseFilesystem(paths, owner=None)
+
+    filesystem.ensure_layout()
+
+    assert paths.update_link.parent.stat().st_mode & 0o777 == 0o750
+
+
+def test_existing_unmarked_install_root_is_rejected(tmp_path: Path) -> None:
+    paths = make_paths(tmp_path)
+    paths.install_root.mkdir(parents=True)
+    (paths.install_root / "unrelated").write_text("operator data\n", encoding="utf-8")
+
+    with pytest.raises(HostOperationError, match="not recognizable"):
+        ReleaseFilesystem(paths, owner=None).ensure_layout()
+
+    assert (paths.install_root / "unrelated").read_text() == "operator data\n"
+
+
+def test_existing_safe_releases_directory_is_accepted(tmp_path: Path) -> None:
+    paths = make_paths(tmp_path)
+    filesystem = ReleaseFilesystem(paths, owner=None)
+
+    filesystem.ensure_layout()
+    filesystem.ensure_layout()
+
+    assert paths.releases.is_dir()
+    assert not paths.releases.is_symlink()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "file", "writable"])
+def test_unsafe_releases_boundary_is_rejected_without_modification(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    paths = make_paths(tmp_path)
+    filesystem = ReleaseFilesystem(
+        paths,
+        owner=None,
+        process_runner=FakePreparationRunner(),
+    )
+    filesystem.ensure_layout()
+    paths.releases.rmdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if kind == "symlink":
+        paths.releases.symlink_to(outside, target_is_directory=True)
+    elif kind == "file":
+        paths.releases.write_text("unrelated\n", encoding="utf-8")
+    else:
+        paths.releases.mkdir()
+        paths.releases.chmod(0o777)
+
+    with pytest.raises(HostOperationError, match="releases directory is unsafe"):
+        filesystem.ensure_layout()
+
+    if kind == "symlink":
+        assert paths.releases.is_symlink()
+    elif kind == "file":
+        assert paths.releases.read_text() == "unrelated\n"
+    else:
+        assert paths.releases.stat().st_mode & 0o777 == 0o777
+
+
+def test_prepare_rejects_releases_symlink_before_touching_external_candidate(
+    tmp_path: Path,
+) -> None:
+    paths = make_paths(tmp_path)
+    filesystem = ReleaseFilesystem(
+        paths,
+        owner=None,
+        process_runner=FakePreparationRunner(),
+    )
+    filesystem.ensure_layout()
+    paths.releases.rmdir()
+    outside = tmp_path / "outside"
+    external_candidate = outside / NEW_SHA
+    external_candidate.mkdir(parents=True)
+    sentinel = external_candidate / "operator-data"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    paths.releases.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(HostOperationError, match="releases directory is unsafe"):
+        filesystem.prepare_release(
+            make_source(tmp_path / "candidate"),
+            NEW_SHA,
+            Path("/usr/bin/python3"),
+        )
+
+    assert sentinel.read_text() == "keep\n"
+    assert paths.releases.is_symlink()
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "read-current",
+        "switch-current",
+        "restore-current",
+        "validate-assets",
+        "install-unit",
+        "install-administration",
+    ],
+)
+def test_existing_release_operations_reject_symlinked_releases_boundary(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    paths = make_paths(tmp_path)
+    filesystem = ReleaseFilesystem(
+        paths,
+        owner=None,
+        process_runner=FakePreparationRunner(),
+    )
+    filesystem.ensure_layout()
+    old_release = filesystem.prepare_release(
+        make_source(tmp_path / "old"),
+        OLD_SHA,
+        Path("/usr/bin/python3"),
+    )
+    new_source = make_source(tmp_path / "new")
+    (new_source / "deploy" / "cloudflared-manager.service").write_text(
+        "candidate unit must not be installed\n",
+        encoding="utf-8",
+    )
+    (new_source / "deploy" / "update.sh").write_text(
+        "#!/bin/sh\n# candidate script must not be installed\n",
+        encoding="utf-8",
+    )
+    filesystem.prepare_release(
+        new_source,
+        NEW_SHA,
+        Path("/usr/bin/python3"),
+    )
+    filesystem.switch_current(OLD_SHA)
+    filesystem.install_unit(old_release)
+    filesystem.install_stable_administration(old_release)
+    previous_unit = paths.unit_path.read_bytes()
+    previous_update = paths.stable_update.read_bytes()
+
+    external_releases = tmp_path / "external-releases"
+    paths.releases.rename(external_releases)
+    paths.releases.symlink_to(external_releases, target_is_directory=True)
+    sentinel = external_releases / "operator-data"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    external_new_release = paths.release(NEW_SHA)
+
+    operations = {
+        "read-current": lambda: filesystem.read_current_sha(),
+        "switch-current": lambda: filesystem.switch_current(NEW_SHA),
+        "restore-current": lambda: filesystem.restore_current(f"releases/{NEW_SHA}"),
+        "validate-assets": lambda: filesystem.validate_deployment_assets(
+            external_new_release
+        ),
+        "install-unit": lambda: filesystem.install_unit(external_new_release),
+        "install-administration": lambda: filesystem.install_stable_administration(
+            external_new_release
+        ),
+    }
+
+    with pytest.raises(HostOperationError, match="releases directory is unsafe"):
+        operations[operation]()
+
+    assert os.readlink(paths.current) == f"releases/{OLD_SHA}"
+    assert paths.unit_path.read_bytes() == previous_unit
+    assert paths.stable_update.read_bytes() == previous_update
+    assert sentinel.read_text() == "keep\n"
+
+
+@pytest.mark.parametrize("kind", ["file", "writable"])
+def test_read_current_rejects_other_unsafe_releases_boundaries(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    paths = make_paths(tmp_path)
+    filesystem = ReleaseFilesystem(
+        paths,
+        owner=None,
+        process_runner=FakePreparationRunner(),
+    )
+    filesystem.ensure_layout()
+    filesystem.prepare_release(
+        make_source(tmp_path / "release"),
+        NEW_SHA,
+        Path("/usr/bin/python3"),
+    )
+    filesystem.switch_current(NEW_SHA)
+
+    if kind == "file":
+        paths.releases.rename(tmp_path / "external-releases")
+        paths.releases.write_text("unrelated\n", encoding="utf-8")
+    else:
+        paths.releases.chmod(0o777)
+
+    with pytest.raises(HostOperationError, match="releases directory is unsafe"):
+        filesystem.read_current_sha()
+
+
+@pytest.mark.parametrize(
+    "collision",
+    ["unit", "stable-update", "stable-config", "update-link", "config-link"],
+)
+def test_unmanaged_deployment_path_collision_is_rejected(
+    tmp_path: Path,
+    collision: str,
+) -> None:
+    paths = make_paths(tmp_path)
+    filesystem = ReleaseFilesystem(
+        paths,
+        owner=None,
+        process_runner=FakePreparationRunner(),
+    )
+    filesystem.ensure_layout()
+    release = filesystem.prepare_release(
+        make_source(tmp_path / "release"),
+        NEW_SHA,
+        Path("/usr/bin/python3"),
+    )
+    targets = {
+        "unit": paths.unit_path,
+        "stable-update": paths.stable_update,
+        "stable-config": paths.stable_config,
+        "update-link": paths.update_link,
+        "config-link": paths.config_link,
+    }
+    target = targets[collision]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if collision.endswith("link"):
+        target.symlink_to("/tmp/unrelated-command")
+    else:
+        target.write_text("unrelated operator content\n", encoding="utf-8")
+        target.chmod(0o644)
+
+    with pytest.raises(HostOperationError, match="collides"):
+        filesystem.validate_deployment_assets(release)
+
+    if collision.endswith("link"):
+        assert target.readlink() == Path("/tmp/unrelated-command")
+    else:
+        assert target.read_text() == "unrelated operator content\n"
+
+
+@pytest.mark.parametrize(
+    "target_name",
+    ["unit", "stable-update", "stable-config", "update-link", "config-link"],
+)
+def test_first_install_refuses_existing_path_without_active_ownership(
+    tmp_path: Path,
+    target_name: str,
+) -> None:
+    paths = make_paths(tmp_path)
+    filesystem = ReleaseFilesystem(paths, owner=None)
+    filesystem.ensure_layout()
+    source = make_source(tmp_path / "candidate")
+    targets = {
+        "unit": paths.unit_path,
+        "stable-update": paths.stable_update,
+        "stable-config": paths.stable_config,
+        "update-link": paths.update_link,
+        "config-link": paths.config_link,
+    }
+    target = targets[target_name]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target_name.endswith("link"):
+        target.symlink_to(
+            paths.stable_update if target_name == "update-link" else paths.stable_config
+        )
+    elif target_name == "unit":
+        target.write_bytes((source / "deploy" / "cloudflared-manager.service").read_bytes())
+    else:
+        script = "update.sh" if target_name == "stable-update" else "config.sh"
+        target.write_bytes((source / "deploy" / script).read_bytes())
+
+    with pytest.raises(HostOperationError, match="First installation collides"):
+        filesystem.validate_first_install_paths()
+
+    assert target.is_symlink() if target_name.endswith("link") else target.is_file()
+
+
+def test_reconciliation_rejects_writable_existing_stable_script(tmp_path: Path) -> None:
+    paths = make_paths(tmp_path)
+    filesystem = ReleaseFilesystem(
+        paths,
+        owner=None,
+        process_runner=FakePreparationRunner(),
+    )
+    filesystem.ensure_layout()
+    release = filesystem.prepare_release(
+        make_source(tmp_path / "release"),
+        NEW_SHA,
+        Path("/usr/bin/python3"),
+    )
+    paths.stable_update.write_bytes((release / "deploy" / "update.sh").read_bytes())
+    paths.stable_update.chmod(0o777)
+
+    with pytest.raises(HostOperationError, match="unsafe ownership or permissions"):
+        filesystem.validate_deployment_assets(release)
+
+    assert paths.stable_update.stat().st_mode & 0o777 == 0o777

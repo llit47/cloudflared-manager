@@ -38,9 +38,18 @@ dist/
 cert.pem
 credentials.json
 *-credentials.json
+*.credentials.json
+tunnel-credentials.json
+cloudflared-credentials/
 
 # Editor and operating-system files
 .DS_Store
 .idea/
 .vscode/
 *.swp
+*~
+
+# Logs and backup files
+*.log
+*.bak
+*.backup

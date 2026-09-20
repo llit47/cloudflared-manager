@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
+from cloudflared_manager.runtime_identity import runtime_config_id
+
 ApplicationMode = Literal["development", "test", "production"]
 
 
@@ -21,6 +23,12 @@ class Settings:
     bind_port: int = 8000
     cloudflared_config_path: Path | None = None
     runtime_discovery_enabled: bool = False
+
+    @property
+    def config_id(self) -> str:
+        return runtime_config_id(
+            self.bind_host, self.bind_port, self.runtime_discovery_enabled
+        )
 
     def __post_init__(self) -> None:
         if not self.app_name.strip():
