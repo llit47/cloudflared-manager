@@ -30,6 +30,14 @@ from cloudflared_manager.deployment.validation import validate_cloudflared_confi
 MAX_ADOPTED_CONFIG_BYTES = 1_048_576
 ConfigParser = Callable[[Path], CloudflaredConfig]
 IdentityProvider = Callable[[], tuple[int, int]]
+PathValidator = Callable[[Path], None]
+_MANAGER_SERVICE_HIDDEN_PREFIXES = (
+    Path("/root"),
+    Path("/home"),
+    Path("/run/user"),
+    Path("/tmp"),
+    Path("/var/tmp"),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,11 +68,15 @@ class CloudflaredConfigAdopter:
         runtime_discovery: RuntimeDiscoveryProvider = discover_cloudflared,
         config_parser: ConfigParser = parse_cloudflared_config,
         identity_provider: IdentityProvider | None = None,
+        sandbox_path_validator: PathValidator | None = None,
     ) -> None:
         self.configurator = configurator
         self.runtime_discovery = runtime_discovery
         self.config_parser = config_parser
         self.identity_provider = identity_provider or _service_identity
+        self.sandbox_path_validator = (
+            sandbox_path_validator or _require_manager_service_sandbox_visible
+        )
 
     def status(self) -> AdoptionStatus:
         settings = self.configurator.settings()
@@ -103,6 +115,7 @@ class CloudflaredConfigAdopter:
             )
 
         candidate = validate_cloudflared_config_path(runtime.explicit_config_path)
+        self.sandbox_path_validator(candidate)
         service_uid, service_gid = self.identity_provider()
         _require_service_readable_regular_file(candidate, service_uid, service_gid)
         try:
@@ -127,6 +140,19 @@ def _service_identity() -> tuple[int, int]:
             "The cloudflared-manager service identity is unavailable."
         ) from error
     return user.pw_uid, user.pw_gid
+
+
+def _require_manager_service_sandbox_visible(path: Path) -> None:
+    """Reject paths hidden by the fixed ProtectHome/PrivateTmp unit settings."""
+
+    if any(
+        path == prefix or prefix in path.parents
+        for prefix in _MANAGER_SERVICE_HIDDEN_PREFIXES
+    ):
+        raise ValidationError(
+            "The detected cloudflared configuration is hidden by the manager "
+            "service sandbox."
+        )
 
 
 def _require_service_readable_regular_file(path: Path, uid: int, gid: int) -> None:

@@ -6,7 +6,10 @@ from pathlib import Path
 import pytest
 
 from cloudflared_manager.cloudflared import CloudflaredRuntime, ManagementMode
-from cloudflared_manager.deployment.adoption import CloudflaredConfigAdopter
+from cloudflared_manager.deployment.adoption import (
+    CloudflaredConfigAdopter,
+    _require_manager_service_sandbox_visible,
+)
 from cloudflared_manager.deployment.configurator import Configurator
 from cloudflared_manager.deployment.environment import (
     atomic_write_environment,
@@ -114,6 +117,7 @@ def _adopter(tmp_path: Path, candidate: Path, health=None):
         configurator,
         runtime_discovery=lambda enabled: _runtime(candidate),
         identity_provider=lambda: (os.getuid(), os.getgid()),
+        sandbox_path_validator=lambda path: None,
     )
     return paths, service, adopter
 
@@ -197,6 +201,7 @@ def test_failed_adoption_health_restores_exact_file_and_verifies_previous_identi
         Configurator(paths, service, health, environment_owner=None),
         runtime_discovery=lambda enabled: _runtime(candidate),
         identity_provider=lambda: (os.getuid(), os.getgid()),
+        sandbox_path_validator=lambda path: None,
     )
 
     with pytest.raises(TransactionFailedError, match="restored"):
@@ -360,6 +365,75 @@ def test_file_unreadable_by_service_identity_is_rejected(tmp_path: Path) -> None
 
     assert "CFM_CLOUDFLARED_CONFIG_PATH" not in paths.environment_file.read_text()
     assert service.calls == []
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        Path("/root/cloudflared/config.yml"),
+        Path("/home/operator/cloudflared/config.yml"),
+        Path("/run/user/1000/cloudflared/config.yml"),
+        Path("/tmp/cloudflared/config.yml"),
+        Path("/var/tmp/cloudflared/config.yml"),
+    ],
+)
+def test_service_sandbox_hidden_path_is_rejected_before_mutation_or_restart(
+    tmp_path: Path,
+    candidate: Path,
+) -> None:
+    paths, service = _installed(tmp_path)
+    previous = paths.environment_file.read_bytes()
+
+    def unexpected_identity() -> tuple[int, int]:
+        raise AssertionError("sandbox rejection must precede identity lookup")
+
+    def unexpected_parser(path: Path):
+        raise AssertionError("sandbox rejection must precede config parsing")
+
+    adopter = CloudflaredConfigAdopter(
+        Configurator(paths, service, lambda host, port: None, environment_owner=None),
+        runtime_discovery=lambda enabled: _runtime(candidate),
+        config_parser=unexpected_parser,
+        identity_provider=unexpected_identity,
+    )
+
+    with pytest.raises(ValidationError, match="service sandbox"):
+        adopter.adopt_detected()
+
+    assert paths.environment_file.read_bytes() == previous
+    assert service.calls == []
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        Path("/root"),
+        Path("/home"),
+        Path("/run/user"),
+        Path("/tmp"),
+        Path("/var/tmp"),
+    ],
+)
+def test_service_sandbox_rejects_exact_hidden_prefix(candidate: Path) -> None:
+    with pytest.raises(ValidationError, match="service sandbox"):
+        _require_manager_service_sandbox_visible(candidate)
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        Path("/rooted/cloudflared/config.yml"),
+        Path("/home2/cloudflared/config.yml"),
+        Path("/run/userland/cloudflared/config.yml"),
+        Path("/tmp2/cloudflared/config.yml"),
+        Path("/var/tmp2/cloudflared/config.yml"),
+        Path("/etc/cloudflared/config.yml"),
+    ],
+)
+def test_service_sandbox_prefix_boundaries_do_not_reject_unrelated_paths(
+    candidate: Path,
+) -> None:
+    _require_manager_service_sandbox_visible(candidate)
 
 
 def test_legacy_no_path_runtime_identity_is_exactly_preserved() -> None:

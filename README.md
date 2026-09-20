@@ -209,17 +209,19 @@ It never prints raw `ExecStart` or token-bearing arguments.
 explicit `--config` path extracted from `cloudflared.service` by enabled runtime
 discovery, and only when the service is detected in local-config mode. Before
 changing manager state it requires a canonical absolute `.yml`/`.yaml` path,
-rejects symlinks and non-regular or oversized files, checks conventional Unix
-read/traverse permissions for the dedicated service identity, and parses the
-file with the existing safe read-only parser. Missing, unreadable, structurally
-invalid, remote-token, unknown-mode, and pathless candidates fail closed.
+rejects locations hidden by the manager unit's current `ProtectHome=true` and
+`PrivateTmp=true` sandbox, rejects symlinks and non-regular or oversized files,
+checks conventional Unix read/traverse permissions for the dedicated service
+identity, and parses the file with the existing safe read-only parser. Missing,
+unreadable, structurally invalid, remote-token, unknown-mode, and pathless
+candidates fail closed.
 
 The service-readability check deliberately does not change cloudflared file
-ownership or mode. It validates normal owner/group/other permission bits; sites
-using restrictive ACLs or other access-control mechanisms must independently
-ensure the dedicated manager service can read the adopted file. A later loss of
-access is rendered as a safe dashboard load error rather than weakening file
-protections.
+ownership or mode. It accounts for the fixed sandbox settings above and normal
+owner/group/other permission bits. Restrictive ACLs, future unit sandbox
+changes, or other access-control mechanisms may still prevent access and must
+be managed by the administrator. A later loss of access is rendered as a safe
+dashboard load error rather than weakening file protections.
 
 `cloudflared-config clear` removes only the manager's optional adopted-path
 setting. It does not remove, edit, or otherwise unadopt anything from
