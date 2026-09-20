@@ -16,6 +16,7 @@ from cloudflared_manager.deployment.environment import (
     initial_environment,
 )
 from cloudflared_manager.deployment.errors import (
+    EnvironmentFileError,
     HealthCheckError,
     HostOperationError,
     TransactionFailedError,
@@ -280,6 +281,74 @@ def test_stale_configurator_process_is_rejected_inside_lock(
 
     assert entered == [True, False]
     assert paths.environment_file.read_bytes() == previous
+    assert service.calls == []
+
+
+def test_stale_updater_process_is_rejected_inside_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    filesystem, _ = installed(tmp_path)
+    paths = filesystem.paths
+    entered: list[bool] = []
+    update_calls: list[bool] = []
+    resolved_main: list[str] = []
+
+    class LockedFilesystem:
+        def __init__(self, actual_paths: object) -> None:
+            assert actual_paths == paths
+
+        def read_current_sha(self) -> str:
+            assert entered == [True]
+            return SHA
+
+    class RecordingUpdater:
+        def __init__(self, *args: object) -> None:
+            pass
+
+        def update(self, *args: object) -> object:
+            update_calls.append(True)
+            raise AssertionError("stale updater must fail before update")
+
+    def unexpected_resolve(curl: str) -> str:
+        resolved_main.append(curl)
+        raise AssertionError("stale updater must fail before resolving main")
+
+    monkeypatch.setattr(cli, "_require_root", lambda: None)
+    monkeypatch.setattr(cli, "DeploymentPaths", lambda: paths)
+    monkeypatch.setattr(cli, "ReleaseFilesystem", LockedFilesystem)
+    monkeypatch.setattr(cli, "SystemdManager", lambda: RuntimeService())
+    monkeypatch.setattr(cli, "Updater", RecordingUpdater)
+    monkeypatch.setattr(cli, "DeploymentLock", lambda path: RecordingLock(path, entered))
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/curl")
+    monkeypatch.setattr(cli, "PROCESS_RELEASE_ID", OTHER_SHA)
+    monkeypatch.setattr(cli, "resolve_main_sha", unexpected_resolve)
+
+    assert cli.update() == 1
+    assert entered == [True, False]
+    assert resolved_main == []
+    assert update_calls == []
+
+
+def test_configurator_rejects_unsafe_environment_before_preserving_content(
+    tmp_path: Path,
+) -> None:
+    filesystem, _ = installed(tmp_path)
+    path = filesystem.paths.environment_file
+    tainted = path.read_bytes() + b"PYTHONPATH=/tmp/untrusted\n"
+    path.write_bytes(tainted)
+    path.chmod(0o666)
+    service = RuntimeService()
+
+    with pytest.raises(EnvironmentFileError, match="unsafe ownership or permissions"):
+        Configurator(
+            filesystem.paths,
+            service,
+            readiness,
+            environment_owner=None,
+        ).apply({"CFM_BIND_PORT": "8081"})
+
+    assert path.read_bytes() == tainted
+    assert path.stat().st_mode & 0o777 == 0o666
     assert service.calls == []
 
 
