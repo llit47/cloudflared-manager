@@ -139,6 +139,11 @@ changes, configuration validation, and service restarts.
   artifacts, then make authenticated cleanup idempotent and directory-fsynced.
   A failed activation is never success; distinguish verified rollback from
   partial or failed rollback.
+- Under the shared outer manager lock, treat every valid nonterminal or
+  unverifiable activation journal as a persistent recovery barrier. Update,
+  release reconciliation, adopt, and clear must reject without mutation until
+  privileged recovery reaches a valid terminal state; recovery takes the same
+  outer lock.
 - Keep privileged operations allowlisted with fixed executable/service
   identities, strict bounded inputs, fixed argv, bounded timeouts,
   `shell=False`, minimal environment, and sanitized errors. Never create a

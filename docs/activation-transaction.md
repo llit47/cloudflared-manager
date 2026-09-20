@@ -196,6 +196,10 @@ Future implementation MUST preserve all of the following:
     exchange. A proven pre-exchange failure aborts without active-config or
     service mutation; once exchange may have occurred, failure requires
     rollback rather than precommit cleanup.
+27. A persistent activation-recovery barrier protects authority after process
+    locks are released. Under the shared outer manager lock, every root manager
+    mutation must reject a valid nonterminal or unverifiable activation journal
+    before changing the active release, adopted path, or related manager state.
 
 ## Recommended privileged boundary
 
@@ -385,7 +389,7 @@ durably only after authenticated cleanup and affected-directory fsync finish.
 
 | Transition | Prerequisites and verification | Side effects and durable state | Failure behavior |
 | --- | --- | --- | --- |
-| `IDLE -> SOURCE_VERIFIED` | Lock held; no incomplete journal; helper/release and adopted path independently valid; canonical path opened without symlinks; bounded snapshot succeeds | Read-only descriptors and immutable snapshot only | Close descriptors; sanitized rejection; no rollback |
+| `IDLE -> SOURCE_VERIFIED` | Shared outer lock held; activation barrier is absent or a valid terminal state; helper/release and adopted path independently valid; canonical path opened without symlinks; bounded snapshot succeeds | Read-only descriptors and immutable snapshot only | Close descriptors; sanitized rejection; no rollback |
 | `SOURCE_VERIFIED -> CANDIDATE_PREPARED` | Narrow mutation accepts structure and reports a real change | Exclusive random `0600` same-directory candidate, complete write and candidate file `fsync`; retained file/directory identity | Remove only the verified candidate; source untouched |
 | `CANDIDATE_PREPARED -> CANDIDATE_VALIDATED` | Candidate identity intact | Existing application parser succeeds, then fixed cloudflared ingress validation succeeds through FD-bound path; sanitized report retained | Discard candidate; source untouched |
 | `CANDIDATE_VALIDATED -> SERVICE_BASELINE_VERIFIED` | Unit is loaded; state is active with the expected running substate; positive MainPID, process start identity, executable identity, adopted-config relationship, and readiness remain stable across a bounded observation | Read-only checks only; sanitized baseline facts retained in memory | Reject before active mutation; discard candidate; do not start/restart/reload an unhealthy service |
@@ -754,8 +758,10 @@ The result model distinguishes at least:
   decision, but authenticated cleanup or terminal journal durability is not
   complete; it is neither user-visible success nor a new rollback decision;
   and
-- `RECOVERY_REQUIRED`: a durable incomplete journal was found before a new
-  transaction.
+- `RECOVERY_REQUIRED`: a valid nonterminal or unverifiable journal was found
+  before a new activation or root manager mutation; the barrier rejected the
+  operation without changing release, adopted authority, journal, config, or
+  service.
 
 All are failures. None may produce an HTTP or CLI success result for the
 requested mutation. Details exposed outside the root boundary remain
@@ -821,6 +827,46 @@ The same classification governs a crash in the in-memory
 `PRE_EXCHANGE_REVALIDATED` state because its durable journal still says
 `CONFIG_COMMITTING`.
 
+### Persistent activation-recovery barrier
+
+Descriptor-held locks prevent concurrent work only while their owning process
+is alive. The durable journal therefore also acts as an authority barrier after
+a crash. The barrier classifies journal state as follows:
+
+- no journal means no activation recovery is pending;
+- a valid terminal completed state (`COMMITTED_SUCCESS`, `FAILED_PRECOMMIT`, or
+  `FAILED_ROLLED_BACK`) means no activation recovery or cleanup is pending and
+  does not permanently block later manager operations;
+- every other valid state, including cleanup-pending and rollback-failed/manual
+  recovery states, blocks authority-changing manager operations; and
+- malformed content, unknown schema/state, impossible transition, unsafe type,
+  ownership or permissions, multiple/ambiguous journal objects, or any failure
+  to authenticate the fixed journal fails closed and also blocks those
+  operations. It is never interpreted as journal absence or terminal success.
+
+The check is read-only and uses the fixed privileged journal location and the
+same strict bounded parser and no-follow identity rules as recovery. A blocked
+operation returns a sanitized instruction for the root administrator to run
+activation status/recovery. Rejection MUST NOT change `current`, a release,
+the adopted config setting, the activation journal or artifacts, the
+cloudflared config, or either cloudflared service state.
+
+The conservative first policy is that all root manager mutation transactions
+refuse while this barrier is closed, rather than trying to decide whether a
+particular mutation happens to preserve activation authority. At minimum the
+barrier applies before:
+
+- `cfm-update` or any `current` release switch;
+- installer, repair, or reconciliation paths capable of switching/replacing
+  the active release or persistent manager authority;
+- `cfm-config cloudflared-config adopt-detected`; and
+- `cfm-config cloudflared-config clear`.
+
+Read-only status may remain available and should report only a sanitized
+"activation recovery required" condition. A valid terminal record may remain
+as the bounded journal and be replaced safely by a later activation under the
+lock; authority-changing manager operations need not delete or rewrite it.
+
 ### Crash matrix
 
 | Crash point | Durable state that may remain | Required next-run behavior |
@@ -830,6 +876,8 @@ The same classification governs a crash in the in-memory
 | After candidate fsync or validation | Valid disposable candidate; active unchanged; normally no journal | Revalidate and explicitly resume only within same live transaction; after process loss, securely discard it |
 | During or after service baseline observation, before durable journal | Active config/service unchanged; candidate may remain; no durable baseline authority | Securely discard candidate after identity checks; a new transaction must establish a fresh bounded healthy baseline |
 | Baseline is unhealthy or becomes unstable | Active config namespace unchanged | Fail closed with `SERVICE_BASELINE_UNAVAILABLE`; never start/restart/reload service and never enter commit |
+| Any crash leaves a valid nonterminal journal | Descriptor locks are released, but journaled release/adopted authority and recovery artifacts remain | Persistent barrier blocks update/install/reconciliation/adopt/clear under the shared outer lock until root recovery reaches a valid terminal state |
+| Journal is malformed, unknown, unsafe, ambiguous, or unverifiable after crash | Authority cannot be authenticated safely | Barrier fails closed exactly like pending recovery; perform no manager/config/service mutation and direct root to status/manual recovery |
 | During backup write, before backup fsync | Incomplete backup; active unchanged | Journal must not claim `BACKUP_DURABLE`; remove authenticated incomplete artifacts or require manual recovery on mismatch |
 | After backup fsync but before backup-directory fsync | Backup existence is not durable | Active unchanged; repeat/clean backup creation; do not commit |
 | After durable backup but before journal fsync | Active unchanged; orphan durable backup possible | Discover only through fixed bounded artifact policy; never infer authority from filename alone; clean if identity can be proven |
@@ -862,7 +910,9 @@ Recovery is invoked explicitly inside the privileged boundary before any new
 transaction. Merely starting the web service MUST NOT mutate cloudflared or
 auto-recover an incomplete transaction. An implementation may provide a
 root-only status/recover operation, but it cannot offer arbitrary artifact
-selection.
+selection. Until recovery reaches a valid terminal completed state, the
+persistent barrier also prevents manager update/configuration transactions from
+changing the release or adopted authority on which recovery depends.
 
 ## Locking and concurrency
 
@@ -873,19 +923,42 @@ commit, service, and rollback sequence. The lock file is fixed, no-follow,
 regular, root-owned, `0600`, and descriptor-held.
 
 The current manager deployment/configuration lock protects updates and adopted
-setting changes. Activation needs coordination with it because changing the
-adopted path or manager release during a transaction invalidates authority.
-The implementation should either use one documented global lock order or a
-single shared outer manager-operation lock. Proposed order if two locks remain:
+setting changes. It becomes the shared outer manager-operation lock for this
+contract. A runtime activation lock is not enough: after a crash it is released
+while a nonterminal journal can still depend on the old active release and
+adopted path.
 
-1. acquire the existing manager deployment/config lock;
-2. verify current release and adopted setting;
-3. acquire the cloudflared activation lock;
-4. hold both until transaction or rollback is complete.
+Every root manager mutation transaction follows this order:
 
-No code may acquire them in reverse order. Long service readiness waits make a
-single shared lock simpler and safer unless review shows unacceptable impact.
-The lock scope and order must be tested for update/config/activation contention.
+1. acquire the shared outer manager/deployment lock;
+2. inspect and strictly authenticate the fixed activation journal barrier;
+3. if the journal is valid nonterminal or is malformed, ambiguous, unsafe, or
+   otherwise unverifiable, reject without any mutation and direct the root
+   administrator to activation status/recovery; and
+4. only after an absent or valid terminal journal may the operation validate
+   and change manager release/configuration authority.
+
+This ordering is mandatory for `cfm-update`, installer/reconciliation release
+switching, adoption, and clear. The barrier check occurs inside the lock and
+immediately before the operation's own authority validation/mutation; checking
+before lock acquisition is insufficient. The rejection path does not reconcile
+units, switch `current`, rewrite the EnvironmentFile, restart the manager,
+touch activation state, or control cloudflared.
+
+Activation status/recovery also acquires the same shared outer lock before it
+classifies or changes a nonterminal journal. If a separate activation lock is
+retained, the order is always outer manager lock first, activation lock second,
+and both remain held through classification plus recovery/cleanup. A new
+activation may proceed only when the barrier is absent or terminal; a pending
+journal routes to recovery instead. No code may acquire these locks in reverse
+order.
+
+Holding the outer lock for the entire activation/recovery transaction is the
+conservative first design. It prevents update, install/reconciliation, adopt,
+and clear from racing a live recovery. If future review narrows lock duration,
+the persistent journal barrier and identical lock/check ordering still must
+close every authority-change window. The lock scope and barrier must be tested
+together, including crash release of descriptor locks.
 
 Advisory locks coordinate only Cloudflared Manager processes. They do not lock
 out root editors, package scripts, cloudflared tooling, or direct systemctl
@@ -951,6 +1024,11 @@ Keep the first code review narrow:
 - stale source and candidate rejection;
 - metadata inventory and fail-closed unsupported-metadata policy;
 - secure ephemeral backup plus minimal durable journal;
+- strict terminal/nonterminal/unverifiable journal barrier classification under
+  the shared outer manager lock;
+- integration of that barrier into `cfm-update`, release-switching
+  installer/reconciliation, adopted-config adoption, and clear before any
+  authority mutation;
 - race-aware same-directory commit prototype;
 - durable-intent then immediate pre-exchange source/candidate/adopted/service
   revalidation, with a distinct no-service `PRECOMMIT_ABORT` path;
@@ -965,6 +1043,13 @@ Because a config commit without service integration is not an end-user feature,
 PR A should remain unwired or require an explicit root-only test/admin mode that
 cannot be mistaken for complete activation. Review must decide which is safer
 before merge. No candidate may be committed from dashboard traffic.
+
+Production activation MUST NOT be enabled until every existing root manager
+operation that can change the active release, adopted config identity, or
+related persistent authority enforces the journal barrier under the shared
+outer lock. This is a required integration invariant, not optional follow-up
+hardening. If barrier integration is split into a separate prerequisite PR,
+activation remains unwired/disabled until that PR is merged and verified.
 
 ### Implementation PR B: cloudflared service activation and rollback
 
@@ -1012,7 +1097,9 @@ touches `/etc/cloudflared`, the real systemd manager, DNS, or Cloudflare.
 | Candidate integrity | candidate renamed, unlinked, replaced, chmodded, hard-linked, truncated, or rewritten; directory swapped; retained FD differs from visible name; procfs unavailable; unrelated FD inheritance; candidate on another filesystem |
 | Validation | application parser rejects before external acceptance; exact fixed cloudflared argv; FD-bound path survives ancestor swap; `pass_fds` contains only verified directory FD; `shell=False`; bounded timeout/output; unavailable executable; nonzero result; raw secret output absent from errors |
 | No-op | no candidate, backup, journal, command, service action, or active-file write for semantic no-op |
-| Locking | second activation rejected; manager update/config action contention; defined lock order; lock symlink/type/owner/mode attacks; lock released after every failure; manual edit still detected despite manager lock |
+| Locking | second activation rejected; manager update/config action contention; shared outer lock precedes barrier inspection and any activation lock; reverse order rejected; lock symlink/type/owner/mode attacks; crash releases descriptor locks but barrier remains; manual edit still detected despite manager lock |
+| Persistent recovery barrier | valid nonterminal journal blocks release update, installer/reconciliation switching, adopt, and clear; malformed/unknown-schema/impossible-state/unsafe-permission/ambiguous journal also blocks; valid `COMMITTED_SUCCESS`, `FAILED_PRECOMMIT`, and `FAILED_ROLLED_BACK` do not permanently block; rejection leaves current release, adopted setting, journal/artifacts, cloudflared config, and both services byte/state unchanged |
+| Recovery contention | activation recovery and update/config acquire the same outer lock; recovery holding it blocks authority mutation; update/config holding it blocks recovery until release; after acquisition each rechecks the barrier; repeated rejection and recovery are deterministic and deadlock-free |
 | Backup | exact bytes, digest, size, UID/GID/mode metadata; exclusive random/fixed-policy name; `0600` root ownership; partial write; fsync failure; directory-fsync failure; collision/symlink; backup tamper; backup cannot be confused with candidate; secrets never logged |
 | Pre-exchange revalidation | `CONFIG_COMMITTING` file/directory fsync occurs before the fresh check; source, candidate, adopted authority, parent/metadata, and complete service baseline are rechecked; any mismatch with exact original active takes `PRECOMMIT_ABORT`; assert no exchange and no service command |
 | Precommit abort | durable abort decision precedes artifact deletion; only authenticated transaction artifacts are removed; crash before/after every deletion and directory fsync resumes idempotently; wrong-identity artifact fails closed; durable `FAILED_PRECOMMIT` required before final result |
