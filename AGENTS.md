@@ -144,6 +144,11 @@ changes, configuration validation, and service restarts.
   release reconciliation, adopt, and clear must reject without mutation until
   privileged recovery reaches a valid terminal state; recovery takes the same
   outer lock.
+- Before update, release reconciliation, adopt, or clear changes authority,
+  authenticate any terminal activation journal against the current authority,
+  securely retire it, and fsync its directory under that lock. Retirement
+  failure aborts the authority change; never ignore a terminal identity
+  mismatch.
 - Keep privileged operations allowlisted with fixed executable/service
   identities, strict bounded inputs, fixed argv, bounded timeouts,
   `shell=False`, minimal environment, and sanitized errors. Never create a
