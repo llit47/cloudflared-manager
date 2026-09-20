@@ -17,10 +17,11 @@ if [[ ! -L ${current_link} ]]; then
 fi
 
 current_target=''
-if ! current_target=$(readlink -- "${current_link}"); then
+if ! current_target=$(readlink --no-newline -- "${current_link}" && printf '.'); then
     printf 'The active Cloudflared Manager release is unavailable.\n' >&2
     exit 1
 fi
+current_target=${current_target%.}
 readonly current_target
 if [[ ! ${current_target} =~ ^releases/([0-9a-f]{40})$ ]]; then
     printf 'The active Cloudflared Manager release is invalid.\n' >&2

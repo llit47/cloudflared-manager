@@ -103,6 +103,22 @@ def test_wrapper_rejects_noncanonical_current_target(tmp_path: Path, target: str
     assert "release is invalid" in result.stderr
 
 
+@pytest.mark.parametrize("name", ["config.sh", "update.sh"])
+@pytest.mark.parametrize("trailing_newlines", ["\n", "\n\n"])
+def test_wrapper_rejects_current_target_with_trailing_newlines(
+    tmp_path: Path, name: str, trailing_newlines: str
+) -> None:
+    result = _run_wrapper(
+        tmp_path,
+        name,
+        f"releases/{SHA}{trailing_newlines}",
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "release is invalid" in result.stderr
+
+
 @pytest.mark.parametrize("interpreter", ["missing", "non-executable"])
 def test_wrapper_rejects_unusable_physical_interpreter(
     tmp_path: Path, interpreter: str
