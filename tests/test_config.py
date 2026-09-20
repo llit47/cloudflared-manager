@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from cloudflared_manager.config import Settings
+from cloudflared_manager.runtime_identity import runtime_config_id
 
 
 def test_settings_defaults_are_safe_for_local_development() -> None:
@@ -38,6 +39,9 @@ def test_settings_accept_explicit_environment_values(tmp_path) -> None:
         bind_port=8123,
         cloudflared_config_path=config_path,
         runtime_discovery_enabled=True,
+    )
+    assert settings.config_id == runtime_config_id(
+        "localhost", 8123, True, config_path
     )
 
 

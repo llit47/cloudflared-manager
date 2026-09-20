@@ -10,6 +10,7 @@ from cloudflared_manager.cloudflared.discovery import discover_cloudflared
 from cloudflared_manager.cloudflared.runtime import CommandResult, DiscoveryCommand
 from cloudflared_manager.config import Settings
 from cloudflared_manager.main import create_app
+from cloudflared_manager.runtime_identity import runtime_config_id
 from cloudflared_manager.web.presentation import build_dashboard_view
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "cloudflared" / "config.yml"
@@ -146,6 +147,22 @@ def test_healthz_returns_only_safe_monitoring_fields() -> None:
         "status": "ok",
         "app": "cloudflared-manager",
     }
+
+
+def test_deployment_readiness_identity_includes_adopted_config_path() -> None:
+    config_path = Path("/etc/cloudflared/config.yml")
+    settings = Settings(
+        mode="test",
+        cloudflared_config_path=config_path,
+        runtime_discovery_enabled=True,
+    )
+
+    response = get_from_app(create_app(settings), "/deployment-readiness")
+
+    assert response.status_code == 200
+    assert response.json()["config_id"] == runtime_config_id(
+        "127.0.0.1", 8000, True, config_path
+    )
 
 
 @pytest.mark.parametrize(

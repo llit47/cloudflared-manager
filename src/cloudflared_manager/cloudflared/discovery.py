@@ -72,6 +72,7 @@ _SYSTEMD_ARGV = re.compile(
     re.DOTALL,
 )
 _SYSTEMD_HEX_ESCAPE = re.compile(r"\\x([0-9A-Fa-f]{2})")
+_SAFE_ABSOLUTE_PATH = re.compile(r"^/[A-Za-z0-9._+:/-]{1,4094}$")
 _MAX_PROPERTY_OUTPUT = 65_536
 
 
@@ -296,10 +297,18 @@ def _safe_cloudflared_path(value: str | None) -> Path | None:
 
 
 def _safe_absolute_path(value: str | None) -> Path | None:
-    if value is None or "\x00" in value:
+    if (
+        value is None
+        or _SAFE_ABSOLUTE_PATH.fullmatch(value) is None
+        or value.startswith("//")
+    ):
         return None
     path = Path(value)
-    return path if path.is_absolute() else None
+    return (
+        path
+        if path.is_absolute() and str(path) == value and ".." not in path.parts
+        else None
+    )
 
 
 def _known_state(value: str, known: set[str]) -> str | None:

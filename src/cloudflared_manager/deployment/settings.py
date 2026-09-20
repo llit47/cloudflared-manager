@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from cloudflared_manager.deployment.environment import EnvironmentDocument
 from cloudflared_manager.deployment.errors import HostOperationError
-from cloudflared_manager.deployment.validation import validate_bind_host, validate_port
+from cloudflared_manager.deployment.validation import (
+    validate_bind_host,
+    validate_cloudflared_config_path,
+    validate_port,
+)
 from cloudflared_manager.runtime_identity import runtime_config_id
 
 
@@ -15,11 +20,15 @@ class ManagerSettings:
     bind_host: str
     bind_port: int
     runtime_discovery_enabled: bool
+    cloudflared_config_path: Path | None = None
 
     @property
     def config_id(self) -> str:
         return runtime_config_id(
-            self.bind_host, self.bind_port, self.runtime_discovery_enabled
+            self.bind_host,
+            self.bind_port,
+            self.runtime_discovery_enabled,
+            self.cloudflared_config_path,
         )
 
 
@@ -59,4 +68,9 @@ def settings_from_document(document: EnvironmentDocument) -> ManagerSettings:
         bind_host=validate_bind_host(values["CFM_BIND_HOST"]),
         bind_port=validate_port(values["CFM_BIND_PORT"]),
         runtime_discovery_enabled=discovery == "true",
+        cloudflared_config_path=(
+            validate_cloudflared_config_path(values["CFM_CLOUDFLARED_CONFIG_PATH"])
+            if "CFM_CLOUDFLARED_CONFIG_PATH" in values
+            else None
+        ),
     )

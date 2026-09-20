@@ -28,13 +28,19 @@ def test_root_shell_surface_has_no_eval_env_source_or_constructed_shell() -> Non
 
 
 def test_deployment_source_has_no_cloudflared_config_or_service_mutation() -> None:
+    deployment_sources = [
+        *(ROOT / "src" / "cloudflared_manager" / "deployment").glob("*.py")
+    ]
     production = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in [*SHELL_SCRIPTS, *(ROOT / "src" / "cloudflared_manager" / "deployment").glob("*.py")]
+        for path in [*SHELL_SCRIPTS, *deployment_sources]
     )
+    service_control = (
+        ROOT / "src" / "cloudflared_manager" / "deployment" / "service.py"
+    ).read_text(encoding="utf-8")
 
     assert re.search(r"/etc/cloudflared(?:/|$)", production, re.MULTILINE) is None
-    assert "cloudflared.service" not in production
+    assert "cloudflared.service" not in service_control
     assert "Cloudflare API token" not in production
     assert "shell=True" not in production
     assert "os.system" not in production

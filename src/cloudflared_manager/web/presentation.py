@@ -86,8 +86,8 @@ def build_dashboard_view(
             routes=(),
             empty_title="No configuration selected",
             empty_description=(
-                "Set an explicit cloudflared configuration path to detect ingress "
-                "routes in read-only mode."
+                "A root administrator can explicitly adopt the local config detected "
+                "from cloudflared.service with cfm-config. No file is adopted automatically."
             ),
         )
 
