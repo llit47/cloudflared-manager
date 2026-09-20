@@ -101,8 +101,12 @@ def update() -> int:
         if curl is None:
             raise DeploymentError("curl is required to resolve and download updates.")
         with DeploymentLock(paths.lock_path):
-            candidate_sha = resolve_main_sha(curl)
             current_sha = filesystem.read_current_sha()
+            if PROCESS_RELEASE_ID != current_sha:
+                raise HostOperationError(
+                    "The update process does not match the current manager release."
+                )
+            candidate_sha = resolve_main_sha(curl)
             source_context = (
                 contextlib.nullcontext(None)
                 if candidate_sha == current_sha
