@@ -12,9 +12,11 @@ a server-rendered dashboard, a minimal health endpoint, isolated tests, and CI.
 When an explicit cloudflared configuration path is provided, the dashboard
 reads it and displays detected hostname ingress routes in read-only mode.
 Optional local runtime discovery can also report sanitized cloudflared binary
-and systemd service facts when it is explicitly enabled. A production
-deployment foundation installs immutable release-specific environments and
-runs the application as a dedicated unprivileged system user.
+and systemd service facts when it is explicitly enabled. The dashboard reports
+whether a local config candidate is detected, explicitly adopted, matched to
+the running service, unverified, or different from the service configuration.
+A production deployment foundation installs immutable release-specific
+environments and runs the application as a dedicated unprivileged system user.
 
 Detected routes are existing configuration, not routes owned or managed by
 Cloudflared Manager. This version does **not** modify cloudflared configuration,
@@ -364,6 +366,14 @@ connectivity. Missing commands, a missing unit, inactive or failed services,
 timeouts, and unexpected output are handled as best-effort observations rather
 than application startup failures.
 
+Config adoption is shown separately from config loading and runtime health.
+Detection alone is a warning, not adoption: the dashboard offers only the safe
+root command for explicit adoption and never displays or loads the detected
+path. A successfully loaded adopted config remains available when runtime
+discovery is disabled or unavailable, with its live-service relationship marked
+unverified. Token-managed service mode is reported as a valid mode without a
+local config candidate.
+
 Systemd `ExecStart` data is treated as potentially secret-bearing because a
 token-managed service can include a token argument. Discovery extracts only
 the executable, management mode, and an explicit config argument, then discards
@@ -376,6 +386,11 @@ service arguments is not automatically adopted or read. The separate
 `CFM_CLOUDFLARED_CONFIG_PATH` setting remains required for YAML loading, has no
 default, and can be persisted in production only by the explicit root
 `cfm-config cloudflared-config adopt-detected` workflow.
+
+When an adopted config loads and the service exposes a different explicit local
+config path, the dashboard reports read-only drift without showing either path.
+It does not adopt the new path, clear the old one, edit configuration, or restart
+cloudflared.
 
 ### Read-only cloudflared configuration
 
