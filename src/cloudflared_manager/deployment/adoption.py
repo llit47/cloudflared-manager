@@ -21,13 +21,13 @@ from cloudflared_manager.cloudflared.discovery import (
     RuntimeDiscoveryProvider,
     discover_cloudflared,
 )
+from cloudflared_manager.cloudflared.limits import MAX_CLOUDFLARED_CONFIG_BYTES
 from cloudflared_manager.deployment.configurator import ConfigResult, Configurator
 from cloudflared_manager.deployment.errors import HostOperationError, ValidationError
 from cloudflared_manager.deployment.identity import SERVICE_IDENTITY
 from cloudflared_manager.deployment.settings import ManagerSettings
 from cloudflared_manager.deployment.validation import validate_cloudflared_config_path
 
-MAX_ADOPTED_CONFIG_BYTES = 1_048_576
 ConfigParser = Callable[[Path], CloudflaredConfig]
 IdentityProvider = Callable[[], tuple[int, int]]
 PathValidator = Callable[[Path], None]
@@ -168,7 +168,7 @@ def _require_service_readable_regular_file(path: Path, uid: int, gid: int) -> No
             raise ValidationError(
                 "The detected cloudflared configuration is not a regular file."
             )
-        if metadata.st_size > MAX_ADOPTED_CONFIG_BYTES:
+        if metadata.st_size > MAX_CLOUDFLARED_CONFIG_BYTES:
             raise ValidationError(
                 "The detected cloudflared configuration is unexpectedly large."
             )

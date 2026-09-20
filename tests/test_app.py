@@ -62,6 +62,19 @@ def test_application_can_be_created(tmp_path) -> None:
     assert application.state.settings is settings
 
 
+def test_application_exposes_no_mutating_http_methods() -> None:
+    application = create_app(Settings(mode="test"))
+
+    application_methods = {
+        method
+        for route in application.routes
+        for method in (getattr(route, "methods", None) or set())
+        if method not in {"HEAD", "OPTIONS"}
+    }
+
+    assert application_methods == {"GET"}
+
+
 def test_dashboard_without_configured_path_renders_safe_empty_state() -> None:
     response = get_from_app(create_app(Settings(mode="test")), "/")
 

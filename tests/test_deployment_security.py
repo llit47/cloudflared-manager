@@ -47,6 +47,26 @@ def test_deployment_source_has_no_cloudflared_config_or_service_mutation() -> No
     assert "eval(" not in production
 
 
+def test_candidate_foundation_has_no_activation_or_privileged_control_surface() -> None:
+    editing_sources = [
+        *(ROOT / "src" / "cloudflared_manager" / "cloudflared" / "editing").glob("*.py")
+    ]
+    production = "\n".join(
+        path.read_text(encoding="utf-8") for path in editing_sources
+    )
+
+    assert "os.replace" not in production
+    assert "os.rename" not in production
+    assert "chmod(" not in production
+    assert "chown(" not in production
+    assert "systemctl" not in production
+    assert "cloudflared.service" not in production
+    assert "shell=True" not in production
+    assert "os.system" not in production
+    assert "Cloudflare API" not in production
+    assert "sudoers" not in production
+
+
 def test_systemd_mutation_surface_is_fixed_to_manager_unit(monkeypatch) -> None:
     calls: list[list[str]] = []
 
