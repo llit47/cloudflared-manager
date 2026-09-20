@@ -28,6 +28,7 @@ class CandidateFile:
         "_path",
         "_name",
         "_directory_fd",
+        "_descriptor",
         "_device",
         "_inode",
         "_size",
@@ -41,6 +42,7 @@ class CandidateFile:
         path: Path,
         name: str,
         directory_fd: int,
+        descriptor: int,
         device: int,
         inode: int,
         size: int,
@@ -49,6 +51,7 @@ class CandidateFile:
         self._path = path
         self._name = name
         self._directory_fd = directory_fd
+        self._descriptor = descriptor
         self._device = device
         self._inode = inode
         self._size = size
@@ -72,53 +75,49 @@ class CandidateFile:
 
         if self._discarded:
             raise CandidateFileError("The candidate file has already been discarded.")
-        descriptor: int | None = None
         try:
-            no_follow = getattr(os, "O_NOFOLLOW", None)
-            if no_follow is None:
-                raise CandidateFileError(
-                    "Safe no-follow candidate verification is unavailable."
-                )
-            descriptor = os.open(
+            visible_metadata = os.stat(
                 self._name,
-                os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
                 dir_fd=self._directory_fd,
+                follow_symlinks=False,
             )
-            metadata = os.fstat(descriptor)
+            metadata = os.fstat(self._descriptor)
         except OSError as error:
             raise CandidateFileError(
                 "The candidate file is no longer available for validation."
             ) from error
         if (
             not stat.S_ISREG(metadata.st_mode)
+            or not stat.S_ISREG(visible_metadata.st_mode)
             or (metadata.st_dev, metadata.st_ino) != (self._device, self._inode)
+            or (visible_metadata.st_dev, visible_metadata.st_ino)
+            != (self._device, self._inode)
             or stat.S_IMODE(metadata.st_mode) != 0o600
+            or stat.S_IMODE(visible_metadata.st_mode) != 0o600
             or metadata.st_nlink != 1
+            or visible_metadata.st_nlink != 1
             or metadata.st_size != self._size
+            or visible_metadata.st_size != self._size
         ):
-            if descriptor is not None:
-                os.close(descriptor)
             raise CandidateFileError(
                 "The candidate file identity or permissions changed unexpectedly."
             )
         digest = hashlib.sha256()
         remaining = self._size
         try:
+            os.lseek(self._descriptor, 0, os.SEEK_SET)
             while remaining:
-                chunk = os.read(descriptor, min(65_536, remaining))
+                chunk = os.read(self._descriptor, min(65_536, remaining))
                 if not chunk:
                     break
                 digest.update(chunk)
                 remaining -= len(chunk)
-            trailing = os.read(descriptor, 1)
-            final_metadata = os.fstat(descriptor)
+            trailing = os.read(self._descriptor, 1)
+            final_metadata = os.fstat(self._descriptor)
         except OSError as error:
             raise CandidateFileError(
                 "The candidate file could not be verified safely."
             ) from error
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
         if (
             remaining
             or trailing
@@ -146,7 +145,7 @@ class CandidateFile:
                 if (metadata.st_dev, metadata.st_ino) != (
                     self._device,
                     self._inode,
-                ):
+                ) or not stat.S_ISREG(metadata.st_mode):
                     raise CandidateFileError(
                         "The candidate name no longer identifies the staged file."
                     )
@@ -156,10 +155,11 @@ class CandidateFile:
         except OSError as error:
             failure = error
         finally:
-            try:
-                os.close(self._directory_fd)
-            except OSError as error:
-                failure = failure or error
+            for descriptor in (self._descriptor, self._directory_fd):
+                try:
+                    os.close(descriptor)
+                except OSError as error:
+                    failure = failure or error
             self._discarded = True
         if failure is not None:
             raise CandidateFileError(
@@ -206,6 +206,7 @@ class CandidateFileStager:
         descriptor: int | None = None
         name: str | None = None
         candidate_metadata: os.stat_result | None = None
+        retained_descriptor: int | None = None
         closed = False
         try:
             descriptor, name = self._create_unique(directory_fd)
@@ -229,21 +230,47 @@ class CandidateFileStager:
             closed = True
             descriptor = None
 
+            no_follow = getattr(os, "O_NOFOLLOW", None)
+            if no_follow is None:
+                raise CandidateFileError(
+                    "Safe no-follow candidate verification is unavailable."
+                )
+            retained_descriptor = os.open(
+                name,
+                os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=directory_fd,
+            )
+            retained_metadata = os.fstat(retained_descriptor)
+            if (retained_metadata.st_dev, retained_metadata.st_ino) != (
+                candidate_metadata.st_dev,
+                candidate_metadata.st_ino,
+            ):
+                raise CandidateFileError(
+                    "The candidate file identity changed while it was staged."
+                )
+
             staged = CandidateFile(
                 path=snapshot.path.parent / name,
                 name=name,
                 directory_fd=directory_fd,
+                descriptor=retained_descriptor,
                 device=candidate_metadata.st_dev,
                 inode=candidate_metadata.st_ino,
                 size=len(contents),
                 sha256=hashlib.sha256(contents).hexdigest(),
             )
             staged.require_intact()
+            retained_descriptor = None
             return staged
         except (CandidateFileError, OSError, ValueError) as error:
             if descriptor is not None and not closed:
                 try:
                     self._close(descriptor)
+                except OSError:
+                    pass
+            if retained_descriptor is not None:
+                try:
+                    os.close(retained_descriptor)
                 except OSError:
                     pass
             if name is not None and candidate_metadata is not None:
