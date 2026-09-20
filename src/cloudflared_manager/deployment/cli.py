@@ -15,6 +15,7 @@ from cloudflared_manager.deployment.configurator import ConfigResult, Configurat
 from cloudflared_manager.deployment.environment import read_environment
 from cloudflared_manager.deployment.errors import (
     DeploymentError,
+    HostOperationError,
     RollbackError,
     TransactionFailedError,
 )
@@ -27,6 +28,7 @@ from cloudflared_manager.deployment.release import DeploymentLock, ReleaseFilesy
 from cloudflared_manager.deployment.service import IpNetworkInspector, SystemdManager
 from cloudflared_manager.deployment.updater import Updater
 from cloudflared_manager.deployment.validation import validate_port, validate_sha
+from cloudflared_manager.runtime_identity import PROCESS_RELEASE_ID
 
 
 def install_from_source(source: Path, sha: str, python: Path) -> int:
@@ -254,6 +256,11 @@ def _apply_config(
     updates: dict[str, str],
 ) -> ConfigResult:
     with DeploymentLock(paths.lock_path):
+        current_release = ReleaseFilesystem(paths).read_current_sha()
+        if PROCESS_RELEASE_ID != current_release:
+            raise HostOperationError(
+                "The configuration process does not match the current manager release."
+            )
         return configurator.apply(updates)
 
 

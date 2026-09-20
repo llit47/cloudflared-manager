@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from cloudflared_manager.config import Settings
+from cloudflared_manager.deployment import cli
 from cloudflared_manager.deployment.configurator import Configurator
 from cloudflared_manager.deployment.environment import (
     atomic_write_environment,
@@ -235,6 +236,82 @@ def test_corrective_restart_still_rejects_wrong_running_release(tmp_path: Path) 
 
     assert service.calls.count("restart") == 2
     assert paths.environment_file.read_bytes() == document.render().encode()
+
+
+class RecordingLock:
+    def __init__(self, path: Path, entered: list[bool]) -> None:
+        self.entered = entered
+
+    def __enter__(self) -> "RecordingLock":
+        self.entered.append(True)
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.entered.append(False)
+
+
+def test_stale_configurator_process_is_rejected_inside_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    filesystem, _ = installed(tmp_path)
+    paths = filesystem.paths
+    previous = paths.environment_file.read_bytes()
+    service = RuntimeService()
+    entered: list[bool] = []
+
+    class LockedFilesystem:
+        def __init__(self, actual_paths: object) -> None:
+            assert entered == [True]
+
+        def read_current_sha(self) -> str:
+            assert entered == [True]
+            return SHA
+
+    monkeypatch.setattr(cli, "DeploymentLock", lambda path: RecordingLock(path, entered))
+    monkeypatch.setattr(cli, "ReleaseFilesystem", LockedFilesystem)
+    monkeypatch.setattr(cli, "PROCESS_RELEASE_ID", OTHER_SHA)
+
+    with pytest.raises(HostOperationError, match="does not match"):
+        cli._apply_config(
+            paths,
+            Configurator(paths, service, readiness, environment_owner=None),
+            {"CFM_BIND_PORT": "8081"},
+        )
+
+    assert entered == [True, False]
+    assert paths.environment_file.read_bytes() == previous
+    assert service.calls == []
+
+
+@pytest.mark.parametrize(("port", "changed"), [(8000, False), (8081, True)])
+def test_current_configurator_process_uses_normal_configuration_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, port: int, changed: bool
+) -> None:
+    filesystem, _ = installed(tmp_path)
+    paths = filesystem.paths
+    service = RuntimeService()
+    entered: list[bool] = []
+
+    monkeypatch.setattr(cli, "DeploymentLock", lambda path: RecordingLock(path, entered))
+    monkeypatch.setattr(cli, "ReleaseFilesystem", lambda actual_paths: filesystem)
+    monkeypatch.setattr(cli, "PROCESS_RELEASE_ID", SHA)
+
+    result = cli._apply_config(
+        paths,
+        Configurator(
+            paths,
+            service,
+            lambda host, request_port: DeploymentReadiness(
+                service.main_pid, config_id(port=request_port), SHA
+            ),
+            environment_owner=None,
+        ),
+        {"CFM_BIND_PORT": str(port)},
+    )
+
+    assert result.changed is changed
+    assert entered == [True, False]
+    assert service.calls.count("restart") == int(changed)
 
 
 def test_applied_same_value_config_is_a_true_noop(tmp_path: Path) -> None:
