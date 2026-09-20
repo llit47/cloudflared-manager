@@ -103,6 +103,39 @@ changes, configuration validation, and service restarts.
   partial DNS/config failures with explicit compensation or a recoverable
   reconciliation state; never report partial success as complete.
 
+## Privileged cloudflared activation
+
+- Follow `docs/activation-transaction.md` for any work that can replace the
+  adopted cloudflared config or control `cloudflared.service`. Treat its
+  non-negotiable invariants as hard requirements, not implementation advice.
+- Keep the long-running web service non-root and unable to write the adopted
+  config, its directory, privileged transaction state, or service-control
+  interfaces. LAN-only access is not privileged authorization.
+- Derive the active target only from the root-owned explicitly adopted setting.
+  Never mutate a detected-only path or accept an active, backup, journal,
+  executable, or service path from browser input.
+- Revalidate the adopted path, active manager release, source bytes and
+  file/parent identity immediately before commit. Reject concurrent or manual
+  changes; never merge or rebase a prepared mutation onto changed config.
+- Preserve PR10's bounded/no-follow snapshots, round-trip structural checks,
+  terminal catch-all, exclusive `0600` staging, fsync, retained candidate
+  identity, layered parsing, and FD-bound cloudflared validation. Root privilege
+  does not permit bypassing them.
+- Never truncate the active config in place. Require exact durable backup,
+  intended metadata handling, race-aware same-filesystem atomic commit, file
+  and directory fsync, and authenticated crash recovery before production
+  activation is enabled. Unsupported ACLs/xattrs or ambiguous filesystem state
+  fail closed.
+- Treat service command completion, active state, process identity, readiness,
+  and stability as separate checks. A failed activation is never success;
+  distinguish verified rollback from partial or failed rollback.
+- Keep privileged operations allowlisted with fixed executable/service
+  identities, strict bounded inputs, fixed argv, bounded timeouts,
+  `shell=False`, minimal environment, and sanitized errors. Never create a
+  generic root command, file-copy, YAML-path, or systemctl proxy.
+- Do not combine local config activation with DNS/API ownership or expose a web
+  mutation surface until each boundary has its own reviewed design and tests.
+
 ## Engineering workflow
 
 - Keep modules small and responsibilities clear. Avoid dependencies without a
