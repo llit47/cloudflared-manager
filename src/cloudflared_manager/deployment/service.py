@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -10,7 +11,7 @@ from pathlib import Path
 
 from cloudflared_manager.deployment.errors import HostOperationError
 from cloudflared_manager.deployment.network import NetworkInspector
-from cloudflared_manager.deployment.validation import validate_interface
+from cloudflared_manager.deployment.validation import validate_interface, validate_sha
 
 MANAGER_UNIT = "cloudflared-manager.service"
 _SAFE_STATE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
@@ -97,6 +98,31 @@ class SystemdManager:
             main_pid=int(pid),
             needs_daemon_reload=reload_value == "yes",
         )
+
+    def running_release_id(self, install_root: Path) -> str:
+        """Read the immutable release directory bound to the stable manager process."""
+
+        before = self.runtime_state()
+        if not before.active or before.main_pid <= 0:
+            raise HostOperationError("The managed Cloudflared Manager service is not active.")
+        try:
+            working_directory = Path(os.readlink(f"/proc/{before.main_pid}/cwd"))
+        except OSError as error:
+            raise HostOperationError(
+                "The manager process release identity is unavailable."
+            ) from error
+        after = self.runtime_state()
+        if not after.active or before.main_pid != after.main_pid:
+            raise HostOperationError("The manager process identity changed during inspection.")
+        if working_directory.parent != install_root / "releases":
+            raise HostOperationError("The manager process release identity is invalid.")
+        try:
+            revision = validate_sha(working_directory.name)
+        except Exception as error:
+            raise HostOperationError("The manager process release identity is invalid.") from error
+        if working_directory != install_root / "releases" / revision:
+            raise HostOperationError("The manager process release identity is invalid.")
+        return revision
 
     def sanitized_status(self) -> tuple[str | None, str | None, str | None]:
         result = self._run(

@@ -113,9 +113,11 @@ def test_rollback_rejects_wrong_executing_release(tmp_path, transaction):
     def health(host, port):
         nonlocal calls
         calls += 1
-        if calls == 1:
+        if transaction == "update" and calls == 1:
             return service.readiness(host, port)
-        if calls == 2:
+        if (transaction == "update" and calls == 2) or (
+            transaction == "config" and calls == 1
+        ):
             raise HealthCheckError("candidate failed")
         return fake_readiness(host, port, release_id=B)
 

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from cloudflared_manager.deployment.environment import atomic_write_environment, read_environment
 from cloudflared_manager.deployment.errors import RollbackError, TransactionFailedError
-from cloudflared_manager.deployment.health import verify_managed_health
+from cloudflared_manager.deployment.health import verify_managed_health, verify_running_release
 from cloudflared_manager.deployment.paths import DeploymentPaths
 from cloudflared_manager.deployment.protocols import HealthVerifier, ManagerService
 from cloudflared_manager.deployment.release import ReleaseFilesystem
@@ -47,12 +47,9 @@ class Configurator:
         filesystem = ReleaseFilesystem(self.paths, owner=self.environment_owner)
         filesystem.require_owned_layout()
         expected_release = filesystem.read_current_sha()
-        # A config-only operation must not adopt a pending release switch. Prove
-        # the running release first, allowing an unapplied persisted config.
-        verify_managed_health(
-            self.service, self.health, previous_settings.bind_host,
-            previous_settings.bind_port, None, expected_release,
-        )
+        # A config-only operation must not adopt a pending release switch. This
+        # process-bound check does not assume the persisted bind is applied yet.
+        verify_running_release(self.service, self.paths.install_root, expected_release)
         if candidate.render() == document.render():
             try:
                 verify_managed_health(

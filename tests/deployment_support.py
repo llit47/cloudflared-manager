@@ -108,6 +108,9 @@ class FakeService:
         from cloudflared_manager.deployment.service import ManagerRuntimeState
         return ManagerRuntimeState(self.active, self.main_pid, self.needs_daemon_reload)
 
+    def running_release_id(self, install_root: Path) -> str:
+        return getattr(self, "release_id", "3" * 40)
+
     def is_active(self) -> bool:
         self.calls.append("is-active")
         return self.active

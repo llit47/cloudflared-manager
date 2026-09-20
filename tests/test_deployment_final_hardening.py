@@ -109,6 +109,7 @@ def test_config_rejects_http_health_when_candidate_service_is_inactive(
             self.active = self.restarts != 1
 
     service = FailedCandidateRestart()
+    service.release_id = A_SHA
     with pytest.raises(TransactionFailedError):
         Configurator(filesystem.paths, service, fake_readiness,
                      environment_owner=None).apply({"CFM_BIND_PORT": "9000"})
@@ -146,12 +147,13 @@ def test_rollback_cannot_claim_health_when_http_succeeds_but_service_is_inactive
             self.active = False
 
     service = FailedRollbackRestart()
+    service.release_id = A_SHA
     calls = 0
 
     def http_health(host: str, port: int) -> None:
         nonlocal calls
         calls += 1
-        if (transaction == "config" and calls == 2) or (
+        if (transaction == "config" and calls == 1) or (
             transaction == "update" and filesystem.read_current_sha() == B_SHA
         ):
             raise HealthCheckError("candidate failed")

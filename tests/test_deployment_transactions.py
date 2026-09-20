@@ -977,7 +977,7 @@ def test_config_change_restarts_and_preserves_unknown_content(tmp_path: Path) ->
 
     assert result.changed is True
     assert service.calls == ["restart"]
-    assert health == [("192.168.1.20", 8000), ("192.168.1.20", 9000)]
+    assert health == [("192.168.1.20", 9000)]
     assert "# custom\nFUTURE=keep\n" in paths.environment_file.read_text()
 
 
@@ -1020,7 +1020,7 @@ def test_config_health_failure_restores_exact_previous_file(tmp_path: Path) -> N
     def health(host: str, port: int) -> None:
         nonlocal health_calls
         health_calls += 1
-        if health_calls == 2:
+        if health_calls == 1:
             raise HealthCheckError("candidate failed")
         return fake_readiness(host, port)
 
@@ -1034,7 +1034,7 @@ def test_config_health_failure_restores_exact_previous_file(tmp_path: Path) -> N
 
     assert paths.environment_file.read_bytes() == previous
     assert service.calls == ["restart", "restart"]
-    assert health_calls == 3
+    assert health_calls == 2
 
 
 def test_config_rollback_health_failure_is_critical(tmp_path: Path) -> None:

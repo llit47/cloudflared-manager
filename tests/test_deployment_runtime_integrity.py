@@ -41,6 +41,7 @@ def config_id(host: str = "192.168.1.20", port: int = 8000, discovery: bool = Tr
 class RuntimeService(FakeService):
     def __init__(self, *, active: bool = True, needs_reload: bool = False) -> None:
         super().__init__(active=active)
+        self.release_id = SHA
         self.main_pid = 1234 if active else 0
         self.needs_reload = needs_reload
         self.next_pid: int | None = None
@@ -145,7 +146,31 @@ def test_systemd_runtime_observation_fails_closed_on_malformed_main_pid(
         manager.runtime_state()
 
 
-@pytest.mark.parametrize("change", ["port", "discovery"])
+def test_systemd_running_release_uses_stable_process_working_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SystemdManager(executable="/usr/bin/systemctl")
+    observations = 0
+
+    def runtime(_arguments: tuple[str, ...]) -> CommandOutput:
+        nonlocal observations
+        observations += 1
+        return CommandOutput(
+            0,
+            "ActiveState=active\nMainPID=1234\nNeedDaemonReload=no\n",
+        )
+
+    monkeypatch.setattr(manager, "_run", runtime)
+    monkeypatch.setattr(
+        "cloudflared_manager.deployment.service.os.readlink",
+        lambda path: "/opt/cloudflared-manager/releases/" + SHA,
+    )
+
+    assert manager.running_release_id(Path("/opt/cloudflared-manager")) == SHA
+    assert observations == 2
+
+
+@pytest.mark.parametrize("change", ["port", "host", "discovery"])
 def test_repeated_config_command_reapplies_unapplied_persisted_value(
     tmp_path: Path, change: str
 ) -> None:
@@ -154,20 +179,61 @@ def test_repeated_config_command_reapplies_unapplied_persisted_value(
     if change == "port":
         updates = {"CFM_BIND_PORT": "8081"}
         desired_id = config_id(port=8081)
+        expected_host = "192.168.1.20"
+        expected_port = 8081
+    elif change == "host":
+        updates = {"CFM_BIND_HOST": "192.168.1.21"}
+        desired_id = config_id(host="192.168.1.21")
+        expected_host = "192.168.1.21"
+        expected_port = 8000
     else:
         updates = {"CFM_RUNTIME_DISCOVERY_ENABLED": "false"}
         desired_id = config_id(discovery=False)
+        expected_host = "192.168.1.20"
+        expected_port = 8000
     document = initial_environment("192.168.1.20", 8000).updated(updates)
     atomic_write_environment(paths.environment_file, document, owner=None)
     service = RuntimeService()
     runtime_id = config_id()  # Process still has the previous configuration.
 
+    observations: list[tuple[str, int]] = []
+
     def observe(host: str, port: int) -> dict[str, object]:
+        observations.append((host, port))
+        if change in {"port", "host"} and "restart" not in service.calls:
+            raise HealthCheckError("persisted bind is not active yet")
         return readiness(identity=desired_id if "restart" in service.calls else runtime_id)
 
     result = Configurator(paths, service, observe, environment_owner=None).apply(updates)
     assert result.changed is True
     assert service.calls.count("restart") == 1
+    assert observations == [
+        (expected_host, expected_port),
+        (expected_host, expected_port),
+    ]
+    assert paths.environment_file.read_bytes() == document.render().encode()
+
+
+def test_corrective_restart_still_rejects_wrong_running_release(tmp_path: Path) -> None:
+    filesystem, _ = installed(tmp_path)
+    paths = filesystem.paths
+    document = initial_environment("192.168.1.20", 8000).updated(
+        {"CFM_BIND_PORT": "8081"}
+    )
+    atomic_write_environment(paths.environment_file, document, owner=None)
+    service = RuntimeService()
+
+    def observe(host: str, port: int) -> DeploymentReadiness:
+        if "restart" not in service.calls:
+            raise HealthCheckError("persisted bind is not active yet")
+        return DeploymentReadiness(service.main_pid, config_id(port=8081), OTHER_SHA)
+
+    with pytest.raises(RollbackError):
+        Configurator(paths, service, observe, environment_owner=None).apply(
+            {"CFM_BIND_PORT": "8081"}
+        )
+
+    assert service.calls.count("restart") == 2
     assert paths.environment_file.read_bytes() == document.render().encode()
 
 
@@ -249,7 +315,7 @@ def test_unchanged_config_restart_failure_recovers_only_persisted_settings(
             {"CFM_BIND_PORT": "8081"}
         )
 
-    expected_events = ["readiness-0", "readiness-0", "restart-1"]
+    expected_events = ["readiness-0", "restart-1"]
     if corrective_failure == "verification":
         expected_events.append("readiness-1")
     expected_events.append("restart-2")
@@ -276,8 +342,6 @@ def test_config_rollback_requires_previous_runtime_identity(
         nonlocal calls
         calls += 1
         if calls == 1:
-            return readiness()
-        if calls == 2:
             raise HealthCheckError("candidate failed")
         if rollback_identity == "pid":
             return readiness(pid=9999)

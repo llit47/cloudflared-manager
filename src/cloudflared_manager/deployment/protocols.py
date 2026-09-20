@@ -1,6 +1,7 @@
 """Small interfaces shared by deployment transactions."""
 
 from collections.abc import Callable
+from pathlib import Path
 from typing import Protocol
 
 
@@ -28,6 +29,8 @@ class ManagerService(Protocol):
     def is_enabled(self) -> bool: ...
 
     def runtime_state(self) -> ManagerRuntimeState: ...
+
+    def running_release_id(self, install_root: Path) -> str: ...
 
     def sanitized_status(self) -> tuple[str | None, str | None, str | None]: ...
 

@@ -9,6 +9,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 from cloudflared_manager.deployment.errors import HealthCheckError
 from cloudflared_manager.deployment.protocols import HealthVerifier, ManagerService
@@ -33,6 +34,19 @@ class DeploymentReadiness:
     pid: int
     config_id: str
     release_id: str
+
+
+def verify_running_release(
+    service: ManagerService,
+    install_root: Path,
+    expected_release_id: str,
+) -> None:
+    """Prove the stable managed process runs the expected immutable release."""
+
+    if re.fullmatch(r"[0-9a-f]{40}", expected_release_id) is None:
+        raise HealthCheckError("The expected manager release identity is invalid.")
+    if service.running_release_id(install_root) != expected_release_id:
+        raise HealthCheckError("The managed Cloudflared Manager release identity is invalid.")
 
 
 def verify_managed_health(
