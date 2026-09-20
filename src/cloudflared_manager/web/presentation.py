@@ -21,8 +21,15 @@ from cloudflared_manager.cloudflared.discovery import (
     discover_cloudflared,
 )
 from cloudflared_manager.config import Settings
+from cloudflared_manager.web.config_source import (
+    ConfigSourceView,
+    RuntimeSnapshotState,
+    adopted_config_source,
+    config_source_load_error,
+    unadopted_config_source,
+)
 
-StatusTone = Literal["neutral", "success", "error"]
+StatusTone = Literal["neutral", "success", "warning", "error"]
 ConfigLoader = Callable[[Path], CloudflaredConfig]
 
 
@@ -51,6 +58,7 @@ class DashboardView:
 
     tunnel: StatusView
     cloudflared: StatusView
+    config_source: ConfigSourceView
     configuration: StatusView
     routes: tuple[DetectedRouteView, ...]
     empty_title: str
@@ -61,6 +69,14 @@ class DashboardView:
         return len(self.routes)
 
 
+@dataclass(frozen=True, slots=True)
+class _RuntimeSnapshot:
+    """One internal discovery result shared by all dashboard status builders."""
+
+    state: RuntimeSnapshotState
+    runtime: CloudflaredRuntime | None = None
+
+
 def build_dashboard_view(
     settings: Settings,
     load_config: ConfigLoader = parse_cloudflared_config,
@@ -68,7 +84,8 @@ def build_dashboard_view(
 ) -> DashboardView:
     """Load configured data and map it to safe dashboard presentation values."""
 
-    cloudflared_status = _cloudflared_status(settings, discover_runtime)
+    runtime_snapshot = _discover_runtime_snapshot(settings, discover_runtime)
+    cloudflared_status = _cloudflared_status(runtime_snapshot)
 
     if settings.cloudflared_config_path is None:
         return DashboardView(
@@ -78,16 +95,20 @@ def build_dashboard_view(
                 description="No Cloudflare Tunnel configuration is selected.",
             ),
             cloudflared=cloudflared_status,
+            config_source=unadopted_config_source(
+                runtime_snapshot.state,
+                runtime_snapshot.runtime,
+            ),
             configuration=StatusView(
                 label="Not configured",
                 tone="neutral",
                 description="No cloudflared configuration source is selected.",
             ),
             routes=(),
-            empty_title="No configuration selected",
+            empty_title="No configuration adopted",
             empty_description=(
-                "A root administrator can explicitly adopt the local config detected "
-                "from cloudflared.service with cfm-config. No file is adopted automatically."
+                "Ingress routes appear only after a root administrator explicitly adopts "
+                "a detected local config and it loads successfully."
             ),
         )
 
@@ -101,6 +122,7 @@ def build_dashboard_view(
                 description="Tunnel details could not be read from the configured file.",
             ),
             cloudflared=cloudflared_status,
+            config_source=config_source_load_error(),
             configuration=StatusView(
                 label="Load error",
                 tone="error",
@@ -137,6 +159,11 @@ def build_dashboard_view(
             ),
         ),
         cloudflared=cloudflared_status,
+        config_source=adopted_config_source(
+            settings.cloudflared_config_path,
+            runtime_snapshot.state,
+            runtime_snapshot.runtime,
+        ),
         configuration=StatusView(
             label="Loaded",
             tone="success",
@@ -150,33 +177,41 @@ def build_dashboard_view(
     )
 
 
-def _cloudflared_status(
+def _discover_runtime_snapshot(
     settings: Settings,
     discover_runtime: RuntimeDiscoveryProvider,
-) -> StatusView:
+) -> _RuntimeSnapshot:
     if not settings.runtime_discovery_enabled:
+        return _RuntimeSnapshot(state="disabled")
+
+    try:
+        runtime = discover_runtime(True)
+    except RuntimeDiscoveryError:
+        return _RuntimeSnapshot(state="unavailable")
+
+    if runtime is None:
+        return _RuntimeSnapshot(state="unavailable")
+
+    return _RuntimeSnapshot(state="available", runtime=runtime)
+
+
+def _cloudflared_status(snapshot: _RuntimeSnapshot) -> StatusView:
+    if snapshot.state == "disabled":
         return StatusView(
             label="Not connected",
             tone="neutral",
             description="Runtime discovery is disabled; local service state is unknown.",
         )
 
-    try:
-        runtime = discover_runtime(True)
-    except RuntimeDiscoveryError:
+    if snapshot.state == "unavailable":
         return StatusView(
             label="Unavailable",
             tone="error",
             description="Local cloudflared runtime inspection could not be completed.",
         )
 
-    if runtime is None:
-        return StatusView(
-            label="Unavailable",
-            tone="error",
-            description="Local cloudflared runtime information is unavailable.",
-        )
-
+    runtime = snapshot.runtime
+    assert runtime is not None
     label, tone = _runtime_label(runtime)
     return StatusView(
         label=label,

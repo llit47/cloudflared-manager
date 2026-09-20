@@ -315,7 +315,7 @@ h1 {
 
 .status-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: var(--space-4);
 }
 
@@ -378,6 +378,11 @@ h1 {
 .status-success {
   color: var(--color-success);
   background: var(--color-success-soft);
+}
+
+.status-warning {
+  color: var(--color-warning);
+  background: var(--color-warning-soft);
 }
 
 .status-error {
@@ -628,6 +633,12 @@ h1 {
   align-items: center;
   justify-content: space-between;
   gap: var(--space-4);
+}
+
+@media (max-width: 68rem) {
+  .status-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 52rem) {
