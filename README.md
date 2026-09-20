@@ -17,6 +17,10 @@ whether a local config candidate is detected, explicitly adopted, matched to
 the running service, unverified, or different from the service configuration.
 A production deployment foundation installs immutable release-specific
 environments and runs the application as a dedicated unprivileged system user.
+An internal candidate-generation foundation can securely snapshot an explicitly
+selected config, apply a narrow in-memory ingress insertion, stage a separate
+candidate beside the source, and validate that candidate. Nothing in the web
+application or deployment workflow invokes this foundation yet.
 
 Detected routes are existing configuration, not routes owned or managed by
 Cloudflared Manager. This version does **not** modify cloudflared configuration,
@@ -35,8 +39,11 @@ layout:
 - `cloudflared_manager.main` creates the FastAPI application and mounts static
   assets.
 - `cloudflared_manager.cloudflared` contains read-only domain models, safe
-  parser errors, YAML parsing that accepts only an explicit path, sanitized
-  runtime discovery, and an allowlisted local command runner.
+  parser errors, strict read-domain YAML parsing that accepts only an explicit
+  path, sanitized runtime discovery, and an allowlisted local command runner.
+- `cloudflared_manager.cloudflared.editing` contains the separate internal
+  round-trip document, secure source snapshot, candidate-file lifecycle, and
+  candidate validation boundaries. It exposes no activation operation.
 - `cloudflared_manager.web` keeps thin HTTP routes separate from dashboard
   presentation models and server-rendered UI code.
 - `cloudflared_manager.deployment` separates exact-source bootstrap, input and
@@ -407,8 +414,15 @@ The catch-all remains in the parsed domain model to preserve ordering but is
 not displayed or counted as a hostname route. The reader does not load the
 credentials file referenced by the YAML.
 
-YAML support uses the mature PyYAML dependency and its `safe_load` API; no
-custom YAML parser or unsafe object construction is used.
+The existing read-domain parser continues to use the mature PyYAML dependency
+and its `safe_load` API. Candidate editing is a separate responsibility and
+uses `ruamel.yaml` in round-trip mode to retain human-maintained comments,
+mapping order, quoting, anchors/aliases, and unrelated structures to the extent
+supported by that library. It rejects duplicate keys, unsupported structures,
+unsafe tags, malformed YAML, non-UTF-8 input, and oversized input. A real
+mutation is not claimed to preserve formatting byte-for-byte, and an explicit
+no-op is never serialized or staged. Neither path uses arbitrary-object YAML
+deserialization.
 
 Configuration loading is strictly read-only. It does not write YAML, create
 backups, run cloudflared, contact Cloudflare, change DNS, or control system
@@ -417,6 +431,50 @@ while the application and `/healthz` remain available. After explicit adoption,
 the dashboard uses that file to show the tunnel declaration and sanitized
 hostname routes; it never reads or dereferences `credentials-file`, token files,
 credentials JSON, or `cert.pem`.
+
+### Internal candidate foundation (not active configuration support)
+
+This release remains operationally **READ-ONLY**. The internal editing package
+is candidate-generation infrastructure for later privileged work; it is not
+wired to HTTP, dashboard requests, `cfm-config`, installation, or deployment.
+There is no Add, Edit, Enable, Disable, Delete, DNS, or Cloudflare API workflow.
+
+Candidate preparation follows this bounded sequence:
+
+1. Open a canonical regular source without following symlinks, read at most the
+   shared one-MiB limit, and retain immutable bytes, SHA-256, file identity,
+   timestamps, ownership/mode, and parent-directory identity.
+2. Load those bytes as UTF-8 round-trip YAML and allow only the narrow primitive
+   that inserts a supplied ingress mapping immediately before a valid terminal
+   catch-all. Unknown existing data is not projected into a smaller model.
+3. For a real change only, exclusively create a random `0600` candidate in the
+   source directory, write it completely, and `fsync` it. The adopted source is
+   never opened for writing, replaced, renamed, removed, chmodded, or chowned.
+4. Run the existing PyYAML application parser against the candidate, then run
+   the replaceable external validator as the fixed argv
+   `cloudflared tunnel --config <candidate> ingress validate` without a shell
+   and with a finite timeout. Candidate bytes and source identity are checked
+   around validation, and any failed preparation removes its candidate.
+5. Return either an explicit no-op or a validated, disposable candidate. Stop
+   there: no code can activate the candidate in this release.
+
+Raw YAML, local config paths, validator output, and credential-bearing values
+are not added to browser models or safe exception messages. Normal dashboard
+requests do not create or validate candidates, and the installed service stays
+unprivileged. `cloudflared.service` is never restarted, reloaded, started, or
+stopped by this foundation.
+
+The next activation-focused change must introduce and review a narrow
+privileged boundary; revalidate the adopted path at mutation time; reject stale
+or concurrent source changes; preserve exact owner, group, and mode; back up
+the exact previous bytes; use same-filesystem atomic activation with file and
+directory `fsync`; restart or reload cloudflared and verify process/service
+readiness; and roll back on activation failure while proving that the previous
+working state was restored. A simple backup copy followed by
+`os.replace(candidate, config)` is not treated as a sufficient transaction.
+None of those activation, backup, rollback, service-control, sudoers, systemd
+privilege, permission-broadening, or production write concerns is implemented
+here. Cloudflare API and DNS mutation also remain unimplemented.
 
 ## Run the development server
 
