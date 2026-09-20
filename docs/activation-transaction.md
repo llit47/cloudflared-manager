@@ -183,6 +183,14 @@ Future implementation MUST preserve all of the following:
 23. A later privileged implementation must not modify sudoers, systemd policy,
     or service permissions as an incidental side effect. Enabling the boundary
     is a separately reviewed administrator action.
+24. Production activation requires a verified healthy and stable
+    `cloudflared.service` baseline before active namespace mutation. An
+    initially inactive, failed, mismatched, or unstable service is an
+    unsupported precondition, not a condition the transaction repairs.
+25. Rollback/recovery artifacts are never deleted before a durable terminal
+    commit or rollback decision. Cleanup after that decision is authenticated,
+    idempotent, directory-fsynced, and complete before a user-visible terminal
+    result.
 
 ## Recommended privileged boundary
 
@@ -286,12 +294,14 @@ IDLE
   -> SOURCE_VERIFIED
   -> CANDIDATE_PREPARED
   -> CANDIDATE_VALIDATED
+  -> SERVICE_BASELINE_VERIFIED
   -> PRECOMMIT_REVALIDATED
   -> BACKUP_DURABLE
   -> CONFIG_COMMITTING
   -> CONFIG_COMMITTED
   -> SERVICE_ACTIVATING
   -> SERVICE_VERIFIED
+  -> COMMIT_CLEANUP_PENDING
   -> COMMITTED_SUCCESS
 
 Failure after CONFIG_COMMITTING:
@@ -300,6 +310,7 @@ ACTIVATION_FAILED
   -> ROLLBACK_CONFIG
   -> ROLLBACK_SERVICE
   -> ROLLBACK_VERIFIED
+  -> ROLLBACK_CLEANUP_PENDING
   -> FAILED_ROLLED_BACK
 
 Any unverified restoration or service recovery:
@@ -313,6 +324,27 @@ state that is still purely read-only with respect to the active name. The
 atomic exchange/replace that leaves candidate bytes at the active name is the
 point of no longer purely read-only staging.
 
+`SERVICE_BASELINE_VERIFIED` is a mandatory precommit gate, not merely an
+observation for diagnostics. The first production implementation accepts only
+a loaded, active, stably running cloudflared service whose process/executable
+identity and relationship to the adopted config are verified. An inactive,
+failed, activating, deactivating, restart-looping, path-mismatched, or otherwise
+unhealthy service causes rejection before `CONFIG_COMMITTING`; the transaction
+does not attempt to turn that state into a supported baseline.
+
+`COMMIT_CLEANUP_PENDING` and `ROLLBACK_CLEANUP_PENDING` are durable terminal
+decisions. Once either is fsynced, the selected outcome no longer depends on
+rollback artifacts remaining present. Cleanup can then remove authenticated
+artifacts idempotently. User-visible success or verified-rollback failure is
+not returned until cleanup, affected-directory fsync, and the corresponding
+durable terminal journal state are complete.
+
+A cleanup error after either durable decision does not reverse that decision.
+The journal remains in its cleanup-pending state, no new transaction may begin,
+and root recovery resumes the same idempotent cleanup. An existing artifact
+with the wrong identity is not treated as already cleaned and requires manual
+intervention; an allowlisted artifact that is absent is safe to skip.
+
 ### State and transition contract
 
 | Transition | Prerequisites and verification | Side effects and durable state | Failure behavior |
@@ -320,17 +352,20 @@ point of no longer purely read-only staging.
 | `IDLE -> SOURCE_VERIFIED` | Lock held; no incomplete journal; helper/release and adopted path independently valid; canonical path opened without symlinks; bounded snapshot succeeds | Read-only descriptors and immutable snapshot only | Close descriptors; sanitized rejection; no rollback |
 | `SOURCE_VERIFIED -> CANDIDATE_PREPARED` | Narrow mutation accepts structure and reports a real change | Exclusive random `0600` same-directory candidate, complete write and candidate file `fsync`; retained file/directory identity | Remove only the verified candidate; source untouched |
 | `CANDIDATE_PREPARED -> CANDIDATE_VALIDATED` | Candidate identity intact | Existing application parser succeeds, then fixed cloudflared ingress validation succeeds through FD-bound path; sanitized report retained | Discard candidate; source untouched |
-| `CANDIDATE_VALIDATED -> PRECOMMIT_REVALIDATED` | Candidate rechecked; adopted setting reread; active path/parent reopened through no-follow descriptor walk; source bytes and metadata compared with original snapshot | Read-only checks only | Reject stale state; never merge/rebase; discard candidate |
-| `PRECOMMIT_REVALIDATED -> BACKUP_DURABLE` | Source still bound by retained descriptors; backup/journal storage verified root-owned and restrictive | Exact source bytes copied from verified descriptor; restoration metadata and digests recorded; backup file and directory fsynced; minimal journal atomically records identities and `BACKUP_DURABLE` and its directory is fsynced | Remove incomplete artifacts only when identity is proven; source untouched |
-| `BACKUP_DURABLE -> CONFIG_COMMITTING` | Final candidate/source/adopted-path checks; journal names exact artifacts; commit primitive available | Journal durably records intent to modify active name | On failure before namespace change, recover as precommit and leave source untouched |
+| `CANDIDATE_VALIDATED -> SERVICE_BASELINE_VERIFIED` | Unit is loaded; state is active with the expected running substate; positive MainPID, process start identity, executable identity, adopted-config relationship, and readiness remain stable across a bounded observation | Read-only checks only; sanitized baseline facts retained in memory | Reject before active mutation; discard candidate; do not start/restart/reload an unhealthy service |
+| `SERVICE_BASELINE_VERIFIED -> PRECOMMIT_REVALIDATED` | Baseline is still current; candidate rechecked; adopted setting reread; active path/parent reopened through no-follow descriptor walk; source bytes and metadata compared with original snapshot | Read-only checks only | Reject stale source or service state; never merge/rebase; discard candidate |
+| `PRECOMMIT_REVALIDATED -> BACKUP_DURABLE` | Source still bound by retained descriptors; service baseline remains valid; backup/journal storage verified root-owned and restrictive | Exact source bytes copied from verified descriptor with pre/post identity checks; restoration metadata and digests recorded; backup file and directory fsynced; minimal journal atomically records identities, sanitized baseline facts, and `BACKUP_DURABLE`, then its directory is fsynced | Remove incomplete artifacts only when identity is proven; source untouched |
+| `BACKUP_DURABLE -> CONFIG_COMMITTING` | Final candidate/source/adopted-path checks; live service still matches the verified baseline; journal already contains baseline and exact artifact identities; commit primitive available | Journal durably records intent to modify active name | On failure before namespace change, recover as precommit and leave source untouched |
 | `CONFIG_COMMITTING -> CONFIG_COMMITTED` | Race-aware same-directory commit; displaced active object verified as exact expected source; new active object verified as exact candidate with intended metadata | One atomic namespace commit, then active file fsync as applicable and parent directory fsync; journal advances only after durability | If displaced source differs, immediately restore/exchange it and return stale rejection; after any active-name change, rollback is mandatory |
 | `CONFIG_COMMITTED -> SERVICE_ACTIVATING` | Active bytes/digest, metadata, and adopted name reverified; service phase implemented | Fixed allowlisted restart or verified reload begins; journal records phase durably first | Enter `ACTIVATION_FAILED`; rollback required |
-| `SERVICE_ACTIVATING -> SERVICE_VERIFIED` | systemd command succeeded and bounded readiness checks prove expected service/process/config stability | Read-only service observations; journal records verification evidence without secrets | Enter `ACTIVATION_FAILED`; rollback required |
-| `SERVICE_VERIFIED -> COMMITTED_SUCCESS` | Active candidate identity still matches and service stayed healthy for required window | Delete rollback artifacts only after identity checks; fsync affected directories; atomically clear/complete journal | Cleanup failure is not silently called clean success; retain recoverable journal/artifacts |
+| `SERVICE_ACTIVATING -> SERVICE_VERIFIED` | systemd command succeeded and bounded readiness checks prove expected service/process/config stability | Read-only service observations; journal records verification evidence without secrets | Enter `ACTIVATION_FAILED`; rollback required while no commit decision exists |
+| `SERVICE_VERIFIED -> COMMIT_CLEANUP_PENDING` | Active candidate and service stability reverified; success is now irrevocably selected | Journal durably records commit decision, complete cleanup allowlist, and `COMMIT_CLEANUP_PENDING` before any rollback artifact is removed | Journal/fsync failure leaves artifacts intact and no user-visible success; recovery still follows pre-decision rules |
+| `COMMIT_CLEANUP_PENDING -> COMMITTED_SUCCESS` | Durable commit decision authentic; each existing cleanup artifact matches its journaled identity | Remove authenticated artifacts idempotently, tolerate already-absent allowlisted artifacts, fsync every affected directory, then durably record `COMMITTED_SUCCESS` | Resume cleanup on restart; never roll back solely because a cleanup artifact is absent; do not report success until terminal durability completes |
 | `ACTIVATION_FAILED -> ROLLBACK_CONFIG` | Durable backup and/or retained displaced original authenticated against journal | Restore exact old bytes/metadata using secure same-directory staging and atomic namespace operation; fsync file and directory | Any uncertainty becomes `ROLLBACK_FAILED` |
 | `ROLLBACK_CONFIG -> ROLLBACK_SERVICE` | Old config digest and metadata verified at adopted name | Fixed service activation for restored config | Distinguish config-restored/service-unrecovered outcome |
-| `ROLLBACK_SERVICE -> ROLLBACK_VERIFIED` | Old service/process/readiness and restored file are proven stable | Read-only verification; durable journal update | Failure becomes `ROLLBACK_FAILED` |
-| `ROLLBACK_VERIFIED -> FAILED_ROLLED_BACK` | Prior state proven; artifacts safely cleaned or intentionally retained for recovery | Journal completed/cleared durably | Return failure, never mutation success |
+| `ROLLBACK_SERVICE -> ROLLBACK_VERIFIED` | Old file is exact; service is again loaded, active, ready, and stably equivalent to the journaled healthy baseline, with the expected executable/config relationship | Read-only verification; durable journal update | Failure becomes a distinct config-restored/service-recovery or rollback failure |
+| `ROLLBACK_VERIFIED -> ROLLBACK_CLEANUP_PENDING` | Exact old config and a healthy baseline-equivalent service are proven; rollback is irrevocably selected | Journal durably records rollback-complete decision, cleanup allowlist, and `ROLLBACK_CLEANUP_PENDING` before artifact deletion | Journal/fsync failure leaves artifacts intact and rollback outcome unfinalized |
+| `ROLLBACK_CLEANUP_PENDING -> FAILED_ROLLED_BACK` | Durable rollback decision authentic; each existing cleanup artifact matches its journaled identity | Remove authenticated artifacts idempotently, tolerate already-absent allowlisted artifacts, fsync every affected directory, then durably record `FAILED_ROLLED_BACK` | Resume cleanup on restart; missing allowlisted artifacts alone are not indeterminate; return activation failure only after terminal durability |
 
 Implementation PR A, if intentionally limited to filesystem mechanics, stops
 with a test-only/internal transaction boundary and does not advertise a
@@ -490,12 +525,22 @@ source and that recorded restoration metadata matches that source. Backup and
 journal permissions acknowledge that cloudflared configs may contain secrets.
 The web identity cannot read them.
 
-On verified success, the ephemeral backup is removed and its directory fsynced
-only after the journal reaches a state from which cleanup is safe. On failed
-activation it is retained until rollback is verified, then removed under the
-same rule. On rollback failure or ambiguous crash recovery it is retained for
-root administrator recovery. Automatic age-based deletion MUST NOT remove an
-artifact referenced by an incomplete journal.
+On verified success, the journal first durably records
+`COMMIT_CLEANUP_PENDING`, including the exact allowlist and identities of
+artifacts to remove. Only then may the ephemeral backup and other rollback
+artifacts be removed. Each deletion is idempotent: an existing object must
+match its journaled identity before deletion, while an already-absent
+allowlisted object is expected after a cleanup crash. Every affected directory
+is fsynced before `COMMITTED_SUCCESS` is recorded durably and success is
+reported.
+
+After verified rollback, the same ordering applies through
+`ROLLBACK_CLEANUP_PENDING` before artifacts are removed and
+`FAILED_ROLLED_BACK` is recorded durably. Before either cleanup-pending decision,
+a missing required backup remains a rollback/recovery failure. On rollback
+failure or ambiguous pre-decision recovery, artifacts are retained for root
+administrator recovery. Automatic age-based deletion MUST NOT remove an
+artifact referenced by a nonterminal journal.
 
 Bounded historical backups are not required for the first implementation.
 They increase secret retention and require a separate retention/audit policy.
@@ -504,16 +549,60 @@ secured configuration-management system.
 
 ## Service activation and readiness model
 
+### Required healthy baseline
+
+The first production activation implementation supports only a service that is
+already healthy. Before `PRECOMMIT_REVALIDATED`, and again immediately before
+`CONFIG_COMMITTING`, the helper MUST verify a `SERVICE_BASELINE_VERIFIED`
+baseline. At minimum it requires:
+
+- the fixed `cloudflared.service` unit is loaded;
+- `ActiveState` is `active` and `SubState` is the expected running state for the
+  supported unit type;
+- `MainPID` is positive and stable across a bounded observation interval;
+- process start identity is unchanged, preventing PID-reuse confusion;
+- `/proc/<MainPID>/exe` or an equivalent check identifies the expected
+  cloudflared executable;
+- the effective service configuration refers to the explicitly adopted config,
+  using strict parsing and identity comparison rather than substring matching;
+- the process and unit remain ready/healthy for the bounded baseline stability
+  interval; and
+- observations before and after readiness agree on unit, PID, process start,
+  executable, and adopted-config relationship.
+
+An inactive, failed, restart-looping, transitional, wrong-executable,
+wrong-config, unstable, or unverifiable service fails closed before active-file
+namespace mutation. The helper does not start, restart, reload, or repair it as
+part of the first activation design. The administrator must establish a healthy
+baseline independently and begin a new transaction.
+
+The `BACKUP_DURABLE` journal record, which is durable before
+`CONFIG_COMMITTING`, captures only sanitized baseline facts: an allowlisted unit
+identity, normalized load/active/substate enums, baseline MainPID and
+process-start identity, executable device/inode and/or trusted digest/version
+identity, an adopted-config fingerprint and source digest relationship, the
+bounded stability duration/result, and any bounded restart-counter/timestamp
+facts required to detect instability. It contains no raw `ExecStart`, config or
+executable path, command line, environment, token, YAML, stdout, or stderr.
+
+Rollback does not promise to recreate the same PID. "Previous service state
+restored" means that the exact old config is active and a newly observed
+service is healthy and equivalent to the journaled baseline in unit,
+executable, adopted-config relationship, readiness, and bounded stability. The
+old MainPID/process-start facts prove what was healthy before mutation and
+prevent the transaction from inventing a baseline after failure.
+
 Candidate acceptance has distinct layers:
 
 1. round-trip document and structural mutation validation;
 2. existing application parser validation;
 3. `cloudflared tunnel --config <FD-bound-candidate> ingress validate`;
-4. durable filesystem commit verification;
-5. systemd operation result;
-6. systemd active state and stable positive `MainPID`;
-7. process/config identity and meaningful post-start readiness; and
-8. a bounded stability window with unchanged process identity.
+4. healthy precommit service baseline verification;
+5. durable filesystem commit verification;
+6. systemd operation result;
+7. systemd active state and stable positive `MainPID`;
+8. process/config identity and meaningful post-start readiness; and
+9. a bounded stability window with unchanged process identity.
 
 `systemctl restart` returning zero proves only that systemd accepted/completed
 that job. It is not activation success. The service could exit immediately,
@@ -547,7 +636,8 @@ enabled.
 Any failure after the active namespace might have changed enters rollback. The
 rollback procedure:
 
-1. authenticates the journal, backup, adopted path, and current active state;
+1. authenticates the journal, healthy pre-activation baseline, backup, adopted
+   path, and current active state;
 2. restores the exact prior bytes, preferably by reversing the retained
    exchange when identity is still proven, otherwise by securely staging the
    authenticated backup in the active directory;
@@ -555,7 +645,8 @@ rollback procedure:
    item;
 4. fsyncs the restored file and active directory in the required order;
 5. uses the fixed service operation to return cloudflared to the prior config;
-6. verifies stable service/process/readiness state; and
+6. verifies service/process/readiness state is stably equivalent to the
+   journaled healthy baseline; and
 7. verifies the restored active digest and metadata before completing the
    failure result.
 
@@ -567,14 +658,22 @@ concurrent administrator change.
 
 The result model distinguishes at least:
 
+- `SERVICE_BASELINE_UNAVAILABLE`: no supported healthy baseline existed, so the
+  transaction stopped before active namespace mutation and no rollback was
+  attempted;
 - `ACTIVATION_FAILED_ROLLBACK_VERIFIED`: activation failed; exact prior config
-  and previous service state were proven restored;
+  and a healthy service state equivalent to the captured baseline were proven
+  restored, and rollback cleanup reached its durable terminal state;
 - `CONFIG_RESTORED_SERVICE_RECOVERY_FAILED`: exact config restoration was
   proven but cloudflared could not be returned to verified health;
 - `ROLLBACK_PARTIAL_FAILURE`: some restoration step failed and current state is
   known but not fully restored;
 - `ROLLBACK_FAILED_STATE_INDETERMINATE`: current file/service state cannot be
   safely classified; automatic mutation stops; and
+- `TERMINAL_CLEANUP_REQUIRED`: commit or verified rollback has a durable
+  decision, but authenticated cleanup or terminal journal durability is not
+  complete; it is neither user-visible success nor a new rollback decision;
+  and
 - `RECOVERY_REQUIRED`: a durable incomplete journal was found before a new
   transaction.
 
@@ -599,9 +698,11 @@ requires a minimal durable single-transaction journal. This is the smallest
 safe choice; it is not a general event log. The journal contains a schema
 version, transaction ID, phase, release ID, non-secret adopted-path fingerprint,
 source/candidate/backup digests and sizes, required identity/metadata facts,
-and artifact names chosen by the helper. It is root-owned `0600`, bounded,
-strictly parsed, atomically rewritten, file-fsynced, and directory-fsynced at
-each recovery-relevant transition.
+sanitized `SERVICE_BASELINE_VERIFIED` facts, and artifact names chosen by the
+helper. Cleanup-pending records additionally contain the complete allowlist and
+expected identities of artifacts eligible for deletion. The journal is
+root-owned `0600`, bounded, strictly parsed, atomically rewritten, file-fsynced,
+and directory-fsynced at each recovery-relevant transition.
 
 The journal is not trusted merely because it is root-owned. Recovery verifies
 every referenced artifact through fixed directories, strict leaf-name grammar,
@@ -611,6 +712,19 @@ transition, unsafe permissions, identity mismatch, or multiple journals cause
 fail-closed manual recovery. No artifact path from the journal may escape its
 fixed directory.
 
+Artifact presence is interpreted by phase. Before a durable terminal decision,
+every artifact required for rollback must exist and authenticate; absence is a
+rollback/recovery failure. In `COMMIT_CLEANUP_PENDING` or
+`ROLLBACK_CLEANUP_PENDING`, the journal proves that rollback or commit has
+already been selected and verified. Existing allowlisted artifacts must still
+authenticate before deletion, but missing allowlisted artifacts mean cleanup
+already progressed and are not by themselves indeterminate. Recovery resumes
+cleanup, fsyncs affected directories, and writes the corresponding durable
+terminal state. A durable `COMMITTED_SUCCESS` or `FAILED_ROLLED_BACK` record can
+be retained as the bounded single terminal record and replaced only when a new
+transaction safely begins; deleting the journal is not required to report the
+terminal result.
+
 ### Crash matrix
 
 | Crash point | Durable state that may remain | Required next-run behavior |
@@ -618,22 +732,30 @@ fixed directory.
 | Before candidate creation | Source only; no journal | Normal start; nothing to recover |
 | During candidate write, before candidate fsync | Incomplete hidden candidate | Never activate it; remove only after name/inode/type/ownership checks, otherwise fail closed |
 | After candidate fsync or validation | Valid disposable candidate; active unchanged; normally no journal | Revalidate and explicitly resume only within same live transaction; after process loss, securely discard it |
+| During or after service baseline observation, before durable journal | Active config/service unchanged; candidate may remain; no durable baseline authority | Securely discard candidate after identity checks; a new transaction must establish a fresh bounded healthy baseline |
+| Baseline is unhealthy or becomes unstable | Active config namespace unchanged | Fail closed with `SERVICE_BASELINE_UNAVAILABLE`; never start/restart/reload service and never enter commit |
 | During backup write, before backup fsync | Incomplete backup; active unchanged | Journal must not claim `BACKUP_DURABLE`; remove authenticated incomplete artifacts or require manual recovery on mismatch |
 | After backup fsync but before backup-directory fsync | Backup existence is not durable | Active unchanged; repeat/clean backup creation; do not commit |
 | After durable backup but before journal fsync | Active unchanged; orphan durable backup possible | Discover only through fixed bounded artifact policy; never infer authority from filename alone; clean if identity can be proven |
-| After durable `BACKUP_DURABLE` journal, before commit intent | Active unchanged; backup and journal valid | Revalidate source/candidate; safe recovery may abort and clean without touching active |
-| After durable `CONFIG_COMMITTING`, before exchange | Active normally old, but crash timing is uncertain | Compare active and artifact digests/identities: old source means abort/clean; candidate at active means continue recovery; anything else requires manual intervention |
+| After durable `BACKUP_DURABLE` journal, before commit intent | Active unchanged; backup, candidate identities, and sanitized healthy baseline are journaled | Revalidate source/candidate and establish that the live service still matches the recorded baseline; safe recovery may abort and clean without touching active |
+| After durable `CONFIG_COMMITTING`, before exchange | Active normally old, but crash timing is uncertain; prior healthy baseline is durable | Compare active and artifact digests/identities: old source means abort/clean; candidate at active means continue recovery using journaled baseline; anything else requires manual intervention |
 | Immediately after atomic exchange | Candidate may be active; old source at transaction name; directory change may not be durable | Use journal plus identities to classify; fsync/restore according to conservative recovery; never start a new transaction |
 | After active file fsync but before active-directory fsync | File data durable; name swap may not be | Same classification; do not assume either namespace survived power loss |
 | After active-directory fsync but before `CONFIG_COMMITTED` journal | New active is durable; journal says committing | Verify candidate digest at active and exact old source/backup, then advance to recovery/service phase or rollback according to implementation policy |
 | After `CONFIG_COMMITTED` but before service operation | New active durable; old process may still use old config | Resume bounded service activation when PR B supports it; PR A must report recovery required rather than success |
 | During restart/reload | New active durable; service state unknown | Reinspect systemd and process identity; verify readiness or roll back; do not trust prior command status |
 | After service becomes healthy but before `SERVICE_VERIFIED` journal | New active and possibly healthy service; journal incomplete | Repeat idempotent readiness/stability verification; success may be recorded only after all identities match |
-| After `SERVICE_VERIFIED` before cleanup | Successful active/service state plus backup/journal | Reverify state, finish cleanup durably, then report/recover committed success |
+| After `SERVICE_VERIFIED` but before commit decision | Successful active/service state plus all required rollback artifacts | Do not delete artifacts; reverify active/service state, then durably choose `COMMIT_CLEANUP_PENDING` or roll back if verification fails |
+| After durable `COMMIT_CLEANUP_PENDING`, before or during cleanup | Commit is irrevocably selected; some or all rollback artifacts may remain | Never roll back solely for missing cleanup artifacts; authenticate and remove those still present, accept already-absent allowlisted artifacts, and fsync affected directories |
+| After commit cleanup directory fsync but before `COMMITTED_SUCCESS` | Commit decision and completed cleanup are durable, journal still says cleanup pending | Repeat idempotent absence/authentication checks and directory fsync, then durably record `COMMITTED_SUCCESS`; do not report success earlier |
+| After durable `COMMITTED_SUCCESS` | New config/service verified; rollback artifacts absent; bounded terminal journal remains | Return/reconstruct success safely; the terminal record may be replaced only when a new transaction begins under the lock |
 | During rollback staging or namespace restoration | Journal says rollback; active may be candidate or restored source | Classify only known digests and artifacts; continue exact restoration if safe; otherwise `ROLLBACK_FAILED_STATE_INDETERMINATE` |
 | After restored file fsync but before directory fsync | Restored bytes exist but namespace durability uncertain | Repeat classification and required fsync; service recovery waits for durable namespace |
 | During rollback service recovery | Old config durable; service state unknown | Verify/retry bounded fixed activation and readiness; distinguish config-restored/service-failed |
-| After rollback verified before cleanup | Old config/service proven; artifacts remain | Reverify, clean securely, fsync directories, complete failed-rolled-back result |
+| After `ROLLBACK_VERIFIED` but before rollback decision | Old config and baseline-equivalent service proven; all required recovery artifacts remain | Do not delete artifacts; durably record `ROLLBACK_CLEANUP_PENDING` first |
+| After durable `ROLLBACK_CLEANUP_PENDING`, before or during cleanup | Verified rollback is irrevocably selected; artifacts may be partially absent | Authenticate and remove remaining allowlisted artifacts idempotently, accept already-absent allowlisted artifacts, and fsync affected directories |
+| After rollback cleanup directory fsync but before `FAILED_ROLLED_BACK` | Restored config/service and cleanup are durable; journal still says cleanup pending | Repeat idempotent cleanup verification and fsync, then durably record `FAILED_ROLLED_BACK`; only then return verified-rollback failure |
+| After durable `FAILED_ROLLED_BACK` | Exact old config and baseline-equivalent service restored; rollback artifacts absent; bounded terminal journal remains | Return/reconstruct the verified-rollback failure; a later transaction may replace the terminal record under the lock |
 
 Recovery is invoked explicitly inside the privileged boundary before any new
 transaction. Merely starting the web service MUST NOT mutate cloudflared or
@@ -730,7 +852,8 @@ Keep the first code review narrow:
 - secure ephemeral backup plus minimal durable journal;
 - race-aware same-directory commit prototype;
 - file/directory fsync ordering;
-- filesystem rollback and crash-recovery classification;
+- filesystem rollback, durable terminal cleanup decisions, idempotent artifact
+  cleanup, and crash-recovery classification;
 - sanitized result types and extensive temporary-directory/fake tests; and
 - no cloudflared service restart/reload and no claim of production activation
   success.
@@ -743,6 +866,11 @@ before merge. No candidate may be committed from dashboard traffic.
 ### Implementation PR B: cloudflared service activation and rollback
 
 - fixed service-control interface and executable/unit identity;
+- mandatory precommit `SERVICE_BASELINE_VERIFIED` capture, bounded stability,
+  and fail-closed rejection of inactive, failed, mismatched, or unstable
+  initial service state;
+- durable sanitized baseline facts sufficient to prove baseline-equivalent
+  service restoration without storing raw command lines or paths;
 - verified reload support or an explicit restart decision;
 - systemd job, active-state, stable MainPID, executable/config identity, and
   readiness checks;
@@ -783,9 +911,13 @@ touches `/etc/cloudflared`, the real systemd manager, DNS, or Cloudflare.
 | Precommit race | replacement before final check; replacement between check and exchange; rename of ancestor; in-place writer holding old FD; unexpected displaced inode; exchange-back failure; candidate mutation during exchange; operator state is never silently overwritten |
 | Commit durability | unavailable `renameat2`/exchange support fails closed; candidate and source filesystem mismatch; metadata application failure; active exchange failure; active verification failure; file-fsync failure; directory-fsync failure; journal update failure at each phase |
 | Successful commit | exact candidate at adopted name; exact intended owner/group/mode; supported metadata preserved; displaced source matches snapshot; active directory durable; source was never truncated in place |
+| Service baseline | unit missing/not loaded; inactive, failed, activating, deactivating, or unexpected substate; zero/unstable/reused PID; restart loop; wrong executable; wrong adopted-config relationship; readiness failure; stability-window failure; every case rejects before namespace mutation and performs no service action |
+| Baseline journal | sanitized enums, PID/start identity, executable identity, adopted-config fingerprint/digest relationship, and stability evidence round-trip; no raw `ExecStart`, paths, YAML, token, command line, stdout, or stderr; live baseline change before `CONFIG_COMMITTING` rejects |
 | Service command | fixed absolute executable and unit; no caller-controlled argv/env; timeout; nonzero systemctl result; active-but-zero PID; PID changes during check; wrong executable/config; restart loop; readiness never arrives; readiness arrives then process dies |
-| Rollback | activation failure with exact rollback; config restored but service recovery fails; backup corrupt/missing; active matches unknown third-party state; metadata restore failure; rollback fsync failure; reverse exchange failure; restoration verification mismatch; distinct sanitized outcomes |
-| Crash recovery | every row in the crash matrix; old/candidate/unknown active digest; malformed or impossible journal; stale release/adopted path; journal symlink/permissions/tamper; missing artifact; multiple artifacts; idempotent repeated recovery; no new transaction while recovery is incomplete |
+| Rollback | activation failure with exact rollback to baseline-equivalent health; config restored but service recovery fails; backup corrupt/missing before terminal decision; active matches unknown third-party state; metadata restore failure; rollback fsync failure; reverse exchange failure; restoration verification mismatch; distinct sanitized outcomes |
+| Commit cleanup | crash before commit decision retains every rollback artifact; durable `COMMIT_CLEANUP_PENDING` precedes deletion; crash before/after each unlink and directory fsync; existing artifact identity mismatch rejects; already-absent allowlisted artifact resumes safely; no success before durable `COMMITTED_SUCCESS` |
+| Rollback cleanup | crash before rollback decision retains every recovery artifact; durable `ROLLBACK_CLEANUP_PENDING` precedes deletion; crash before/after each unlink and directory fsync; identity mismatch rejects; already-absent allowlisted artifact resumes safely; no verified-rollback result before durable `FAILED_ROLLED_BACK` |
+| Crash recovery | every row in the crash matrix; old/candidate/unknown active digest; malformed or impossible journal; stale release/adopted path; journal symlink/permissions/tamper; phase-sensitive required versus cleanup-optional missing artifacts; multiple artifacts; idempotent repeated recovery; no new transaction while recovery is incomplete |
 | Information safety | secret-looking YAML, paths, stdout/stderr, environment and tokens never appear in exceptions, reprs, logs, journal, CLI safe output, or browser models |
 | Scope regression | web routes remain GET-only; Add/Edit/Delete remain disabled; no Cloudflare API/DNS calls; no production config writes from web; no sudoers/unit privilege broadening; no cloudflared service call in PR A |
 

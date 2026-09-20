@@ -126,9 +126,14 @@ changes, configuration validation, and service restarts.
   and directory fsync, and authenticated crash recovery before production
   activation is enabled. Unsupported ACLs/xattrs or ambiguous filesystem state
   fail closed.
-- Treat service command completion, active state, process identity, readiness,
-  and stability as separate checks. A failed activation is never success;
-  distinguish verified rollback from partial or failed rollback.
+- Require a verified healthy, stable cloudflared service baseline before active
+  config mutation; an initially inactive, failed, mismatched, or unstable
+  service fails closed. Treat command completion, state, process identity,
+  readiness, and stability as separate checks.
+- Record a durable commit-or-rollback cleanup decision before deleting recovery
+  artifacts, then make authenticated cleanup idempotent and directory-fsynced.
+  A failed activation is never success; distinguish verified rollback from
+  partial or failed rollback.
 - Keep privileged operations allowlisted with fixed executable/service
   identities, strict bounded inputs, fixed argv, bounded timeouts,
   `shell=False`, minimal environment, and sanitized errors. Never create a
