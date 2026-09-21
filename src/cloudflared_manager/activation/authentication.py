@@ -61,18 +61,34 @@ def authenticate_record(
             raise FilesystemRefused("UNKNOWN_ACTIVE_STATE")
     elif record.phase in {"CONFIG_COMMITTED", "ACTIVATION_FAILED", "ROLLBACK_CONFIG", "SERVICE_ACTIVATING", "SERVICE_VERIFIED", "COMMIT_CLEANUP_PENDING"}:
         current, _ = named_file(active, adopted.name)
-        if record.phase == "ROLLBACK_CONFIG" and current.same_content_metadata(record.source):
+        restored_active = record.phase == "ROLLBACK_CONFIG" and current.same_content_metadata(
+            record.restoration or record.source
+        )
+        if record.restoration is not None and record.phase == "ROLLBACK_CONFIG":
+            if not restored_active and not current.same_content_metadata(record.candidate):
+                raise FilesystemRefused("UNKNOWN_ACTIVE_STATE")
+            if _exists(active, record.candidate_name):
+                raise FilesystemRefused("ARTIFACT_MISMATCH")
+            require_at(record.restoration_name,
+                       record.candidate if restored_active else record.restoration)
+        elif restored_active:
             require_at(record.candidate_name, record.candidate)
         elif not current.same_content_metadata(record.candidate):
             raise FilesystemRefused("UNKNOWN_ACTIVE_STATE")
-        if record.phase in {"CONFIG_COMMITTED", "SERVICE_ACTIVATING", "SERVICE_VERIFIED"}:
-            require_at(record.candidate_name, record.source)
+        if not restored_active and record.restoration is None and record.phase in {
+            "CONFIG_COMMITTED", "ACTIVATION_FAILED", "ROLLBACK_CONFIG", "SERVICE_ACTIVATING", "SERVICE_VERIFIED"
+        }:
+            if _exists(active, record.candidate_name):
+                require_at(record.candidate_name, record.restoration or record.source)
+            elif record.restoration is not None or record.phase in {"SERVICE_ACTIVATING", "SERVICE_VERIFIED"}:
+                raise FilesystemRefused("ARTIFACT_MISMATCH")
     elif record.phase == "ROLLBACK_CLEANUP_PENDING":
         require_at(adopted.name, record.source)
     if record.phase in {"PRECOMMIT_ABORT", "COMMIT_CLEANUP_PENDING", "ROLLBACK_CLEANUP_PENDING"}:
         for kind, expected in record.cleanup.items():
             directory = active if kind == "candidate" else backups.directory
-            name = record.candidate_name if kind == "candidate" else record.backup_name
+            name = (record.restoration_name if record.restoration is not None else record.candidate_name
+                    ) if kind == "candidate" else record.backup_name
             if _exists(directory, name):
                 current, _ = named_file(directory, name)
                 if not current.same_content_metadata(expected):

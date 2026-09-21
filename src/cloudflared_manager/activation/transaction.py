@@ -241,6 +241,9 @@ class FilesystemActivation:
                                 return FilesystemResult("FAILED_PRECOMMIT", record.transaction_id)
                             if (record.phase == "CONFIG_COMMITTING"
                                 and current.same_content_metadata(record.candidate)):
+                                if not _leaf_exists(active, record.candidate_name):
+                                    result = self._handle_failure(record, journal, active, backups, adopted.name)
+                                    return FilesystemResult(result, record.transaction_id)
                                 self._require_source_at(active, record.candidate_name, record.source)
                                 committed = journal.publish(record.successor("CONFIG_COMMITTED"),
                                                             authenticate=lambda item: self._authenticate(item, active, backups))
@@ -251,7 +254,7 @@ class FilesystemActivation:
                             return FilesystemResult("FAILED_PRECOMMIT", record.transaction_id)
                         if record.phase in {"ACTIVATION_FAILED", "ROLLBACK_CONFIG"}:
                             current, _ = named_file(active, adopted.name)
-                            if current.same_content_metadata(record.source):
+                            if current.same_content_metadata(record.restoration or record.source):
                                 fsync_directory(active)
                                 return FilesystemResult("CONFIG_RESTORED_SERVICE_PENDING", record.transaction_id)
                             result = self._handle_failure(record, journal, active, backups, adopted.name)
@@ -369,18 +372,40 @@ class FilesystemActivation:
             abort = journal.publish(abort, authenticate=lambda item: self._authenticate(item, active, backups))
             self._finish_abort(abort, journal, active, backups)
             return "FAILED_PRECOMMIT"
+        if record.phase == "ROLLBACK_CONFIG" and current.same_content_metadata(record.restoration or record.source):
+            self._authenticate(record, active, backups)
+            fsync_directory(active)
+            return "CONFIG_RESTORED_SERVICE_PENDING"
         if not current.same_content_metadata(record.candidate):
             raise FilesystemRefused("ROLLBACK_FAILED_STATE_INDETERMINATE")
         if record.phase not in {"CONFIG_COMMITTING", "CONFIG_COMMITTED", "ACTIVATION_FAILED", "ROLLBACK_CONFIG"}:
             raise FilesystemRefused("RECOVERY_REQUIRED")
-        self._require_source_at(active, record.candidate_name, record.source)
+        displaced_exists = _leaf_exists(active, record.candidate_name)
+        if displaced_exists:
+            self._require_source_at(active, record.candidate_name, record.source)
+        elif record.restoration is None and _leaf_exists(active, record.restoration_name):
+            # A pre-publication restoration file has no journaled inode. Keep
+            # it and the rollback intent for explicit manual review.
+            raise FilesystemRefused("UNJOURNALED_RESTORATION")
+        if record.restoration is not None:
+            if displaced_exists:
+                raise FilesystemRefused("ARTIFACT_MISMATCH")
+            self._require_source_at(active, record.restoration_name, record.restoration)
         if record.phase in {"CONFIG_COMMITTING", "CONFIG_COMMITTED"}:
             record = journal.publish(record.successor("ACTIVATION_FAILED"), authenticate=lambda item: self._authenticate(item, active, backups))
         if record.phase == "ACTIVATION_FAILED":
             record = journal.publish(record.successor("ROLLBACK_CONFIG"), authenticate=lambda item: self._authenticate(item, active, backups))
-        exchange(active, active_name, record.candidate_name)
-        self._require_source_at(active, active_name, record.source)
-        self._require_candidate(active, record.candidate_name, record.candidate)
+        if not displaced_exists and record.restoration is None:
+            restored = self._stage_backup_restoration(record, active, backups)
+            record = journal.publish(record.successor("ROLLBACK_CONFIG", restoration=restored),
+                                     authenticate=lambda item: self._authenticate(item, active, backups))
+        self._authenticate(record, active, backups)
+        target_name = record.restoration_name if record.restoration is not None else record.candidate_name
+        self._require_candidate(active, active_name, record.candidate)
+        self._require_source_at(active, target_name, record.restoration or record.source)
+        exchange(active, active_name, target_name)
+        self._require_source_at(active, active_name, record.restoration or record.source)
+        self._require_candidate(active, target_name, record.candidate)
         fd = os.open(active_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=active.fd)
         try:
             os.fsync(fd)
@@ -388,6 +413,53 @@ class FilesystemActivation:
             os.close(fd)
         fsync_directory(active)
         return "CONFIG_RESTORED_SERVICE_PENDING"
+
+    def _stage_backup_restoration(self, record: JournalRecord, active: PinnedDirectory,
+                                  backups: BackupStore) -> FileFacts:
+        backups.require(record.backup_name, record.backup)
+        backup_facts, data = named_file(backups.directory, record.backup_name)
+        if (not backup_facts.same_content_metadata(record.backup)
+            or len(data) != record.source.size
+            or hashlib.sha256(data).hexdigest() != record.source.sha256):
+            raise FilesystemRefused("BACKUP_MISMATCH")
+        active.revalidate()
+        fd: int | None = None
+        try:
+            fd = os.open(record.restoration_name,
+                         os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         0o600, dir_fd=active.fd)
+            initial, _ = file_facts(fd)
+            if (initial.uid != self.owner or initial.mode != 0o600
+                or initial.device != record.parent.device or initial.links != 1):
+                raise FilesystemRefused("UNSAFE_RESTORATION")
+            remaining = memoryview(data)
+            while remaining:
+                written = os.write(fd, remaining)
+                if written <= 0 or written > len(remaining):
+                    raise FilesystemRefused("RESTORATION_WRITE_FAILED")
+                remaining = remaining[written:]
+            if (initial.uid, initial.gid) != (record.source.uid, record.source.gid):
+                os.fchown(fd, record.source.uid, record.source.gid)
+            os.fchmod(fd, record.source.mode)
+            os.fsync(fd)
+            staged, copied = file_facts(fd)
+            if (copied != data or staged.inode == record.source.inode
+                or (staged.device, staged.uid, staged.gid, staged.mode, staged.size, staged.sha256)
+                != (record.parent.device, record.source.uid, record.source.gid,
+                    record.source.mode, record.source.size, record.source.sha256)):
+                raise FilesystemRefused("RESTORATION_MISMATCH")
+        except FilesystemRefused:
+            raise
+        except OSError:
+            raise FilesystemRefused("RESTORATION_STAGE_FAILED") from None
+        finally:
+            if fd is not None:
+                os.close(fd)
+        fsync_directory(active)
+        visible, copied = named_file(active, record.restoration_name)
+        if not visible.same_content_metadata(staged) or copied != data:
+            raise FilesystemRefused("RESTORATION_MISMATCH")
+        return visible
 
     def _finish_abort(self, record: JournalRecord, journal: JournalStore,
                       active: PinnedDirectory, backups: BackupStore) -> None:
@@ -413,6 +485,15 @@ def _fingerprint(path: Path) -> str:
 
 
 _CANDIDATE_LEAF = re.compile(r"^\.cfm-candidate-[0-9a-f]{32}\.yaml$")
+_RESTORATION_LEAF = re.compile(r"^\.cfm-restore-[0-9a-f]{32}\.yaml$")
+
+
+def _leaf_exists(directory: PinnedDirectory, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=directory.fd, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
 
 
 def _require_no_orphan_candidates(active: PinnedDirectory) -> None:
@@ -420,7 +501,7 @@ def _require_no_orphan_candidates(active: PinnedDirectory) -> None:
     try:
         with os.scandir(active.fd) as entries:
             for count, entry in enumerate(entries, start=1):
-                if count > 4096 or _CANDIDATE_LEAF.fullmatch(entry.name):
+                if count > 4096 or _CANDIDATE_LEAF.fullmatch(entry.name) or _RESTORATION_LEAF.fullmatch(entry.name):
                     raise FilesystemRefused("ORPHAN_CANDIDATE_REQUIRES_REVIEW")
     except OSError:
         raise FilesystemRefused("UNSAFE_DIRECTORY") from None

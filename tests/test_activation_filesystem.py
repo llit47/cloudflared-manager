@@ -444,3 +444,178 @@ def test_unjournaled_candidate_blocks_new_transaction(fixture):
     assert caught.value.code == "ORPHAN_CANDIDATE_REQUIRES_REVIEW"
     assert source.read_bytes() == _SOURCE
     assert orphan.read_bytes() == b"unknown"
+
+
+def _missing_displaced_original(fixture):
+    source, paths, engine, root = fixture
+    engine.run(insert, validator=Validator())
+    with engine._stores() as (journal, backups):
+        record = journal.load()
+        assert record is not None and record.phase == "CONFIG_COMMITTED"
+        (source.parent / record.candidate_name).unlink()
+        record = journal.publish(record.successor("ACTIVATION_FAILED"),
+                                 authenticate=lambda item: engine._authenticate_record(item, backups))
+    return record
+
+
+def test_authenticated_backup_restores_missing_displaced_original(fixture):
+    source, paths, engine, root = fixture
+    record = _missing_displaced_original(fixture)
+    recovered = engine.recover()
+    assert recovered.code == "CONFIG_RESTORED_SERVICE_PENDING"
+    assert source.read_bytes() == _SOURCE
+    assert source.stat().st_ino != record.source.inode
+    assert source.stat().st_mode & 0o777 == record.source.mode
+    assert (source.parent / record.restoration_name).read_bytes().find(b"new.example.com") >= 0
+    assert not (source.parent / record.candidate_name).exists()
+    with PinnedDirectory(paths.config_root / "activation-journal", anchor=root, owner=os.getuid()) as directory:
+        restored = JournalStore(directory, owner=os.getuid()).load()
+    assert restored is not None and restored.phase == "ROLLBACK_CONFIG"
+    assert restored.restoration is not None
+    assert restored.restoration.inode == source.stat().st_ino
+    assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
+
+
+def test_corrupt_backup_blocks_missing_original_restoration(fixture):
+    source, paths, engine, root = fixture
+    record = _missing_displaced_original(fixture)
+    (paths.config_root / "activation-backups" / record.backup_name).write_bytes(b"tampered")
+    active = source.read_bytes()
+    with pytest.raises(ActivationError) as caught:
+        engine.recover()
+    assert caught.value.code == "RECOVERY_REQUIRED"
+    assert source.read_bytes() == active
+    assert not (source.parent / record.restoration_name).exists()
+
+
+def test_unjournaled_restoration_is_preserved_and_blocks_recovery(fixture):
+    source, paths, engine, root = fixture
+    record = _missing_displaced_original(fixture)
+    unjournaled = source.parent / record.restoration_name
+    unjournaled.write_bytes(_SOURCE)
+    unjournaled.chmod(record.source.mode)
+    active = source.read_bytes()
+    with pytest.raises(ActivationError) as caught:
+        engine.recover()
+    assert caught.value.code == "RECOVERY_REQUIRED"
+    assert caught.value.original == "UNJOURNALED_RESTORATION"
+    assert source.read_bytes() == active
+    assert unjournaled.read_bytes() == _SOURCE
+
+
+def test_failed_restore_exchange_keeps_journaled_stage_for_recovery(fixture, monkeypatch):
+    source, paths, engine, root = fixture
+    record = _missing_displaced_original(fixture)
+    from cloudflared_manager.activation import transaction
+
+    original_exchange = transaction.exchange
+    monkeypatch.setattr(transaction, "exchange", lambda *_: (_ for _ in ()).throw(
+        FilesystemRefused("INJECTED_RESTORE_EXCHANGE_FAILURE")))
+    with pytest.raises(ActivationError) as caught:
+        engine.recover()
+    assert caught.value.code == "RECOVERY_REQUIRED"
+    assert caught.value.original == "INJECTED_RESTORE_EXCHANGE_FAILURE"
+    with PinnedDirectory(paths.config_root / "activation-journal", anchor=root, owner=os.getuid()) as directory:
+        staged_record = JournalStore(directory, owner=os.getuid()).load()
+    assert staged_record is not None and staged_record.restoration is not None
+    assert source.read_bytes() != _SOURCE
+    assert (source.parent / record.restoration_name).read_bytes() == _SOURCE
+    monkeypatch.setattr(transaction, "exchange", original_exchange)
+    assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
+    assert source.read_bytes() == _SOURCE
+
+
+def test_tampered_journaled_restoration_identity_blocks_exchange(fixture, monkeypatch):
+    source, paths, engine, root = fixture
+    record = _missing_displaced_original(fixture)
+    from cloudflared_manager.activation import transaction
+
+    original_exchange = transaction.exchange
+    monkeypatch.setattr(transaction, "exchange", lambda *_: (_ for _ in ()).throw(
+        FilesystemRefused("INJECTED_RESTORE_EXCHANGE_FAILURE")))
+    with pytest.raises(ActivationError):
+        engine.recover()
+    restored = source.parent / record.restoration_name
+    replacement = source.parent / "replacement"
+    replacement.write_bytes(_SOURCE)
+    replacement.chmod(record.source.mode)
+    os.replace(replacement, restored)
+    active = source.read_bytes()
+    monkeypatch.setattr(transaction, "exchange", original_exchange)
+    with pytest.raises(ActivationError) as caught:
+        engine.recover()
+    assert caught.value.code == "RECOVERY_REQUIRED"
+    assert source.read_bytes() == active
+    assert restored.read_bytes() == _SOURCE
+
+
+def test_interrupted_restoration_write_keeps_recoverable_intent(fixture, monkeypatch):
+    source, paths, engine, root = fixture
+    record = _missing_displaced_original(fixture)
+    from cloudflared_manager.activation import transaction
+
+    original_write = transaction.os.write
+
+    def fail_restoration_write(fd, data):
+        if ".cfm-restore-" in os.readlink(f"/proc/self/fd/{fd}"):
+            return 0
+        return original_write(fd, data)
+
+    monkeypatch.setattr(transaction.os, "write", fail_restoration_write)
+    with pytest.raises(ActivationError) as caught:
+        engine.recover()
+    assert caught.value.code == "RECOVERY_REQUIRED"
+    assert caught.value.original == "RESTORATION_WRITE_FAILED"
+    with PinnedDirectory(paths.config_root / "activation-journal", anchor=root, owner=os.getuid()) as directory:
+        pending = JournalStore(directory, owner=os.getuid()).load()
+    assert pending is not None and pending.phase == "ROLLBACK_CONFIG" and pending.restoration is None
+    assert source.read_bytes() != _SOURCE
+    assert (source.parent / record.restoration_name).exists()
+
+
+def test_config_committing_recovery_uses_backup_if_displaced_original_is_missing(fixture, monkeypatch):
+    source, paths, engine, root = fixture
+    original_publish = JournalStore.publish
+
+    def interrupt_committed(self, record, *, authenticate):
+        if record.phase == "CONFIG_COMMITTED":
+            with PinnedDirectory(paths.config_root / "activation-journal", anchor=root,
+                                 owner=os.getuid()) as directory:
+                current = JournalStore(directory, owner=os.getuid()).load()
+            assert current is not None
+            (source.parent / current.candidate_name).unlink()
+            raise FilesystemRefused("INJECTED_COMMIT_INTERRUPTION")
+        return original_publish(self, record, authenticate=authenticate)
+
+    monkeypatch.setattr(JournalStore, "publish", interrupt_committed)
+    with pytest.raises(ActivationError) as caught:
+        engine.run(insert, validator=Validator())
+    assert caught.value.code == "CONFIG_RESTORED_SERVICE_PENDING"
+    assert caught.value.original == "INJECTED_COMMIT_INTERRUPTION"
+    assert source.read_bytes() == _SOURCE
+
+
+def test_failed_restoration_identity_publication_leaves_unjournaled_artifact(fixture, monkeypatch):
+    source, paths, engine, root = fixture
+    record = _missing_displaced_original(fixture)
+    original_publish = JournalStore.publish
+
+    def fail_restoration_publication(self, next_record, *, authenticate):
+        if next_record.restoration is not None:
+            raise FilesystemRefused("INJECTED_RESTORATION_PUBLICATION_FAILURE")
+        return original_publish(self, next_record, authenticate=authenticate)
+
+    monkeypatch.setattr(JournalStore, "publish", fail_restoration_publication)
+    with pytest.raises(ActivationError) as caught:
+        engine.recover()
+    assert caught.value.code == "RECOVERY_REQUIRED"
+    assert caught.value.original == "INJECTED_RESTORATION_PUBLICATION_FAILURE"
+    assert (source.parent / record.restoration_name).read_bytes() == _SOURCE
+    assert source.read_bytes() != _SOURCE
+    with PinnedDirectory(paths.config_root / "activation-journal", anchor=root, owner=os.getuid()) as directory:
+        pending = JournalStore(directory, owner=os.getuid()).load()
+    assert pending is not None and pending.phase == "ROLLBACK_CONFIG" and pending.restoration is None
+    monkeypatch.setattr(JournalStore, "publish", original_publish)
+    with pytest.raises(ActivationError) as blocked:
+        engine.recover()
+    assert blocked.value.original == "UNJOURNALED_RESTORATION"
