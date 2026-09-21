@@ -35,6 +35,8 @@ class ConfigSourceSnapshot:
     parent_device: int
     parent_inode: int
     parent_mode: int
+    parent_uid: int
+    parent_gid: int
 
     def __repr__(self) -> str:
         return (
@@ -147,6 +149,8 @@ def read_config_source_snapshot(path: str | Path) -> ConfigSourceSnapshot:
         parent_device=final_parent_metadata.st_dev,
         parent_inode=final_parent_metadata.st_ino,
         parent_mode=stat.S_IMODE(final_parent_metadata.st_mode),
+        parent_uid=final_parent_metadata.st_uid,
+        parent_gid=final_parent_metadata.st_gid,
     )
 
 
@@ -173,6 +177,8 @@ def require_source_unchanged(snapshot: ConfigSourceSnapshot) -> None:
         "parent_device",
         "parent_inode",
         "parent_mode",
+        "parent_uid",
+        "parent_gid",
     )
     if any(getattr(current, field) != getattr(snapshot, field) for field in comparable):
         raise SourceConfigChangedError(

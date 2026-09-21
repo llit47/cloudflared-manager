@@ -261,6 +261,9 @@ def test_install_summary_respects_disabled_persisted_runtime_discovery(
     monkeypatch.setattr(cli, "_require_root", lambda: None)
     monkeypatch.setattr(cli, "DeploymentPaths", lambda: paths)
     monkeypatch.setattr(cli, "DeploymentLock", FakeLock)
+    monkeypatch.setattr(cli, "ActivationRecoveryBarrier", lambda paths: type(
+        "CleanGate", (), {"require_clean": lambda self: None}
+    )())
     monkeypatch.setattr(cli, "ReleaseFilesystem", lambda paths: object())
     monkeypatch.setattr(cli, "SystemdManager", lambda: object())
     monkeypatch.setattr(cli, "Installer", FakeInstaller)

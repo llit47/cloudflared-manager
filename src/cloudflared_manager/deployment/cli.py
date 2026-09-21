@@ -10,6 +10,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+from cloudflared_manager.activation.barrier import ActivationRecoveryBarrier
 from cloudflared_manager.cloudflared.discovery import discover_cloudflared
 from cloudflared_manager.cloudflared.models import ManagementMode
 from cloudflared_manager.deployment.adoption import (
@@ -44,6 +45,7 @@ def install_from_source(source: Path, sha: str, python: Path) -> int:
         _require_root()
         paths = DeploymentPaths()
         with DeploymentLock(paths.lock_path):
+            ActivationRecoveryBarrier(paths).require_clean()
             filesystem = ReleaseFilesystem(paths)
             service = SystemdManager()
             installer = Installer(
@@ -108,6 +110,7 @@ def update() -> int:
         if curl is None:
             raise DeploymentError("curl is required to resolve and download updates.")
         with DeploymentLock(paths.lock_path):
+            ActivationRecoveryBarrier(paths).require_clean()
             current_sha = filesystem.read_current_sha()
             if PROCESS_RELEASE_ID != current_sha:
                 raise HostOperationError(
@@ -333,6 +336,7 @@ def _locked_config_action(
     action: Callable[[], ConfigResult],
 ) -> ConfigResult:
     with DeploymentLock(paths.lock_path):
+        ActivationRecoveryBarrier(paths).require_clean()
         current_release = ReleaseFilesystem(paths).read_current_sha()
         if PROCESS_RELEASE_ID != current_release:
             raise HostOperationError(

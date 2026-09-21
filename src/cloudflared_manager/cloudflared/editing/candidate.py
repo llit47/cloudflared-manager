@@ -38,6 +38,23 @@ class CandidateValidationBinding:
         return "CandidateValidationBinding(bound=True)"
 
 
+@dataclass(slots=True, repr=False)
+class CandidateCommitHandle:
+    """Transferred descriptors; only the privileged transaction may consume these."""
+
+    directory_fd: int
+    file_fd: int
+    name: str
+    device: int
+    inode: int
+    size: int
+    sha256: str
+
+    def close(self) -> None:
+        for descriptor in (self.file_fd, self.directory_fd):
+            os.close(descriptor)
+
+
 class CandidateFile:
     """A verified staged file that can only be retained or discarded, not activated."""
 
@@ -210,6 +227,22 @@ class CandidateFile:
             raise CandidateFileError(
                 "The candidate file could not be cleaned up safely."
             ) from failure
+
+    def consume_for_activation(self) -> CandidateCommitHandle:
+        """Transfer the validated artifact to the internal activation layer."""
+
+        self.require_intact()
+        handle = CandidateCommitHandle(
+            self._directory_fd,
+            self._descriptor,
+            self._name,
+            self._device,
+            self._inode,
+            self._size,
+            self._sha256,
+        )
+        self._discarded = True
+        return handle
 
     def __enter__(self) -> CandidateFile:
         return self
