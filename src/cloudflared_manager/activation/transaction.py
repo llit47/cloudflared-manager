@@ -245,6 +245,17 @@ class FilesystemActivation:
                                     result = self._handle_failure(record, journal, active, backups, adopted.name)
                                     return FilesystemResult(result, record.transaction_id)
                                 self._require_source_at(active, record.candidate_name, record.source)
+                                fd = os.open(adopted.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                             dir_fd=active.fd)
+                                try:
+                                    observed, _ = file_facts(fd)
+                                    if not observed.same_content_metadata(record.candidate):
+                                        raise FilesystemRefused("STALE_CANDIDATE")
+                                    os.fsync(fd)
+                                finally:
+                                    os.close(fd)
+                                fsync_directory(active)
+                                self._authenticate(record, active, backups)
                                 committed = journal.publish(record.successor("CONFIG_COMMITTED"),
                                                             authenticate=lambda item: self._authenticate(item, active, backups))
                                 return FilesystemResult("SERVICE_ACTIVATION_PENDING", committed.transaction_id)
@@ -473,7 +484,8 @@ class FilesystemActivation:
     def _finish_cleanup(self, record: JournalRecord, journal: JournalStore,
                         active: PinnedDirectory, backups: BackupStore) -> None:
         self._authenticate(record, active, backups)
-        unlink_known(active, record.candidate_name, record.cleanup["candidate"], missing_ok=True)
+        candidate_name = record.restoration_name if record.restoration is not None else record.candidate_name
+        unlink_known(active, candidate_name, record.cleanup["candidate"], missing_ok=True)
         unlink_known(backups.directory, record.backup_name, record.cleanup["backup"], missing_ok=True)
         fsync_directory(active)
         fsync_directory(backups.directory)

@@ -260,6 +260,8 @@ class JournalRecord:
         if phase == self.phase == "ROLLBACK_CONFIG":
             if self.restoration is not None or restoration is None:
                 raise FilesystemRefused("INVALID_TRANSITION")
+        elif self.phase == "ACTIVATION_FAILED" and restoration is not None:
+            raise FilesystemRefused("INVALID_TRANSITION")
         elif restoration is not None and restoration != self.restoration:
             raise FilesystemRefused("INVALID_TRANSITION")
         next_restoration = restoration if restoration is not None else self.restoration

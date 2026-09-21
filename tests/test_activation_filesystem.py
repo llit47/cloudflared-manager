@@ -619,3 +619,82 @@ def test_failed_restoration_identity_publication_leaves_unjournaled_artifact(fix
     with pytest.raises(ActivationError) as blocked:
         engine.recover()
     assert blocked.value.original == "UNJOURNALED_RESTORATION"
+
+
+def test_restored_backup_artifacts_are_retired_after_durable_rollback_decision(fixture):
+    source, paths, engine, root = fixture
+    initial = _missing_displaced_original(fixture)
+    assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
+    with engine._stores() as (journal, backups):
+        record = journal.load()
+        assert record is not None and record.restoration is not None
+        for phase in ("ROLLBACK_SERVICE", "ROLLBACK_VERIFIED"):
+            record = journal.publish(record.successor(phase),
+                                     authenticate=lambda item: engine._authenticate_record(item, backups))
+        record = journal.publish(record.successor("ROLLBACK_CLEANUP_PENDING", cleanup={
+            "candidate": record.candidate, "backup": record.backup,
+        }), authenticate=lambda item: engine._authenticate_record(item, backups))
+    assert engine.recover().code == "FAILED_ROLLED_BACK"
+    assert source.read_bytes() == _SOURCE
+    assert not (source.parent / initial.restoration_name).exists()
+    assert not (source.parent / initial.candidate_name).exists()
+    assert list((paths.config_root / "activation-backups").iterdir()) == []
+    assert list((paths.config_root / "activation-journal").iterdir()) == []
+
+
+def test_barrier_retires_completed_backup_rollback_after_artifacts_are_absent(fixture, monkeypatch):
+    source, paths, engine, root = fixture
+    initial = _missing_displaced_original(fixture)
+    assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
+    with engine._stores() as (journal, backups):
+        record = journal.load()
+        assert record is not None
+        for phase in ("ROLLBACK_SERVICE", "ROLLBACK_VERIFIED"):
+            record = journal.publish(record.successor(phase),
+                                     authenticate=lambda item: engine._authenticate_record(item, backups))
+        record = journal.publish(record.successor("ROLLBACK_CLEANUP_PENDING", cleanup={
+            "candidate": record.candidate, "backup": record.backup,
+        }), authenticate=lambda item: engine._authenticate_record(item, backups))
+    (source.parent / initial.restoration_name).unlink()
+    (paths.config_root / "activation-backups" / initial.backup_name).unlink()
+    barrier = ActivationRecoveryBarrier(paths, anchor=root, owner=os.getuid())
+    monkeypatch.setattr(barrier, "_authority", lambda: ("a" * 40, source))
+    barrier.require_clean()
+    assert list((paths.config_root / "activation-journal").iterdir()) == []
+    assert source.read_bytes() == _SOURCE
+
+
+def test_recovered_commit_requires_active_file_fsync_before_advancing(fixture, monkeypatch):
+    source, paths, engine, root = fixture
+    from cloudflared_manager.activation import transaction
+
+    original_publish = JournalStore.publish
+    original_fsync = transaction.os.fsync
+
+    def leave_committing(self, record, *, authenticate):
+        if record.phase in {"CONFIG_COMMITTED", "ACTIVATION_FAILED"}:
+            raise FilesystemRefused("INJECTED_PUBLICATION_FAILURE")
+        return original_publish(self, record, authenticate=authenticate)
+
+    monkeypatch.setattr(JournalStore, "publish", leave_committing)
+    with pytest.raises(ActivationError):
+        engine.run(insert, validator=Validator())
+    with PinnedDirectory(paths.config_root / "activation-journal", anchor=root, owner=os.getuid()) as directory:
+        record = JournalStore(directory, owner=os.getuid()).load()
+    assert record is not None and record.phase == "CONFIG_COMMITTING"
+    monkeypatch.setattr(JournalStore, "publish", original_publish)
+
+    def fail_active_fsync(fd):
+        if os.readlink(f"/proc/self/fd/{fd}") == str(source):
+            raise OSError("injected active fsync failure")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(transaction.os, "fsync", fail_active_fsync)
+    with pytest.raises(ActivationError) as caught:
+        engine.recover()
+    assert caught.value.code == "RECOVERY_REQUIRED"
+    with PinnedDirectory(paths.config_root / "activation-journal", anchor=root, owner=os.getuid()) as directory:
+        still_pending = JournalStore(directory, owner=os.getuid()).load()
+    assert still_pending is not None and still_pending.phase == "CONFIG_COMMITTING"
+    monkeypatch.setattr(transaction.os, "fsync", original_fsync)
+    assert engine.recover().code == "SERVICE_ACTIVATION_PENDING"

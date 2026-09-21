@@ -57,7 +57,10 @@ def authenticate_record(
         current, _ = named_file(active, adopted.name)
         if current.same_content_metadata(record.source):
             require_at(record.candidate_name, record.candidate)
-        elif not current.same_content_metadata(record.candidate):
+        elif current.same_content_metadata(record.candidate):
+            if _exists(active, record.candidate_name):
+                require_at(record.candidate_name, record.source)
+        else:
             raise FilesystemRefused("UNKNOWN_ACTIVE_STATE")
     elif record.phase in {"CONFIG_COMMITTED", "ACTIVATION_FAILED", "ROLLBACK_CONFIG", "SERVICE_ACTIVATING", "SERVICE_VERIFIED", "COMMIT_CLEANUP_PENDING"}:
         current, _ = named_file(active, adopted.name)
@@ -82,8 +85,15 @@ def authenticate_record(
                 require_at(record.candidate_name, record.restoration or record.source)
             elif record.restoration is not None or record.phase in {"SERVICE_ACTIVATING", "SERVICE_VERIFIED"}:
                 raise FilesystemRefused("ARTIFACT_MISMATCH")
-    elif record.phase == "ROLLBACK_CLEANUP_PENDING":
-        require_at(adopted.name, record.source)
+    elif record.phase in {"ROLLBACK_SERVICE", "ROLLBACK_VERIFIED", "ROLLBACK_CLEANUP_PENDING"}:
+        require_at(adopted.name, record.restoration or record.source)
+        if record.restoration is not None:
+            if _exists(active, record.candidate_name):
+                raise FilesystemRefused("ARTIFACT_MISMATCH")
+            if record.phase != "ROLLBACK_CLEANUP_PENDING":
+                require_at(record.restoration_name, record.candidate)
+        elif record.phase != "ROLLBACK_CLEANUP_PENDING":
+            require_at(record.candidate_name, record.candidate)
     if record.phase in {"PRECOMMIT_ABORT", "COMMIT_CLEANUP_PENDING", "ROLLBACK_CLEANUP_PENDING"}:
         for kind, expected in record.cleanup.items():
             directory = active if kind == "candidate" else backups.directory
