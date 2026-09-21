@@ -146,6 +146,11 @@ changes, configuration validation, and service restarts.
   is not complete before that fsync. A journal left after a final cleanup
   decision is a recovery artifact to retire, not permanent history. Recovery
   takes the same outer lock, and any unverifiable state fails closed unchanged.
+- Only fixed, durably published `journal` is recovery authority. Fixed
+  `journal.next` is non-authoritative staging and recovery never promotes it.
+  Begin a phase-dependent side effect only after staging rename, journal-
+  directory fsync, and published-record reverification; recover interrupted
+  staging deterministically, while unknown journal objects fail closed.
 - Keep privileged operations allowlisted with fixed executable/service
   identities, strict bounded inputs, fixed argv, bounded timeouts,
   `shell=False`, minimal environment, and sanitized errors. Never create a
