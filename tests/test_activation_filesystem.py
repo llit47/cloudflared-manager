@@ -396,3 +396,51 @@ def test_unsafe_staging_symlink_is_never_deleted(fixture, monkeypatch):
     with pytest.raises(ActivationBarrierError):
         barrier.require_clean()
     assert staged.is_symlink()
+
+
+def test_published_journal_identity_change_preserves_interrupted_staging(fixture):
+    source, paths, engine, root = fixture
+    engine.run(insert, validator=Validator())
+    directory = paths.config_root / "activation-journal"
+    journal_path = directory / "journal"
+    staged = directory / "journal.next"
+    staged.write_bytes(b"partial")
+    staged.chmod(0o600)
+    with PinnedDirectory(directory, anchor=root, owner=os.getuid()) as pinned:
+        store = JournalStore(pinned, owner=os.getuid())
+
+        def swap_published(_record):
+            replacement = directory / "replacement"
+            replacement.write_bytes(journal_path.read_bytes())
+            replacement.chmod(0o600)
+            os.replace(replacement, journal_path)
+
+        with pytest.raises(FilesystemRefused):
+            store.recover_staging(authenticate=swap_published)
+    assert staged.read_bytes() == b"partial"
+
+
+def test_unjournaled_backup_blocks_new_transaction(fixture):
+    source, paths, engine, root = fixture
+    backup_dir = paths.config_root / "activation-backups"
+    backup_dir.mkdir(mode=0o700)
+    orphan = backup_dir / ("backup-" + "f" * 32)
+    orphan.write_bytes(_SOURCE)
+    orphan.chmod(0o600)
+    with pytest.raises(FilesystemRefused) as caught:
+        engine.run(insert, validator=Validator())
+    assert caught.value.code == "ORPHAN_BACKUP_REQUIRES_REVIEW"
+    assert source.read_bytes() == _SOURCE
+    assert orphan.read_bytes() == _SOURCE
+
+
+def test_unjournaled_candidate_blocks_new_transaction(fixture):
+    source, paths, engine, root = fixture
+    orphan = source.parent / (".cfm-candidate-" + "f" * 32 + ".yaml")
+    orphan.write_bytes(b"unknown")
+    orphan.chmod(0o600)
+    with pytest.raises(FilesystemRefused) as caught:
+        engine.run(insert, validator=Validator())
+    assert caught.value.code == "ORPHAN_CANDIDATE_REQUIRES_REVIEW"
+    assert source.read_bytes() == _SOURCE
+    assert orphan.read_bytes() == b"unknown"

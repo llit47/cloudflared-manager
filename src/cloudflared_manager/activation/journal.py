@@ -308,7 +308,11 @@ class JournalStore:
         authenticate: Callable[[JournalRecord], None] | None = None,
     ) -> JournalRecord | None:
         names = self._names()
-        record = self.load() if "journal" in names else None
+        record: JournalRecord | None = None
+        published_bytes: bytes | None = None
+        published_stat: os.stat_result | None = None
+        if "journal" in names:
+            record, published_bytes, published_stat = self._read("journal", parse=True)
         if record is not None and "journal.next" in names:
             # A parsed journal is not yet recovery authority. Its release,
             # adopted path, and phase-dependent artifacts must authenticate
@@ -316,6 +320,7 @@ class JournalStore:
             if authenticate is None:
                 raise FilesystemRefused("RECOVERY_REQUIRED")
             authenticate(record)
+            self._require_same_published(published_bytes, published_stat)
         if "journal.next" in names:
             _, _, staged = self._read("journal.next", parse=False)
             visible = os.stat("journal.next", dir_fd=self.directory.fd, follow_symlinks=False)
@@ -327,10 +332,10 @@ class JournalStore:
             if authenticate is not None:
                 authenticate(record)
             fsync_directory(self.directory)
-            confirmed = self.load()
-            if confirmed is None or confirmed.bytes() != record.bytes() or "journal.next" in self._names():
+            self._require_same_published(published_bytes, published_stat)
+            if "journal.next" in self._names():
                 raise FilesystemRefused("UNSAFE_JOURNAL")
-            return confirmed
+            return record
         self.require_clean()
         return None
 
@@ -341,6 +346,15 @@ class JournalStore:
         if self._names():
             raise FilesystemRefused("JOURNAL_NAMESPACE_NOT_DURABLY_CLEAN")
 
+    def _require_same_published(self, raw: bytes | None, info: os.stat_result | None) -> None:
+        if raw is None or info is None:
+            raise FilesystemRefused("UNSAFE_JOURNAL")
+        _, current_raw, current = self._read("journal", parse=True)
+        fields = ("st_dev", "st_ino", "st_uid", "st_gid", "st_mode", "st_nlink",
+                  "st_size", "st_mtime_ns", "st_ctime_ns")
+        if current_raw != raw or any(getattr(current, key) != getattr(info, key) for key in fields):
+            raise FilesystemRefused("UNSAFE_JOURNAL")
+
     def publish(
         self,
         new: JournalRecord,
@@ -348,11 +362,14 @@ class JournalStore:
         authenticate: Callable[[JournalRecord], None],
     ) -> JournalRecord:
         current = self.load()
+        current_raw: bytes | None = None
+        current_stat: os.stat_result | None = None
         if current is None:
             self.require_clean()
             if new.generation != 1 or new.phase != "BACKUP_DURABLE":
                 raise FilesystemRefused("INVALID_TRANSITION")
         else:
+            _, current_raw, current_stat = self._read("journal", parse=True)
             authenticate(current)
             if new != current.successor(new.phase, cleanup=new.cleanup):
                 raise FilesystemRefused("INVALID_TRANSITION")
@@ -380,12 +397,21 @@ class JournalStore:
             if staged != new or staged_bytes != raw:
                 raise FilesystemRefused("JOURNAL_PUBLICATION_FAILED")
             authenticate(new)
+            if current is None:
+                if "journal" in self._names():
+                    raise FilesystemRefused("UNSAFE_JOURNAL")
+            else:
+                self._require_same_published(current_raw, current_stat)
+            _, repeated_staging, _ = self._read("journal.next", parse=True)
+            if repeated_staging != raw:
+                raise FilesystemRefused("UNSAFE_JOURNAL")
             self.directory.revalidate()
             os.rename("journal.next", "journal", src_dir_fd=self.directory.fd, dst_dir_fd=self.directory.fd)
             fsync_directory(self.directory)
             published, published_bytes, _ = self._read("journal", parse=True)
             if published != new or published_bytes != raw or "journal.next" in self._names():
                 raise FilesystemRefused("JOURNAL_PUBLICATION_FAILED")
+            authenticate(new)
             return new
         except FilesystemRefused:
             raise

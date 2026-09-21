@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,7 @@ from cloudflared_manager.cloudflared.editing.candidate import CandidateCommitHan
 from cloudflared_manager.cloudflared.editing.preparation import (
     ConfigMutation, PreparationOutcome, prepare_validated_candidate,
 )
+from cloudflared_manager.cloudflared.editing.source import ConfigSourceSnapshot
 from cloudflared_manager.cloudflared.editing.validation import CandidateValidator
 from cloudflared_manager.deployment.environment import read_environment, require_safe_environment
 from cloudflared_manager.deployment.paths import DeploymentPaths
@@ -103,9 +105,11 @@ class FilesystemActivation:
             with self._stores() as (journal, backups):
                 journal.recover_staging(authenticate=lambda item: self._authenticate_record(item, backups))
                 journal.require_clean()
+                backups.require_empty()
                 release, adopted = self.authority.current()
                 with PinnedDirectory(adopted.parent, anchor=self.anchor, owner=self.owner) as active:
                     _metadata_supported(active.fd)
+                    _require_no_orphan_candidates(active)
                     prepared = prepare_validated_candidate(adopted, mutation, cloudflared_validator=validator)
                     if prepared.outcome is PreparationOutcome.NO_CHANGE:
                         require_source(prepared.source, active)
@@ -173,7 +177,10 @@ class FilesystemActivation:
                                 authenticate=lambda item: self._authenticate_record(item, backups)
                             )
                             if published is None:
-                                self._cleanup_unpublished(active, backups, handle, backup_name, backup_facts)
+                                self._cleanup_unpublished(
+                                    active, backups, handle, backup_name, backup_facts,
+                                    prepared.source,
+                                )
                                 journal.require_clean()
                                 raise ActivationError(initial_cleanup_failure or original,
                                                       original=original if initial_cleanup_failure else None,
@@ -190,14 +197,20 @@ class FilesystemActivation:
                             try:
                                 handle.close()
                             except OSError:
-                                if original is None:
-                                    raise ActivationError("DESCRIPTOR_CLOSE_FAILED") from None
+                                raise ActivationError(
+                                    "RECOVERY_REQUIRED" if original else "DESCRIPTOR_CLOSE_FAILED",
+                                    original=original,
+                                    rollback="DESCRIPTOR_CLOSE_FAILED" if original else None,
+                                ) from None
                         elif prepared.candidate is not None:
                             try:
                                 prepared.discard()
                             except Exception:
-                                if original is None:
-                                    raise ActivationError("CANDIDATE_CLEANUP_FAILED") from None
+                                raise ActivationError(
+                                    "RECOVERY_REQUIRED" if original else "CANDIDATE_CLEANUP_FAILED",
+                                    original=original,
+                                    rollback="CANDIDATE_CLEANUP_FAILED" if original else None,
+                                ) from None
 
     def recover(self) -> FilesystemResult:
         """Root-only explicit recovery of filesystem phases; never controls service."""
@@ -333,10 +346,16 @@ class FilesystemActivation:
 
     def _cleanup_unpublished(self, active: PinnedDirectory, backups: BackupStore,
                              handle: CandidateCommitHandle | None, backup_name: str | None,
-                             backup_facts: FileFacts | None) -> None:
+                             backup_facts: FileFacts | None, snapshot: ConfigSourceSnapshot) -> None:
         if handle is not None:
             facts, _ = named_file(active, handle.name)
-            if (facts.device, facts.inode) != (handle.device, handle.inode):
+            if ((facts.device, facts.inode, facts.size, facts.sha256)
+                != (handle.device, handle.inode, handle.size, handle.sha256)
+                or (facts.uid, facts.gid, facts.mode) not in {
+                    (self.owner, os.getegid(), 0o600),
+                    (snapshot.uid, snapshot.gid, 0o600),
+                    (snapshot.uid, snapshot.gid, snapshot.permission_mode),
+                }):
                 raise FilesystemRefused("ARTIFACT_MISMATCH")
             unlink_known(active, handle.name, facts)
         if backup_name is not None and backup_facts is not None:
@@ -391,6 +410,21 @@ class FilesystemActivation:
 
 def _fingerprint(path: Path) -> str:
     return hashlib.sha256(os.fsencode(path)).hexdigest()
+
+
+_CANDIDATE_LEAF = re.compile(r"^\.cfm-candidate-[0-9a-f]{32}\.yaml$")
+
+
+def _require_no_orphan_candidates(active: PinnedDirectory) -> None:
+    active.revalidate()
+    try:
+        with os.scandir(active.fd) as entries:
+            for count, entry in enumerate(entries, start=1):
+                if count > 4096 or _CANDIDATE_LEAF.fullmatch(entry.name):
+                    raise FilesystemRefused("ORPHAN_CANDIDATE_REQUIRES_REVIEW")
+    except OSError:
+        raise FilesystemRefused("UNSAFE_DIRECTORY") from None
+    active.revalidate()
 
 
 def _failure_code(error: Exception) -> str:

@@ -62,6 +62,18 @@ class BackupStore:
         self.directory = directory
         self.owner = owner
 
+    def require_empty(self) -> None:
+        """An unjournaled backup has no authenticated deletion authority."""
+
+        self.directory.revalidate()
+        try:
+            with os.scandir(self.directory.fd) as entries:
+                for _ in entries:
+                    raise FilesystemRefused("ORPHAN_BACKUP_REQUIRES_REVIEW")
+        except OSError:
+            raise FilesystemRefused("UNSAFE_BACKUP_DIRECTORY") from None
+        fsync_directory(self.directory)
+
     def create(self, name: str, data: bytes, source: FileFacts) -> FileFacts:
         if (not name.startswith("backup-") or len(name) != 39
             or any(c not in "0123456789abcdef" for c in name[7:])
@@ -93,7 +105,7 @@ class BackupStore:
                 raise FilesystemRefused("BACKUP_MISMATCH")
             return facts
         except Exception as original:
-            cleanup_failure = False
+            cleanup_failure = fd is not None and created is None
             if fd is not None:
                 try:
                     os.close(fd)
