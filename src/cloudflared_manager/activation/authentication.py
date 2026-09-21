@@ -42,9 +42,13 @@ def authenticate_record(
     active.revalidate()
     _metadata_supported(active.fd)
 
-    def require_at(name: str, expected: FileFacts) -> None:
+    def matches(current: FileFacts, expected: FileFacts, *, exchanged: bool = False) -> bool:
+        return (current.same_after_exchange(expected) if exchanged
+                else current.same_content_metadata(expected))
+
+    def require_at(name: str, expected: FileFacts, *, exchanged: bool = False) -> None:
         current, _ = named_file(active, name)
-        if not current.same_content_metadata(expected):
+        if not matches(current, expected, exchanged=exchanged):
             raise FilesystemRefused("ARTIFACT_MISMATCH")
 
     if record.phase not in {"PRECOMMIT_ABORT", "COMMIT_CLEANUP_PENDING", "ROLLBACK_CLEANUP_PENDING"}:
@@ -57,43 +61,44 @@ def authenticate_record(
         current, _ = named_file(active, adopted.name)
         if current.same_content_metadata(record.source):
             require_at(record.candidate_name, record.candidate)
-        elif current.same_content_metadata(record.candidate):
+        elif current.same_after_exchange(record.candidate):
             if _exists(active, record.candidate_name):
-                require_at(record.candidate_name, record.source)
+                require_at(record.candidate_name, record.source, exchanged=True)
         else:
             raise FilesystemRefused("UNKNOWN_ACTIVE_STATE")
     elif record.phase in {"CONFIG_COMMITTED", "ACTIVATION_FAILED", "ROLLBACK_CONFIG", "SERVICE_ACTIVATING", "SERVICE_VERIFIED", "COMMIT_CLEANUP_PENDING"}:
         current, _ = named_file(active, adopted.name)
-        restored_active = record.phase in {"ACTIVATION_FAILED", "ROLLBACK_CONFIG"} and current.same_content_metadata(
+        restored_active = record.phase in {"ACTIVATION_FAILED", "ROLLBACK_CONFIG"} and current.same_after_exchange(
             record.restoration or record.source
         )
         if record.restoration is not None and record.phase == "ROLLBACK_CONFIG":
-            if not restored_active and not current.same_content_metadata(record.candidate):
+            if not restored_active and not current.same_after_exchange(record.candidate):
                 raise FilesystemRefused("UNKNOWN_ACTIVE_STATE")
             if _exists(active, record.candidate_name):
                 raise FilesystemRefused("ARTIFACT_MISMATCH")
             require_at(record.restoration_name,
-                       record.candidate if restored_active else record.restoration)
+                       record.candidate if restored_active else record.restoration,
+                       exchanged=restored_active)
         elif restored_active:
-            require_at(record.candidate_name, record.candidate)
-        elif not current.same_content_metadata(record.candidate):
+            require_at(record.candidate_name, record.candidate, exchanged=True)
+        elif not current.same_after_exchange(record.candidate):
             raise FilesystemRefused("UNKNOWN_ACTIVE_STATE")
         if not restored_active and record.restoration is None and record.phase in {
             "CONFIG_COMMITTED", "ACTIVATION_FAILED", "ROLLBACK_CONFIG", "SERVICE_ACTIVATING", "SERVICE_VERIFIED"
         }:
             if _exists(active, record.candidate_name):
-                require_at(record.candidate_name, record.restoration or record.source)
+                require_at(record.candidate_name, record.restoration or record.source, exchanged=True)
             elif record.restoration is not None or record.phase in {"SERVICE_ACTIVATING", "SERVICE_VERIFIED"}:
                 raise FilesystemRefused("ARTIFACT_MISMATCH")
     elif record.phase in {"ROLLBACK_SERVICE", "ROLLBACK_VERIFIED", "ROLLBACK_CLEANUP_PENDING"}:
-        require_at(adopted.name, record.restoration or record.source)
+        require_at(adopted.name, record.restoration or record.source, exchanged=True)
         if record.restoration is not None:
             if _exists(active, record.candidate_name):
                 raise FilesystemRefused("ARTIFACT_MISMATCH")
             if record.phase != "ROLLBACK_CLEANUP_PENDING":
-                require_at(record.restoration_name, record.candidate)
+                require_at(record.restoration_name, record.candidate, exchanged=True)
         elif record.phase != "ROLLBACK_CLEANUP_PENDING":
-            require_at(record.candidate_name, record.candidate)
+            require_at(record.candidate_name, record.candidate, exchanged=True)
     if record.phase in {"PRECOMMIT_ABORT", "COMMIT_CLEANUP_PENDING", "ROLLBACK_CLEANUP_PENDING"}:
         for kind, expected in record.cleanup.items():
             directory = active if kind == "candidate" else backups.directory
@@ -101,5 +106,30 @@ def authenticate_record(
                     ) if kind == "candidate" else record.backup_name
             if _exists(directory, name):
                 current, _ = named_file(directory, name)
-                if not current.same_content_metadata(expected):
+                if not matches(current, expected, exchanged=(kind == "candidate" and
+                        record.phase != "PRECOMMIT_ABORT")):
                     raise FilesystemRefused("ARTIFACT_MISMATCH")
+
+
+def authenticate_complete_cleanup(
+    record: JournalRecord,
+    authority: RecoveryAuthority,
+    active: PinnedDirectory,
+    backups: BackupStore,
+) -> None:
+    """Require both artifacts for the first durable cleanup decision.
+
+    A published final decision uses authenticate_record instead: deletion may
+    already have happened before a crash, so absence is then recoverable.
+    """
+
+    if record.phase not in {"PRECOMMIT_ABORT", "COMMIT_CLEANUP_PENDING", "ROLLBACK_CLEANUP_PENDING"}:
+        raise FilesystemRefused("INVALID_TRANSITION")
+    authenticate_record(record, authority, active, backups)
+    backups.require(record.backup_name, record.backup)
+    candidate_name = record.restoration_name if record.restoration is not None else record.candidate_name
+    current, _ = named_file(active, candidate_name)
+    expected = record.cleanup["candidate"]
+    if not (current.same_content_metadata(expected) if record.phase == "PRECOMMIT_ABORT"
+            else current.same_after_exchange(expected)):
+        raise FilesystemRefused("ARTIFACT_MISMATCH")

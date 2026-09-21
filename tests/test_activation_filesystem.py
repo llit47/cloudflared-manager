@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from cloudflared_manager.activation.journal import BaselineFacts, JournalStore
+from cloudflared_manager.activation.journal import BaselineFacts, JournalRecord, JournalStore
 from cloudflared_manager.activation.barrier import ActivationBarrierError, ActivationRecoveryBarrier
 from cloudflared_manager.activation.filesystem import FilesystemRefused, PinnedDirectory
 from cloudflared_manager.activation.transaction import ActivationError, FilesystemActivation
@@ -117,10 +118,10 @@ def test_failed_post_exchange_publication_rolls_back_with_durable_intent(fixture
     source, paths, engine, root = fixture
     original_publish = JournalStore.publish
 
-    def fail_committed(self, record, *, authenticate):
+    def fail_committed(self, record, *, authenticate, **kwargs):
         if record.phase == "CONFIG_COMMITTED":
             raise FilesystemRefused("INJECTED_PUBLICATION_FAILURE")
-        return original_publish(self, record, authenticate=authenticate)
+        return original_publish(self, record, authenticate=authenticate, **kwargs)
 
     monkeypatch.setattr(JournalStore, "publish", fail_committed)
     with pytest.raises(ActivationError) as caught:
@@ -212,7 +213,7 @@ def test_absent_cleanup_artifacts_allow_durable_journal_retirement(fixture, monk
             record = journal.publish(record.successor(phase), authenticate=lambda item: None)
         record = journal.publish(record.successor("COMMIT_CLEANUP_PENDING", cleanup={
             "candidate": record.source, "backup": record.backup,
-        }), authenticate=lambda item: None)
+        }), authenticate=lambda item: None, authenticate_complete_cleanup=lambda item: None)
     (source.parent / record.candidate_name).unlink()
     (paths.config_root / "activation-backups" / record.backup_name).unlink()
     barrier = ActivationRecoveryBarrier(paths, anchor=root, owner=os.getuid())
@@ -230,10 +231,10 @@ def test_failed_reverse_exchange_keeps_first_failure_and_rollback_intent(fixture
     original_exchange = transaction.exchange
     exchanges = 0
 
-    def fail_committed(self, record, *, authenticate):
+    def fail_committed(self, record, *, authenticate, **kwargs):
         if record.phase == "CONFIG_COMMITTED":
             raise FilesystemRefused("COMMIT_PUBLICATION_FAILED")
-        return original_publish(self, record, authenticate=authenticate)
+        return original_publish(self, record, authenticate=authenticate, **kwargs)
 
     def fail_reverse(directory, first, second):
         nonlocal exchanges
@@ -263,10 +264,10 @@ def test_explicit_recovery_finishes_interrupted_config_rollback(fixture, monkeyp
     original_exchange = transaction.exchange
     exchanges = 0
 
-    def fail_committed(self, record, *, authenticate):
+    def fail_committed(self, record, *, authenticate, **kwargs):
         if record.phase == "CONFIG_COMMITTED":
             raise FilesystemRefused("COMMIT_PUBLICATION_FAILED")
-        return original_publish(self, record, authenticate=authenticate)
+        return original_publish(self, record, authenticate=authenticate, **kwargs)
 
     def fail_reverse(directory, first, second):
         nonlocal exchanges
@@ -458,6 +459,12 @@ def _missing_displaced_original(fixture):
     return record
 
 
+def _authenticate_complete_for_test(engine, record, backups):
+    _, adopted = engine.authority.current()
+    with PinnedDirectory(adopted.parent, anchor=engine.anchor, owner=engine.owner) as active:
+        engine._authenticate_complete(record, active, backups)
+
+
 def test_authenticated_backup_restores_missing_displaced_original(fixture):
     source, paths, engine, root = fixture
     record = _missing_displaced_original(fixture)
@@ -577,7 +584,7 @@ def test_config_committing_recovery_uses_backup_if_displaced_original_is_missing
     source, paths, engine, root = fixture
     original_publish = JournalStore.publish
 
-    def interrupt_committed(self, record, *, authenticate):
+    def interrupt_committed(self, record, *, authenticate, **kwargs):
         if record.phase == "CONFIG_COMMITTED":
             with PinnedDirectory(paths.config_root / "activation-journal", anchor=root,
                                  owner=os.getuid()) as directory:
@@ -585,7 +592,7 @@ def test_config_committing_recovery_uses_backup_if_displaced_original_is_missing
             assert current is not None
             (source.parent / current.candidate_name).unlink()
             raise FilesystemRefused("INJECTED_COMMIT_INTERRUPTION")
-        return original_publish(self, record, authenticate=authenticate)
+        return original_publish(self, record, authenticate=authenticate, **kwargs)
 
     monkeypatch.setattr(JournalStore, "publish", interrupt_committed)
     with pytest.raises(ActivationError) as caught:
@@ -600,10 +607,10 @@ def test_failed_restoration_identity_publication_leaves_unjournaled_artifact(fix
     record = _missing_displaced_original(fixture)
     original_publish = JournalStore.publish
 
-    def fail_restoration_publication(self, next_record, *, authenticate):
+    def fail_restoration_publication(self, next_record, *, authenticate, **kwargs):
         if next_record.restoration is not None:
             raise FilesystemRefused("INJECTED_RESTORATION_PUBLICATION_FAILURE")
-        return original_publish(self, next_record, authenticate=authenticate)
+        return original_publish(self, next_record, authenticate=authenticate, **kwargs)
 
     monkeypatch.setattr(JournalStore, "publish", fail_restoration_publication)
     with pytest.raises(ActivationError) as caught:
@@ -638,7 +645,8 @@ def test_restored_backup_artifacts_are_retired_after_durable_rollback_decision(f
                                      authenticate=lambda item: engine._authenticate_record(item, backups))
         record = journal.publish(record.successor("ROLLBACK_CLEANUP_PENDING", cleanup={
             "candidate": record.candidate, "backup": record.backup,
-        }), authenticate=lambda item: engine._authenticate_record(item, backups))
+        }), authenticate=lambda item: engine._authenticate_record(item, backups),
+            authenticate_complete_cleanup=lambda item: _authenticate_complete_for_test(engine, item, backups))
     assert engine.recover().code == "FAILED_ROLLED_BACK"
     assert source.read_bytes() == _SOURCE
     assert not (source.parent / initial.restoration_name).exists()
@@ -659,7 +667,8 @@ def test_barrier_retires_completed_backup_rollback_after_artifacts_are_absent(fi
                                      authenticate=lambda item: engine._authenticate_record(item, backups))
         record = journal.publish(record.successor("ROLLBACK_CLEANUP_PENDING", cleanup={
             "candidate": record.candidate, "backup": record.backup,
-        }), authenticate=lambda item: engine._authenticate_record(item, backups))
+        }), authenticate=lambda item: engine._authenticate_record(item, backups),
+            authenticate_complete_cleanup=lambda item: _authenticate_complete_for_test(engine, item, backups))
     (source.parent / initial.restoration_name).unlink()
     (paths.config_root / "activation-backups" / initial.backup_name).unlink()
     barrier = ActivationRecoveryBarrier(paths, anchor=root, owner=os.getuid())
@@ -676,10 +685,10 @@ def test_recovered_commit_requires_active_file_fsync_before_advancing(fixture, m
     original_publish = JournalStore.publish
     original_fsync = transaction.os.fsync
 
-    def leave_committing(self, record, *, authenticate):
+    def leave_committing(self, record, *, authenticate, **kwargs):
         if record.phase in {"CONFIG_COMMITTED", "ACTIVATION_FAILED"}:
             raise FilesystemRefused("INJECTED_PUBLICATION_FAILURE")
-        return original_publish(self, record, authenticate=authenticate)
+        return original_publish(self, record, authenticate=authenticate, **kwargs)
 
     monkeypatch.setattr(JournalStore, "publish", leave_committing)
     with pytest.raises(ActivationError):
@@ -714,10 +723,10 @@ def test_descriptor_close_failure_preserves_earlier_rollback_failure(fixture, mo
     original_close = transaction.CandidateCommitHandle.close
     exchanges = 0
 
-    def fail_committed(self, record, *, authenticate):
+    def fail_committed(self, record, *, authenticate, **kwargs):
         if record.phase == "CONFIG_COMMITTED":
             raise FilesystemRefused("COMMIT_PUBLICATION_FAILED")
-        return original_publish(self, record, authenticate=authenticate)
+        return original_publish(self, record, authenticate=authenticate, **kwargs)
 
     def fail_reverse(directory, first, second):
         nonlocal exchanges
@@ -799,7 +808,7 @@ def test_journal_retirement_rejects_in_place_authority_swap(fixture):
             record = store.publish(record.successor(phase), authenticate=lambda item: None)
         record = store.publish(record.successor("COMMIT_CLEANUP_PENDING", cleanup={
             "candidate": record.source, "backup": record.backup,
-        }), authenticate=lambda item: None)
+        }), authenticate=lambda item: None, authenticate_complete_cleanup=lambda item: None)
 
         def replace_published(_record):
             replacement = directory / "replacement"
@@ -810,3 +819,117 @@ def test_journal_retirement_rejects_in_place_authority_swap(fixture):
         with pytest.raises(FilesystemRefused):
             store.retire(record, authenticate=replace_published)
     assert journal_path.exists()
+
+
+def test_restoration_journal_accepts_reused_deleted_source_inode(fixture):
+    source, paths, engine, root = fixture
+    _missing_displaced_original(fixture)
+    assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
+    with PinnedDirectory(paths.config_root / "activation-journal", anchor=root, owner=os.getuid()) as directory:
+        record = JournalStore(directory, owner=os.getuid()).load()
+    assert record is not None and record.restoration is not None
+    reused = replace(record, restoration=replace(record.restoration, inode=record.source.inode))
+    assert JournalRecord.parse(reused.bytes()) == reused
+
+
+def test_backup_ctime_interference_blocks_recovery_even_with_same_bytes(fixture, monkeypatch):
+    source, paths, engine, root = fixture
+    engine.run(insert, validator=Validator())
+    from cloudflared_manager.activation import state
+
+    original_named = state.named_file
+
+    def touched_backup(directory, name):
+        facts, data = original_named(directory, name)
+        if name.startswith("backup-"):
+            facts = replace(facts, ctime_ns=facts.ctime_ns + 1)
+        return facts, data
+
+    monkeypatch.setattr(state, "named_file", touched_backup)
+    active = source.read_bytes()
+    with pytest.raises(ActivationError) as caught:
+        engine.recover()
+    assert caught.value.code == "RECOVERY_REQUIRED"
+    assert caught.value.original == "BACKUP_MISMATCH"
+    assert source.read_bytes() == active
+
+
+def test_post_exchange_active_mtime_touch_blocks_recovery(fixture):
+    source, paths, engine, root = fixture
+    engine.run(insert, validator=Validator())
+    active = source.read_bytes()
+    before = source.stat()
+    os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+    with pytest.raises(ActivationError) as caught:
+        engine.recover()
+    assert caught.value.code == "RECOVERY_REQUIRED"
+    assert source.read_bytes() == active
+
+
+@pytest.mark.parametrize("kind", ["commit", "rollback"])
+def test_first_final_decision_rechecks_artifacts_before_journal_rename(fixture, kind):
+    source, paths, engine, root = fixture
+    if kind == "commit":
+        engine.run(insert, validator=Validator())
+    else:
+        _missing_displaced_original(fixture)
+        assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
+    with engine._stores() as (journal, backups):
+        record = journal.load()
+        assert record is not None
+        phases = ("SERVICE_ACTIVATING", "SERVICE_VERIFIED") if kind == "commit" else (
+            "ROLLBACK_SERVICE", "ROLLBACK_VERIFIED")
+        for phase in phases:
+            record = journal.publish(record.successor(phase),
+                                     authenticate=lambda item: engine._authenticate_record(item, backups))
+        final = "COMMIT_CLEANUP_PENDING" if kind == "commit" else "ROLLBACK_CLEANUP_PENDING"
+        decision = record.successor(final, cleanup={
+            "candidate": record.source if kind == "commit" else record.candidate,
+            "backup": record.backup,
+        })
+        disappearing = (paths.config_root / "activation-backups" / record.backup_name
+                        if kind == "commit" else source.parent / record.restoration_name)
+        checks = 0
+
+        def complete(item):
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                disappearing.unlink()
+            _authenticate_complete_for_test(engine, item, backups)
+
+        with pytest.raises(FilesystemRefused):
+            journal.publish(decision,
+                            authenticate=lambda item: engine._authenticate_record(item, backups),
+                            authenticate_complete_cleanup=complete)
+        assert checks == 2
+        assert journal.load() == record
+    assert (paths.config_root / "activation-journal" / "journal.next").exists()
+
+
+def test_precommit_abort_requires_candidate_at_first_decision_publication(fixture, monkeypatch):
+    source, paths, engine, root = fixture
+    from cloudflared_manager.activation import transaction
+
+    original_complete = engine._authenticate_complete
+    checks = 0
+
+    def complete(item, active, backups):
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            (source.parent / item.candidate_name).unlink()
+        original_complete(item, active, backups)
+
+    monkeypatch.setattr(engine, "_authenticate_complete", complete)
+    monkeypatch.setattr(transaction, "exchange", lambda *_: (_ for _ in ()).throw(
+        FilesystemRefused("INJECTED_EXCHANGE_FAILURE")))
+    with pytest.raises(ActivationError) as caught:
+        engine.run(insert, validator=Validator())
+    assert caught.value.code == "RECOVERY_REQUIRED"
+    assert caught.value.original == "INJECTED_EXCHANGE_FAILURE"
+    assert checks == 2
+    assert source.read_bytes() == _SOURCE
+    with PinnedDirectory(paths.config_root / "activation-journal", anchor=root, owner=os.getuid()) as directory:
+        record = JournalStore(directory, owner=os.getuid()).load()
+    assert record is not None and record.phase == "CONFIG_COMMITTING"

@@ -233,7 +233,9 @@ class JournalRecord:
                 if (record.phase not in {"ROLLBACK_CONFIG", "ROLLBACK_SERVICE", "ROLLBACK_VERIFIED", "ROLLBACK_CLEANUP_PENDING"}
                     or record.predecessor_phase not in {"ROLLBACK_CONFIG", "ROLLBACK_SERVICE", "ROLLBACK_VERIFIED"}
                     or restored.device != record.parent.device
-                    or restored.inode in {record.source.inode, record.candidate.inode}
+                    # The original has been unlinked before backup staging;
+                    # the filesystem may legitimately reuse its inode number.
+                    or restored.inode == record.candidate.inode
                     or (restored.uid, restored.gid, restored.mode, restored.size, restored.sha256)
                     != (record.source.uid, record.source.gid, record.source.mode,
                         record.source.size, record.source.sha256)):
@@ -389,6 +391,7 @@ class JournalStore:
         new: JournalRecord,
         *,
         authenticate: Callable[[JournalRecord], None],
+        authenticate_complete_cleanup: Callable[[JournalRecord], None] | None = None,
     ) -> JournalRecord:
         current = self.load()
         current_raw: bytes | None = None
@@ -403,6 +406,11 @@ class JournalStore:
             if new != current.successor(new.phase, cleanup=new.cleanup,
                                         restoration=new.restoration):
                 raise FilesystemRefused("INVALID_TRANSITION")
+        first_cleanup_decision = new.phase in _FINAL
+        if first_cleanup_decision:
+            if authenticate_complete_cleanup is None:
+                raise FilesystemRefused("INVALID_TRANSITION")
+            authenticate_complete_cleanup(new)
         if "journal.next" in self._names():
             raise FilesystemRefused("RECOVERY_REQUIRED")
         raw = new.bytes()
@@ -435,6 +443,9 @@ class JournalStore:
             _, repeated_staging, _ = self._read("journal.next", parse=True)
             if repeated_staging != raw:
                 raise FilesystemRefused("UNSAFE_JOURNAL")
+            if first_cleanup_decision:
+                assert authenticate_complete_cleanup is not None
+                authenticate_complete_cleanup(new)
             self.directory.revalidate()
             os.rename("journal.next", "journal", src_dir_fd=self.directory.fd, dst_dir_fd=self.directory.fd)
             fsync_directory(self.directory)
@@ -442,6 +453,9 @@ class JournalStore:
             if published != new or published_bytes != raw or "journal.next" in self._names():
                 raise FilesystemRefused("JOURNAL_PUBLICATION_FAILED")
             authenticate(new)
+            if first_cleanup_decision:
+                assert authenticate_complete_cleanup is not None
+                authenticate_complete_cleanup(new)
             return new
         except FilesystemRefused:
             raise

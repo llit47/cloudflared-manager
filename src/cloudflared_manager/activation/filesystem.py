@@ -66,12 +66,24 @@ class FileFacts:
         return cls(**value)
 
     def same_content_metadata(self, other: FileFacts) -> bool:
+        """Exact journaled file identity, including both change timestamps."""
+
+        return self == other
+
+    def same_after_exchange(self, other: FileFacts) -> bool:
+        """Identity after RENAME_EXCHANGE, which changes ctime on Linux.
+
+        Rename preserves mtime and the remaining recorded facts. Use this
+        only for an inode whose namespace exchange may have occurred; source,
+        candidate, backup, and staging checks before exchange stay exact.
+        """
+
         return (
             self.device, self.inode, self.uid, self.gid, self.mode,
-            self.links, self.size, self.sha256,
+            self.links, self.size, self.sha256, self.mtime_ns,
         ) == (
             other.device, other.inode, other.uid, other.gid, other.mode,
-            other.links, other.size, other.sha256,
+            other.links, other.size, other.sha256, other.mtime_ns,
         )
 
 
