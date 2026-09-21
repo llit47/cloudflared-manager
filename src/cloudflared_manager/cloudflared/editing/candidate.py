@@ -51,8 +51,15 @@ class CandidateCommitHandle:
     sha256: str
 
     def close(self) -> None:
+        failure: OSError | None = None
         for descriptor in (self.file_fd, self.directory_fd):
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                if failure is None:
+                    failure = error
+        if failure is not None:
+            raise failure
 
 
 class CandidateFile:

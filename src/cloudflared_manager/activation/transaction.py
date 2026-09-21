@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import secrets
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -193,10 +194,17 @@ class FilesystemActivation:
                             raise ActivationError("RECOVERY_REQUIRED", original=original,
                                                   rollback=_failure_code(recovery_error)) from None
                     finally:
+                        pending = sys.exc_info()[1]
                         if handle is not None:
                             try:
                                 handle.close()
                             except OSError:
+                                if isinstance(pending, ActivationError):
+                                    failures = [code for code in (pending.rollback, "DESCRIPTOR_CLOSE_FAILED") if code]
+                                    raise ActivationError(
+                                        "RECOVERY_REQUIRED", original=pending.original or pending.code,
+                                        rollback=";".join(failures),
+                                    ) from None
                                 raise ActivationError(
                                     "RECOVERY_REQUIRED" if original else "DESCRIPTOR_CLOSE_FAILED",
                                     original=original,
@@ -206,6 +214,12 @@ class FilesystemActivation:
                             try:
                                 prepared.discard()
                             except Exception:
+                                if isinstance(pending, ActivationError):
+                                    failures = [code for code in (pending.rollback, "CANDIDATE_CLEANUP_FAILED") if code]
+                                    raise ActivationError(
+                                        "RECOVERY_REQUIRED", original=pending.original or pending.code,
+                                        rollback=";".join(failures),
+                                    ) from None
                                 raise ActivationError(
                                     "RECOVERY_REQUIRED" if original else "CANDIDATE_CLEANUP_FAILED",
                                     original=original,
@@ -266,7 +280,11 @@ class FilesystemActivation:
                         if record.phase in {"ACTIVATION_FAILED", "ROLLBACK_CONFIG"}:
                             current, _ = named_file(active, adopted.name)
                             if current.same_content_metadata(record.restoration or record.source):
-                                fsync_directory(active)
+                                if record.phase == "ACTIVATION_FAILED":
+                                    record = journal.publish(record.successor("ROLLBACK_CONFIG"),
+                                                             authenticate=lambda item: self._authenticate(item, active, backups))
+                                self._fsync_verified_active(active, adopted.name,
+                                                            record.restoration or record.source)
                                 return FilesystemResult("CONFIG_RESTORED_SERVICE_PENDING", record.transaction_id)
                             result = self._handle_failure(record, journal, active, backups, adopted.name)
                             return FilesystemResult(result, record.transaction_id)
@@ -358,6 +376,19 @@ class FilesystemActivation:
     def _authenticate(self, record: JournalRecord, active: PinnedDirectory, backups: BackupStore) -> None:
         authenticate_record(record, self.authority, active, backups)
 
+    def _fsync_verified_active(self, active: PinnedDirectory, name: str, expected: FileFacts) -> None:
+        active.revalidate()
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=active.fd)
+        try:
+            observed, _ = file_facts(fd)
+            if not observed.same_content_metadata(expected):
+                raise FilesystemRefused("ARTIFACT_MISMATCH")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        self._require_source_at(active, name, expected)
+        fsync_directory(active)
+
     def _cleanup_unpublished(self, active: PinnedDirectory, backups: BackupStore,
                              handle: CandidateCommitHandle | None, backup_name: str | None,
                              backup_facts: FileFacts | None, snapshot: ConfigSourceSnapshot) -> None:
@@ -385,7 +416,7 @@ class FilesystemActivation:
             return "FAILED_PRECOMMIT"
         if record.phase == "ROLLBACK_CONFIG" and current.same_content_metadata(record.restoration or record.source):
             self._authenticate(record, active, backups)
-            fsync_directory(active)
+            self._fsync_verified_active(active, active_name, record.restoration or record.source)
             return "CONFIG_RESTORED_SERVICE_PENDING"
         if not current.same_content_metadata(record.candidate):
             raise FilesystemRefused("ROLLBACK_FAILED_STATE_INDETERMINATE")
@@ -417,12 +448,7 @@ class FilesystemActivation:
         exchange(active, active_name, target_name)
         self._require_source_at(active, active_name, record.restoration or record.source)
         self._require_candidate(active, target_name, record.candidate)
-        fd = os.open(active_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=active.fd)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        fsync_directory(active)
+        self._fsync_verified_active(active, active_name, record.restoration or record.source)
         return "CONFIG_RESTORED_SERVICE_PENDING"
 
     def _stage_backup_restoration(self, record: JournalRecord, active: PinnedDirectory,

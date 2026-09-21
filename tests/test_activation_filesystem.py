@@ -616,9 +616,14 @@ def test_failed_restoration_identity_publication_leaves_unjournaled_artifact(fix
         pending = JournalStore(directory, owner=os.getuid()).load()
     assert pending is not None and pending.phase == "ROLLBACK_CONFIG" and pending.restoration is None
     monkeypatch.setattr(JournalStore, "publish", original_publish)
+    interrupted = paths.config_root / "activation-journal" / "journal.next"
+    interrupted.write_bytes(b"partial restoration successor")
+    interrupted.chmod(0o600)
     with pytest.raises(ActivationError) as blocked:
         engine.recover()
     assert blocked.value.original == "UNJOURNALED_RESTORATION"
+    assert not interrupted.exists()
+    assert (source.parent / record.restoration_name).read_bytes() == _SOURCE
 
 
 def test_restored_backup_artifacts_are_retired_after_durable_rollback_decision(fixture):
@@ -698,3 +703,110 @@ def test_recovered_commit_requires_active_file_fsync_before_advancing(fixture, m
     assert still_pending is not None and still_pending.phase == "CONFIG_COMMITTING"
     monkeypatch.setattr(transaction.os, "fsync", original_fsync)
     assert engine.recover().code == "SERVICE_ACTIVATION_PENDING"
+
+
+def test_descriptor_close_failure_preserves_earlier_rollback_failure(fixture, monkeypatch):
+    source, paths, engine, root = fixture
+    from cloudflared_manager.activation import transaction
+
+    original_publish = JournalStore.publish
+    original_exchange = transaction.exchange
+    original_close = transaction.CandidateCommitHandle.close
+    exchanges = 0
+
+    def fail_committed(self, record, *, authenticate):
+        if record.phase == "CONFIG_COMMITTED":
+            raise FilesystemRefused("COMMIT_PUBLICATION_FAILED")
+        return original_publish(self, record, authenticate=authenticate)
+
+    def fail_reverse(directory, first, second):
+        nonlocal exchanges
+        exchanges += 1
+        if exchanges == 2:
+            raise FilesystemRefused("REVERSE_EXCHANGE_FAILED")
+        return original_exchange(directory, first, second)
+
+    def fail_close(handle):
+        original_close(handle)
+        raise OSError("injected close failure")
+
+    monkeypatch.setattr(JournalStore, "publish", fail_committed)
+    monkeypatch.setattr(transaction, "exchange", fail_reverse)
+    monkeypatch.setattr(transaction.CandidateCommitHandle, "close", fail_close)
+    with pytest.raises(ActivationError) as caught:
+        engine.run(insert, validator=Validator())
+    assert caught.value.code == "RECOVERY_REQUIRED"
+    assert caught.value.original == "COMMIT_PUBLICATION_FAILED"
+    assert caught.value.rollback == "REVERSE_EXCHANGE_FAILED;DESCRIPTOR_CLOSE_FAILED"
+    with PinnedDirectory(paths.config_root / "activation-journal", anchor=root, owner=os.getuid()) as directory:
+        record = JournalStore(directory, owner=os.getuid()).load()
+    assert record is not None and record.phase == "ROLLBACK_CONFIG"
+
+
+def test_restored_backup_requires_active_file_fsync_on_recovery(fixture, monkeypatch):
+    source, paths, engine, root = fixture
+    record = _missing_displaced_original(fixture)
+    from cloudflared_manager.activation import transaction
+
+    original_fsync = transaction.os.fsync
+
+    def fail_restored_fsync(fd):
+        if os.readlink(f"/proc/self/fd/{fd}") == str(source) and source.read_bytes() == _SOURCE:
+            raise OSError("injected restored file fsync failure")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(transaction.os, "fsync", fail_restored_fsync)
+    with pytest.raises(ActivationError) as caught:
+        engine.recover()
+    assert caught.value.code == "RECOVERY_REQUIRED"
+    assert source.read_bytes() == _SOURCE
+    with PinnedDirectory(paths.config_root / "activation-journal", anchor=root, owner=os.getuid()) as directory:
+        pending = JournalStore(directory, owner=os.getuid()).load()
+    assert pending is not None and pending.phase == "ROLLBACK_CONFIG" and pending.restoration is not None
+    monkeypatch.setattr(transaction.os, "fsync", original_fsync)
+    assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
+
+
+def test_crash_reverted_namespace_under_activation_failed_publishes_rollback_intent(fixture):
+    source, paths, engine, root = fixture
+    engine.run(insert, validator=Validator())
+    with engine._stores() as (journal, backups):
+        record = journal.load()
+        assert record is not None and record.phase == "CONFIG_COMMITTED"
+        record = journal.publish(record.successor("ACTIVATION_FAILED"),
+                                 authenticate=lambda item: engine._authenticate_record(item, backups))
+    from cloudflared_manager.activation.filesystem import exchange
+
+    with PinnedDirectory(source.parent, anchor=root, owner=os.getuid()) as active:
+        exchange(active, source.name, record.candidate_name)
+    assert source.read_bytes() == _SOURCE
+    assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
+    with PinnedDirectory(paths.config_root / "activation-journal", anchor=root, owner=os.getuid()) as directory:
+        pending = JournalStore(directory, owner=os.getuid()).load()
+    assert pending is not None and pending.phase == "ROLLBACK_CONFIG"
+
+
+def test_journal_retirement_rejects_in_place_authority_swap(fixture):
+    source, paths, engine, root = fixture
+    engine.run(insert, validator=Validator())
+    directory = paths.config_root / "activation-journal"
+    journal_path = directory / "journal"
+    with PinnedDirectory(directory, anchor=root, owner=os.getuid()) as pinned:
+        store = JournalStore(pinned, owner=os.getuid())
+        record = store.load()
+        assert record is not None
+        for phase in ("SERVICE_ACTIVATING", "SERVICE_VERIFIED"):
+            record = store.publish(record.successor(phase), authenticate=lambda item: None)
+        record = store.publish(record.successor("COMMIT_CLEANUP_PENDING", cleanup={
+            "candidate": record.source, "backup": record.backup,
+        }), authenticate=lambda item: None)
+
+        def replace_published(_record):
+            replacement = directory / "replacement"
+            replacement.write_bytes(journal_path.read_bytes())
+            replacement.chmod(0o600)
+            os.replace(replacement, journal_path)
+
+        with pytest.raises(FilesystemRefused):
+            store.retire(record, authenticate=replace_published)
+    assert journal_path.exists()

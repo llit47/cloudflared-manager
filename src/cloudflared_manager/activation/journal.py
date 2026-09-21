@@ -454,11 +454,13 @@ class JournalStore:
     def retire(self, record: JournalRecord, *, authenticate: Callable[[JournalRecord], None]) -> None:
         if record.phase not in _FINAL:
             raise FilesystemRefused("INVALID_TRANSITION")
-        actual = self.load()
+        actual, raw, info = self._read("journal", parse=True)
         if actual != record or "journal.next" in self._names():
             raise FilesystemRefused("UNSAFE_JOURNAL")
         authenticate(record)
-        self._read("journal", parse=True)
+        self._require_same_published(raw, info)
+        if "journal.next" in self._names():
+            raise FilesystemRefused("UNSAFE_JOURNAL")
         os.unlink("journal", dir_fd=self.directory.fd)
         fsync_directory(self.directory)
         self.require_clean()

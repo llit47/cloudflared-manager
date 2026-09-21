@@ -64,7 +64,7 @@ def authenticate_record(
             raise FilesystemRefused("UNKNOWN_ACTIVE_STATE")
     elif record.phase in {"CONFIG_COMMITTED", "ACTIVATION_FAILED", "ROLLBACK_CONFIG", "SERVICE_ACTIVATING", "SERVICE_VERIFIED", "COMMIT_CLEANUP_PENDING"}:
         current, _ = named_file(active, adopted.name)
-        restored_active = record.phase == "ROLLBACK_CONFIG" and current.same_content_metadata(
+        restored_active = record.phase in {"ACTIVATION_FAILED", "ROLLBACK_CONFIG"} and current.same_content_metadata(
             record.restoration or record.source
         )
         if record.restoration is not None and record.phase == "ROLLBACK_CONFIG":
