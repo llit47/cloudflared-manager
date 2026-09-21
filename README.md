@@ -485,6 +485,14 @@ None of those activation, backup, rollback, service-control, sudoers, systemd
 privilege, permission-broadening, or production write concerns is implemented
 here. Cloudflare API and DNS mutation also remain unimplemented.
 
+The design contract for that future work is
+[`docs/activation-transaction.md`](docs/activation-transaction.md). It defines
+the trust boundary, stale-write and race requirements, transaction state
+machine, metadata and durability rules, minimal crash journal, service/readiness
+verification, rollback outcomes, phased implementation plan, and adversarial
+test matrix. The document is a design only: it does not enable config writes,
+privilege, service control, HTTP mutations, or DNS/API behavior.
+
 ## Run the development server
 
 The package entry point reads `CFM_BIND_HOST` and `CFM_BIND_PORT` and enables

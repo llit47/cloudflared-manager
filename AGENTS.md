@@ -103,6 +103,63 @@ changes, configuration validation, and service restarts.
   partial DNS/config failures with explicit compensation or a recoverable
   reconciliation state; never report partial success as complete.
 
+## Privileged cloudflared activation
+
+- Follow `docs/activation-transaction.md` for any work that can replace the
+  adopted cloudflared config or control `cloudflared.service`. Treat its
+  non-negotiable invariants as hard requirements, not implementation advice.
+- Keep the long-running web service non-root and unable to write the adopted
+  config, its directory, privileged transaction state, or service-control
+  interfaces. LAN-only access is not privileged authorization.
+- Derive the active target only from the root-owned explicitly adopted setting.
+  Never mutate a detected-only path or accept an active, backup, journal,
+  executable, or service path from browser input.
+- Revalidate the adopted path, active manager release, source bytes and
+  file/parent identity immediately before commit. Reject concurrent or manual
+  changes; never merge or rebase a prepared mutation onto changed config.
+- Preserve PR10's bounded/no-follow snapshots, round-trip structural checks,
+  terminal catch-all, exclusive `0600` staging, fsync, retained candidate
+  identity, layered parsing, and FD-bound cloudflared validation. Root privilege
+  does not permit bypassing them.
+- Never truncate the active config in place. Require exact durable backup,
+  intended metadata handling, race-aware same-filesystem atomic commit, file
+  and directory fsync, and authenticated crash recovery before production
+  activation is enabled. Unsupported ACLs/xattrs or ambiguous filesystem state
+  fail closed. Fsync the candidate and its verified parent directory, then
+  reverify identity before any durable journal names it as required state.
+- Require a verified healthy, stable cloudflared service baseline before active
+  config mutation; an initially inactive, failed, mismatched, or unstable
+  service fails closed. Treat command completion, state, process identity,
+  readiness, and stability as separate checks.
+- After durable commit intent, freshly recheck source/candidate/adopted identity
+  and the complete service baseline immediately before exchange. A proven
+  pre-exchange failure aborts without config or service mutation; once the
+  active name may have changed, publish durable rollback intent before any
+  compensating exchange or restore. Do not claim process liveness and
+  filesystem exchange are atomic.
+- Record a durable commit-or-rollback cleanup decision before deleting recovery
+  artifacts, then make authenticated cleanup idempotent and directory-fsynced.
+  A failed activation is never success; distinguish verified rollback from
+  partial or failed rollback.
+- Under the shared outer manager lock, update, release reconciliation, adopt,
+  and clear may change authority only after proving the fixed activation-
+  journal namespace durably clean. Pathname absence alone is insufficient:
+  fsync the verified journal directory and recheck absence; journal retirement
+  is not complete before that fsync. A journal left after a final cleanup
+  decision is a recovery artifact to retire, not permanent history. Recovery
+  takes the same outer lock, and any unverifiable state fails closed unchanged.
+- Only fixed, durably published `journal` is recovery authority. Fixed
+  `journal.next` is non-authoritative staging and recovery never promotes it.
+  Begin a phase-dependent side effect only after staging rename, journal-
+  directory fsync, and published-record reverification; recover interrupted
+  staging deterministically, while unknown journal objects fail closed.
+- Keep privileged operations allowlisted with fixed executable/service
+  identities, strict bounded inputs, fixed argv, bounded timeouts,
+  `shell=False`, minimal environment, and sanitized errors. Never create a
+  generic root command, file-copy, YAML-path, or systemctl proxy.
+- Do not combine local config activation with DNS/API ownership or expose a web
+  mutation surface until each boundary has its own reviewed design and tests.
+
 ## Engineering workflow
 
 - Keep modules small and responsibilities clear. Avoid dependencies without a
