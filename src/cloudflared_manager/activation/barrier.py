@@ -10,9 +10,10 @@ from cloudflared_manager.activation.filesystem import (
     FilesystemRefused, PinnedDirectory, fsync_directory, named_file,
 )
 from cloudflared_manager.activation.journal import JournalRecord, JournalStore
-from cloudflared_manager.activation.state import open_fixed_state_child
+from cloudflared_manager.activation.state import BackupStore, open_fixed_state_child
+from cloudflared_manager.activation.authentication import authenticate_record
 from cloudflared_manager.deployment.environment import read_environment, require_safe_environment
-from cloudflared_manager.deployment.errors import HostOperationError
+from cloudflared_manager.deployment.errors import DeploymentError, HostOperationError
 from cloudflared_manager.deployment.paths import DeploymentPaths
 from cloudflared_manager.deployment.release import ReleaseFilesystem
 from cloudflared_manager.deployment.settings import settings_from_document
@@ -37,30 +38,32 @@ class ActivationRecoveryBarrier:
             with open_fixed_state_child(self.paths.config_root, "activation-journal",
                                         anchor=self.anchor, owner=self.owner) as journal_dir:
                 journal = JournalStore(journal_dir, owner=self.owner)
-                record = journal.recover_staging()
-                if record is None:
+                published = journal.load()
+                if published is None:
+                    journal.recover_staging()
                     journal.require_clean()
                     return
-                # A terminal cleanup decision can be retired here only if the
-                # allowlisted artifacts are already absent. This gate does not
-                # perform substantive config or service recovery.
-                if record.phase not in {"PRECOMMIT_ABORT", "COMMIT_CLEANUP_PENDING", "ROLLBACK_CLEANUP_PENDING"}:
-                    raise FilesystemRefused("RECOVERY_REQUIRED")
                 with open_fixed_state_child(self.paths.config_root, "activation-backups",
                                             anchor=self.anchor, owner=self.owner,
                                             create=False) as backup_dir:
-                    release, adopted = self._authority()
-                    if (release != record.release_id
-                        or hashlib.sha256(os.fsencode(adopted)).hexdigest() != record.adopted_fingerprint):
-                        raise FilesystemRefused("STALE_AUTHORITY")
+                    backups = BackupStore(backup_dir, owner=self.owner)
+                    _, adopted = self._authority()
                     with PinnedDirectory(adopted.parent, anchor=self.anchor, owner=self.owner) as active:
+                        authenticate = lambda item: authenticate_record(item, self, active, backups)
+                        record = journal.recover_staging(authenticate=authenticate)
+                        if record is None:
+                            raise FilesystemRefused("UNSAFE_JOURNAL")
+                        # This gate retires a final decision only when all
+                        # allowlisted artifacts are already absent.
+                        if record.phase not in {"PRECOMMIT_ABORT", "COMMIT_CLEANUP_PENDING", "ROLLBACK_CLEANUP_PENDING"}:
+                            raise FilesystemRefused("RECOVERY_REQUIRED")
                         self._authenticate_absent_cleanup(record, active, backup_dir, adopted.name)
                         fsync_directory(active)
                         fsync_directory(backup_dir)
                         journal.retire(record, authenticate=lambda item: self._authenticate_absent_cleanup(
                             item, active, backup_dir, adopted.name))
                 journal.require_clean()
-        except (FilesystemRefused, OSError) as error:
+        except (FilesystemRefused, DeploymentError, OSError) as error:
             code = error.code if isinstance(error, FilesystemRefused) else "JOURNAL_NAMESPACE_NOT_DURABLY_CLEAN"
             raise ActivationBarrierError(code) from None
 
@@ -71,6 +74,9 @@ class ActivationRecoveryBarrier:
             raise FilesystemRefused("STALE_AUTHORITY")
         release = ReleaseFilesystem(self.paths, owner=(self.owner, os.getegid())).read_current_sha()
         return release, settings.cloudflared_config_path
+
+    def current(self) -> tuple[str, Path]:
+        return self._authority()
 
     def _authenticate_absent_cleanup(self, record: JournalRecord, active: PinnedDirectory,
                                      backup_dir: PinnedDirectory, active_name: str) -> None:

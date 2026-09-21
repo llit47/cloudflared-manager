@@ -160,13 +160,14 @@ def test_operator_replacement_during_exchange_is_preserved_for_manual_recovery(f
     assert record is not None and record.phase == "CONFIG_COMMITTING"
 
 
-def test_pending_journal_blocks_manager_authority_changes(fixture):
+def test_pending_journal_blocks_manager_authority_changes(fixture, monkeypatch):
     source, paths, engine, root = fixture
     engine.run(insert, validator=Validator())
     before = source.read_bytes()
     journal_path = paths.config_root / "activation-journal" / "journal"
     journal_before = journal_path.read_bytes()
     barrier = ActivationRecoveryBarrier(paths, anchor=root, owner=os.getuid())
+    monkeypatch.setattr(barrier, "_authority", lambda: ("a" * 40, source))
     with pytest.raises(ActivationBarrierError) as caught:
         barrier.require_clean()
     assert caught.value.code == "RECOVERY_REQUIRED"
@@ -318,3 +319,80 @@ def test_backup_short_write_aborts_without_recovery_journal(fixture, monkeypatch
     assert source.read_bytes() == _SOURCE
     assert list((paths.config_root / "activation-journal").iterdir()) == []
     assert list((paths.config_root / "activation-backups").iterdir()) == []
+
+
+@pytest.mark.parametrize("staged_bytes", [b"partial", b"complete-successor"])
+def test_published_journal_authenticates_before_discarding_interrupted_staging(
+    fixture, monkeypatch, staged_bytes,
+):
+    source, paths, engine, root = fixture
+    engine.run(insert, validator=Validator())
+    directory = paths.config_root / "activation-journal"
+    published_path = directory / "journal"
+    published_bytes = published_path.read_bytes()
+    if staged_bytes == b"complete-successor":
+        with PinnedDirectory(directory, anchor=root, owner=os.getuid()) as pinned:
+            record = JournalStore(pinned, owner=os.getuid()).load()
+        assert record is not None
+        staged_bytes = record.successor("SERVICE_ACTIVATING").bytes()
+    staged = directory / "journal.next"
+    staged.write_bytes(staged_bytes)
+    staged.chmod(0o600)
+    barrier = ActivationRecoveryBarrier(paths, anchor=root, owner=os.getuid())
+    monkeypatch.setattr(barrier, "_authority", lambda: ("a" * 40, source))
+    with pytest.raises(ActivationBarrierError) as caught:
+        barrier.require_clean()
+    assert caught.value.code == "RECOVERY_REQUIRED"
+    assert published_path.read_bytes() == published_bytes
+    assert not staged.exists()
+    assert b"new.example.com" in source.read_bytes()
+    assert engine.recover().code == "SERVICE_ACTIVATION_PENDING"
+
+
+def test_invalid_published_journal_does_not_use_valid_staging(fixture, monkeypatch):
+    source, paths, engine, root = fixture
+    engine.run(insert, validator=Validator())
+    directory = paths.config_root / "activation-journal"
+    with PinnedDirectory(directory, anchor=root, owner=os.getuid()) as pinned:
+        record = JournalStore(pinned, owner=os.getuid()).load()
+    assert record is not None
+    staged = directory / "journal.next"
+    staged.write_bytes(record.successor("SERVICE_ACTIVATING").bytes())
+    staged.chmod(0o600)
+    (directory / "journal").write_bytes(b"corrupt authority")
+    barrier = ActivationRecoveryBarrier(paths, anchor=root, owner=os.getuid())
+    monkeypatch.setattr(barrier, "_authority", lambda: ("a" * 40, source))
+    with pytest.raises(ActivationBarrierError):
+        barrier.require_clean()
+    assert staged.exists()
+    assert (directory / "journal").read_bytes() == b"corrupt authority"
+
+
+def test_unauthenticated_published_artifact_preserves_staging(fixture, monkeypatch):
+    source, paths, engine, root = fixture
+    engine.run(insert, validator=Validator())
+    directory = paths.config_root / "activation-journal"
+    staged = directory / "journal.next"
+    staged.write_bytes(b"partial")
+    staged.chmod(0o600)
+    backup = next((paths.config_root / "activation-backups").iterdir())
+    backup.write_bytes(b"tampered")
+    barrier = ActivationRecoveryBarrier(paths, anchor=root, owner=os.getuid())
+    monkeypatch.setattr(barrier, "_authority", lambda: ("a" * 40, source))
+    with pytest.raises(ActivationBarrierError):
+        barrier.require_clean()
+    assert staged.read_bytes() == b"partial"
+    assert backup.read_bytes() == b"tampered"
+
+
+def test_unsafe_staging_symlink_is_never_deleted(fixture, monkeypatch):
+    source, paths, engine, root = fixture
+    engine.run(insert, validator=Validator())
+    directory = paths.config_root / "activation-journal"
+    staged = directory / "journal.next"
+    staged.symlink_to(directory / "journal")
+    barrier = ActivationRecoveryBarrier(paths, anchor=root, owner=os.getuid())
+    monkeypatch.setattr(barrier, "_authority", lambda: ("a" * 40, source))
+    with pytest.raises(ActivationBarrierError):
+        barrier.require_clean()
+    assert staged.is_symlink()

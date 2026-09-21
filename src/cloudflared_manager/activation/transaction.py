@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from cloudflared_manager.activation.authentication import authenticate_record
 from cloudflared_manager.activation.filesystem import (
     DirectoryFacts, FileFacts, FilesystemRefused, PinnedDirectory, _metadata_supported,
     exchange, file_facts, fsync_directory, named_file, require_source,
@@ -100,7 +101,7 @@ class FilesystemActivation:
             raise ActivationError("PRIVILEGED_BOUNDARY_UNAVAILABLE")
         with DeploymentLock(self.paths.lock_path, owner=(self.owner, os.getegid())):
             with self._stores() as (journal, backups):
-                journal.recover_staging()
+                journal.recover_staging(authenticate=lambda item: self._authenticate_record(item, backups))
                 journal.require_clean()
                 release, adopted = self.authority.current()
                 with PinnedDirectory(adopted.parent, anchor=self.anchor, owner=self.owner) as active:
@@ -168,7 +169,9 @@ class FilesystemActivation:
                             else None
                         )
                         try:
-                            published = journal.recover_staging()
+                            published = journal.recover_staging(
+                                authenticate=lambda item: self._authenticate_record(item, backups)
+                            )
                             if published is None:
                                 self._cleanup_unpublished(active, backups, handle, backup_name, backup_facts)
                                 journal.require_clean()
@@ -204,7 +207,9 @@ class FilesystemActivation:
         with DeploymentLock(self.paths.lock_path, owner=(self.owner, os.getegid())):
             with self._stores() as (journal, backups):
                 try:
-                    record = journal.recover_staging()
+                    record = journal.recover_staging(
+                        authenticate=lambda item: self._authenticate_record(item, backups)
+                    )
                     if record is None:
                         journal.require_clean()
                         return FilesystemResult("NO_RECOVERY_REQUIRED")
@@ -258,7 +263,7 @@ class FilesystemActivation:
             journal_dir = open_fixed_state_child(self.paths.config_root, "activation-journal", anchor=self.anchor, owner=self.owner)
             try:
                 journal = JournalStore(journal_dir, owner=self.owner)
-                published = journal.recover_staging()
+                published = journal.load()
                 backup_dir = open_fixed_state_child(
                     self.paths.config_root, "activation-backups", anchor=self.anchor,
                     owner=self.owner, create=published is None,
@@ -274,6 +279,13 @@ class FilesystemActivation:
     def _require_authority(self, release: str, adopted: Path) -> None:
         if self.authority.current() != (release, adopted):
             raise FilesystemRefused("STALE_AUTHORITY")
+
+    def _authenticate_record(self, record: JournalRecord, backups: BackupStore) -> None:
+        release, adopted = self.authority.current()
+        if release != record.release_id or _fingerprint(adopted) != record.adopted_fingerprint:
+            raise FilesystemRefused("STALE_AUTHORITY")
+        with PinnedDirectory(adopted.parent, anchor=self.anchor, owner=self.owner) as active:
+            self._authenticate(record, active, backups)
 
     def _baseline(self, adopted: Path, source: FileFacts) -> BaselineFacts:
         assert self.baseline is not None
@@ -317,43 +329,7 @@ class FilesystemActivation:
             raise FilesystemRefused("STALE_SOURCE")
 
     def _authenticate(self, record: JournalRecord, active: PinnedDirectory, backups: BackupStore) -> None:
-        release, adopted = self.authority.current()
-        if (release != record.release_id or adopted.parent != active.path
-            or _fingerprint(adopted) != record.adopted_fingerprint
-            or active.facts != record.parent):
-            raise FilesystemRefused("STALE_AUTHORITY")
-        active.revalidate()
-        _metadata_supported(active.fd)
-        if record.phase not in {"PRECOMMIT_ABORT", "COMMIT_CLEANUP_PENDING", "ROLLBACK_CLEANUP_PENDING"}:
-            backups.require(record.backup_name, record.backup)
-        if record.phase in {"BACKUP_DURABLE", "PRECOMMIT_ABORT"}:
-            self._require_source_at(active, adopted.name, record.source)
-            if record.phase != "PRECOMMIT_ABORT" or _exists(active, record.candidate_name):
-                self._require_candidate(active, record.candidate_name, record.candidate)
-        elif record.phase == "CONFIG_COMMITTING":
-            current, _ = named_file(active, adopted.name)
-            if current.same_content_metadata(record.source):
-                self._require_candidate(active, record.candidate_name, record.candidate)
-            elif not current.same_content_metadata(record.candidate):
-                raise FilesystemRefused("UNKNOWN_ACTIVE_STATE")
-        elif record.phase in {"CONFIG_COMMITTED", "ACTIVATION_FAILED", "ROLLBACK_CONFIG", "SERVICE_ACTIVATING", "SERVICE_VERIFIED", "COMMIT_CLEANUP_PENDING"}:
-            current, _ = named_file(active, adopted.name)
-            if record.phase == "ROLLBACK_CONFIG" and current.same_content_metadata(record.source):
-                self._require_candidate(active, record.candidate_name, record.candidate)
-            elif not current.same_content_metadata(record.candidate):
-                raise FilesystemRefused("UNKNOWN_ACTIVE_STATE")
-            if record.phase in {"CONFIG_COMMITTED", "SERVICE_ACTIVATING", "SERVICE_VERIFIED"}:
-                self._require_source_at(active, record.candidate_name, record.source)
-        elif record.phase == "ROLLBACK_CLEANUP_PENDING":
-            self._require_source_at(active, adopted.name, record.source)
-        if record.phase in {"PRECOMMIT_ABORT", "COMMIT_CLEANUP_PENDING", "ROLLBACK_CLEANUP_PENDING"}:
-            for kind, expected in record.cleanup.items():
-                directory = active if kind == "candidate" else backups.directory
-                name = record.candidate_name if kind == "candidate" else record.backup_name
-                if _exists(directory, name):
-                    current, _ = named_file(directory, name)
-                    if not current.same_content_metadata(expected):
-                        raise FilesystemRefused("ARTIFACT_MISMATCH")
+        authenticate_record(record, self.authority, active, backups)
 
     def _cleanup_unpublished(self, active: PinnedDirectory, backups: BackupStore,
                              handle: CandidateCommitHandle | None, backup_name: str | None,
@@ -415,14 +391,6 @@ class FilesystemActivation:
 
 def _fingerprint(path: Path) -> str:
     return hashlib.sha256(os.fsencode(path)).hexdigest()
-
-
-def _exists(directory: PinnedDirectory, name: str) -> bool:
-    try:
-        os.stat(name, dir_fd=directory.fd, follow_symlinks=False)
-        return True
-    except FileNotFoundError:
-        return False
 
 
 def _failure_code(error: Exception) -> str:
