@@ -125,7 +125,8 @@ changes, configuration validation, and service restarts.
   intended metadata handling, race-aware same-filesystem atomic commit, file
   and directory fsync, and authenticated crash recovery before production
   activation is enabled. Unsupported ACLs/xattrs or ambiguous filesystem state
-  fail closed.
+  fail closed. Fsync the candidate and its verified parent directory, then
+  reverify identity before any durable journal names it as required state.
 - Require a verified healthy, stable cloudflared service baseline before active
   config mutation; an initially inactive, failed, mismatched, or unstable
   service fails closed. Treat command completion, state, process identity,
@@ -133,7 +134,8 @@ changes, configuration validation, and service restarts.
 - After durable commit intent, freshly recheck source/candidate/adopted identity
   and the complete service baseline immediately before exchange. A proven
   pre-exchange failure aborts without config or service mutation; once the
-  active name may have changed, use rollback. Do not claim process liveness and
+  active name may have changed, publish durable rollback intent before any
+  compensating exchange or restore. Do not claim process liveness and
   filesystem exchange are atomic.
 - Record a durable commit-or-rollback cleanup decision before deleting recovery
   artifacts, then make authenticated cleanup idempotent and directory-fsynced.
