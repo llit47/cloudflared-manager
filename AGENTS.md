@@ -138,16 +138,34 @@ changes, configuration validation, and service restarts.
   activation is enabled. Unsupported ACLs/xattrs or ambiguous filesystem state
   fail closed. Fsync the candidate and its verified parent directory, then
   reverify identity before any durable journal names it as required state.
-- Require a verified healthy, stable cloudflared service baseline before active
-  config mutation; an initially inactive, failed, mismatched, or unstable
-  service fails closed. Treat command completion, state, process identity,
-  readiness, and stability as separate checks.
+- Require a verified stable cloudflared service baseline before active config
+  mutation. PR14 supports only the fixed `cloudflared.service` unit in local-
+  config mode when its loaded systemd definition is strictly parseable,
+  `Type=notify`, and its explicit `--config` resolves to the adopted config.
+  Inactive, failed, transitional, token-managed, wrong-config, wrong-executable,
+  non-notify, or otherwise unverifiable service state fails closed.
+- PR14 uses only a fixed `systemctl restart cloudflared.service` operation to
+  load a committed config. Do not use reload, daemon-reload, stop/start
+  sequences, caller-selected verbs, or caller-selected unit names. A zero
+  systemctl exit status is never sufficient: verify stable systemd state,
+  process start identity, executable identity, adopted-config relationship, and
+  the notify-based startup readiness contract after the operation.
+- Publish and reverify `SERVICE_ACTIVATING` before the planned restart and
+  `ROLLBACK_SERVICE` before a rollback restart. If a restart command times out
+  or the unit is still transitional, do not race it with config rollback;
+  retain recovery authority and fail closed until the service state is settled.
+  Recovery from either service-action phase may reissue the fixed restart only
+  after proving the unit is no longer transitional.
+- Treat direct equivalent-root lifecycle commands or loaded-unit changes racing
+  activation/recovery as unsupported host-administrator interference. Changes
+  observable at required service validation boundaries still fail closed. Do
+  not claim that the manager lock makes filesystem exchange and systemd/process
+  state atomic.
 - After durable commit intent, freshly recheck source/candidate/adopted identity
   and the complete service baseline immediately before exchange. A proven
   pre-exchange failure aborts without config or service mutation; once the
   active name may have changed, publish durable rollback intent before any
-  compensating exchange or restore. Do not claim process liveness and
-  filesystem exchange are atomic.
+  compensating exchange or restore.
 - Record a durable commit-or-rollback cleanup decision before deleting recovery
   artifacts, then make authenticated cleanup idempotent and directory-fsynced.
   A failed activation is never success; distinguish verified rollback from
