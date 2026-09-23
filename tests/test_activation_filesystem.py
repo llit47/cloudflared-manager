@@ -39,6 +39,30 @@ class Baseline:
                              source_digest, 1000, 0)
 
 
+
+class FakeService(Baseline):
+    def settled(self):
+        return True
+
+    def restart(self):
+        return True
+
+    def verify(self, baseline, *, activation):
+        pass
+
+
+class FilesystemStageHarness(FilesystemActivation):
+    """Pause at the service boundary to inspect PR12 artifacts before cleanup.
+
+    Full PR14 service/cleanup behavior is exercised by the integration suite.
+    These explicit test-only pauses retain the filesystem adversarial assertions.
+    """
+    def _resume_service(self, record, journal, active, backups, active_name, *, recovery=False):
+        if record.phase in {"CONFIG_COMMITTED", "ROLLBACK_CONFIG"}:
+            return "TEST_PAUSED_" + record.phase
+        return super()._resume_service(record, journal, active, backups, active_name, recovery=recovery)
+
+
 class Validator:
     def validate(self, candidate):
         candidate.require_intact()
@@ -62,7 +86,7 @@ def fixture(tmp_path):
     paths.config_root.mkdir(parents=True)
     (tmp_path / "etc").chmod(0o700)
     paths.config_root.chmod(0o700)
-    engine = FilesystemActivation(paths, authority=Authority(source), baseline=Baseline(),
+    engine = FilesystemStageHarness(paths, authority=Authority(source), baseline=Baseline(), service=FakeService(),
                                   owner=os.getuid(), anchor=tmp_path)
     return source, paths, engine, tmp_path
 
@@ -70,7 +94,7 @@ def fixture(tmp_path):
 def test_commit_keeps_exact_backup_and_recovery_journal(fixture):
     source, paths, engine, root = fixture
     result = engine.run(insert, validator=Validator())
-    assert result.code == "SERVICE_ACTIVATION_PENDING"
+    assert result.code == "TEST_PAUSED_CONFIG_COMMITTED"
     assert b"new.example.com" in source.read_bytes()
     backup_files = list((paths.config_root / "activation-backups").iterdir())
     assert len(backup_files) == 1
@@ -178,7 +202,7 @@ def test_failed_post_exchange_publication_rolls_back_with_durable_intent(fixture
     monkeypatch.setattr(JournalStore, "publish", fail_committed)
     with pytest.raises(ActivationError) as caught:
         engine.run(insert, validator=Validator())
-    assert caught.value.code == "CONFIG_RESTORED_SERVICE_PENDING"
+    assert caught.value.code == "TEST_PAUSED_ROLLBACK_CONFIG"
     assert caught.value.original == "INJECTED_PUBLICATION_FAILURE"
     assert source.read_bytes() == _SOURCE
     with PinnedDirectory(paths.config_root / "activation-journal", anchor=root, owner=os.getuid()) as directory:
@@ -334,9 +358,9 @@ def test_explicit_recovery_finishes_interrupted_config_rollback(fixture, monkeyp
         engine.run(insert, validator=Validator())
     monkeypatch.setattr(transaction, "exchange", original_exchange)
     recovered = engine.recover()
-    assert recovered.code == "CONFIG_RESTORED_SERVICE_PENDING"
+    assert recovered.code == "TEST_PAUSED_ROLLBACK_CONFIG"
     assert source.read_bytes() == _SOURCE
-    assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
+    assert engine.recover().code == "TEST_PAUSED_ROLLBACK_CONFIG"
 
 
 def test_unsupported_source_xattr_is_rejected_without_journal(fixture):
@@ -399,7 +423,7 @@ def test_published_journal_authenticates_before_discarding_interrupted_staging(
     assert published_path.read_bytes() == published_bytes
     assert not staged.exists()
     assert b"new.example.com" in source.read_bytes()
-    assert engine.recover().code == "SERVICE_ACTIVATION_PENDING"
+    assert engine.recover().code == "TEST_PAUSED_CONFIG_COMMITTED"
 
 
 def test_invalid_published_journal_does_not_use_valid_staging(fixture, monkeypatch):
@@ -521,7 +545,7 @@ def test_authenticated_backup_restores_missing_displaced_original(fixture):
     source, paths, engine, root = fixture
     record = _missing_displaced_original(fixture)
     recovered = engine.recover()
-    assert recovered.code == "CONFIG_RESTORED_SERVICE_PENDING"
+    assert recovered.code == "TEST_PAUSED_ROLLBACK_CONFIG"
     assert source.read_bytes() == _SOURCE
     assert source.stat().st_mode & 0o777 == record.source.mode
     assert (source.parent / record.restoration_name).read_bytes().find(b"new.example.com") >= 0
@@ -534,7 +558,7 @@ def test_authenticated_backup_restores_missing_displaced_original(fixture):
     assert restored.rollback_ctimes[0] == source.stat().st_ctime_ns
     assert restored.restoration.inode == source.stat().st_ino
     assert restored.restoration.sha256 == record.source.sha256
-    assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
+    assert engine.recover().code == "TEST_PAUSED_ROLLBACK_CONFIG"
 
 
 def test_corrupt_backup_blocks_missing_original_restoration(fixture):
@@ -582,7 +606,7 @@ def test_failed_restore_exchange_keeps_journaled_stage_for_recovery(fixture, mon
     assert source.read_bytes() != _SOURCE
     assert (source.parent / record.restoration_name).read_bytes() == _SOURCE
     monkeypatch.setattr(transaction, "exchange", original_exchange)
-    assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
+    assert engine.recover().code == "TEST_PAUSED_ROLLBACK_CONFIG"
     assert source.read_bytes() == _SOURCE
 
 
@@ -651,7 +675,7 @@ def test_config_committing_recovery_uses_backup_if_displaced_original_is_missing
     monkeypatch.setattr(JournalStore, "publish", interrupt_committed)
     with pytest.raises(ActivationError) as caught:
         engine.run(insert, validator=Validator())
-    assert caught.value.code == "CONFIG_RESTORED_SERVICE_PENDING"
+    assert caught.value.code == "TEST_PAUSED_ROLLBACK_CONFIG"
     assert caught.value.original == "INJECTED_COMMIT_INTERRUPTION"
     assert source.read_bytes() == _SOURCE
 
@@ -690,7 +714,7 @@ def test_failed_restoration_identity_publication_leaves_unjournaled_artifact(fix
 def test_restored_backup_artifacts_are_retired_after_durable_rollback_decision(fixture):
     source, paths, engine, root = fixture
     initial = _missing_displaced_original(fixture)
-    assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
+    assert engine.recover().code == "TEST_PAUSED_ROLLBACK_CONFIG"
     with engine._stores() as (journal, backups):
         record = journal.load()
         assert record is not None and record.restoration is not None
@@ -712,7 +736,7 @@ def test_restored_backup_artifacts_are_retired_after_durable_rollback_decision(f
 def test_barrier_retires_completed_backup_rollback_after_artifacts_are_absent(fixture, monkeypatch):
     source, paths, engine, root = fixture
     initial = _missing_displaced_original(fixture)
-    assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
+    assert engine.recover().code == "TEST_PAUSED_ROLLBACK_CONFIG"
     with engine._stores() as (journal, backups):
         record = journal.load()
         assert record is not None
@@ -765,7 +789,7 @@ def test_recovered_commit_requires_active_file_fsync_before_advancing(fixture, m
         still_pending = JournalStore(directory, owner=os.getuid()).load()
     assert still_pending is not None and still_pending.phase == "CONFIG_COMMITTING"
     monkeypatch.setattr(transaction.os, "fsync", original_fsync)
-    assert engine.recover().code == "SERVICE_ACTIVATION_PENDING"
+    assert engine.recover().code == "TEST_PAUSED_CONFIG_COMMITTED"
 
 
 def test_descriptor_close_failure_preserves_earlier_rollback_failure(fixture, monkeypatch):
@@ -827,7 +851,7 @@ def test_restored_backup_requires_active_file_fsync_on_recovery(fixture, monkeyp
         pending = JournalStore(directory, owner=os.getuid()).load()
     assert pending is not None and pending.phase == "ROLLBACK_CONFIG" and pending.restoration is not None
     monkeypatch.setattr(transaction.os, "fsync", original_fsync)
-    assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
+    assert engine.recover().code == "TEST_PAUSED_ROLLBACK_CONFIG"
 
 
 def test_crash_reverted_namespace_under_activation_failed_publishes_rollback_intent(fixture):
@@ -843,7 +867,7 @@ def test_crash_reverted_namespace_under_activation_failed_publishes_rollback_int
     with PinnedDirectory(source.parent, anchor=root, owner=os.getuid()) as active:
         exchange(active, source.name, record.candidate_name)
     assert source.read_bytes() == _SOURCE
-    assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
+    assert engine.recover().code == "TEST_PAUSED_ROLLBACK_CONFIG"
     with PinnedDirectory(paths.config_root / "activation-journal", anchor=root, owner=os.getuid()) as directory:
         pending = JournalStore(directory, owner=os.getuid()).load()
     assert pending is not None and pending.phase == "ROLLBACK_CONFIG"
@@ -878,7 +902,7 @@ def test_journal_retirement_rejects_in_place_authority_swap(fixture):
 def test_restoration_journal_accepts_reused_deleted_source_inode(fixture):
     source, paths, engine, root = fixture
     _missing_displaced_original(fixture)
-    assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
+    assert engine.recover().code == "TEST_PAUSED_ROLLBACK_CONFIG"
     with PinnedDirectory(paths.config_root / "activation-journal", anchor=root, owner=os.getuid()) as directory:
         record = JournalStore(directory, owner=os.getuid()).load()
     assert record is not None and record.restoration is not None
@@ -928,7 +952,7 @@ def test_journaled_post_exchange_ctime_interference_blocks_recovery(
     source, paths, engine, root = fixture
     if after_rollback:
         _missing_displaced_original(fixture)
-        assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
+        assert engine.recover().code == "TEST_PAUSED_ROLLBACK_CONFIG"
     else:
         engine.run(insert, validator=Validator())
     from cloudflared_manager.activation import authentication
@@ -961,7 +985,7 @@ def test_first_final_decision_rechecks_artifacts_before_journal_rename(fixture, 
         engine.run(insert, validator=Validator())
     else:
         _missing_displaced_original(fixture)
-        assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
+        assert engine.recover().code == "TEST_PAUSED_ROLLBACK_CONFIG"
     with engine._stores() as (journal, backups):
         record = journal.load()
         assert record is not None
