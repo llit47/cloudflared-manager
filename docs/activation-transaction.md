@@ -102,11 +102,21 @@ The administrator explicitly adopts a path and explicitly installs or enables
 any future write capability. Detection does not imply adoption, and an upgrade
 must not silently enable write capability.
 
-Root is trusted, but concurrent manual administration is still expected. A
-manual edit racing the manager is legitimate interference and MUST cause stale
-state rejection or a distinct rollback outcome rather than silent overwrite.
-No design can protect against a deliberately malicious root; the goal is to
-avoid losing independent administrative work and to detect namespace races.
+The host administrator/root is part of the trusted computing base. Concurrent
+manual administration is still expected: a change observable at a required
+validation or recovery boundary MUST cause stale-state rejection or a distinct
+rollback outcome rather than silent overwrite. This includes source,
+candidate, and active-config state. The manager MUST still handle crashes,
+reboot or power loss, interrupted commit/rollback/cleanup, partial filesystem
+operations, malformed or inconsistent recovery state, unprivileged symlink or
+path manipulation, and unauthorized writes by the non-root web service.
+
+The contract does not promise protection against an independent process with
+equivalent root privileges manipulating manager-private root-owned transaction
+files, whether deliberately or accidentally, in the narrow interval between
+completed leaf verification and the immediately following namespace syscall.
+This exception does not remove any required precondition revalidation,
+authenticated recovery, or durable ordering step.
 
 ### Narrow privileged activation component
 
@@ -159,8 +169,8 @@ Future implementation MUST preserve all of the following:
 7. The exact source state used to prepare the candidate must still be current
    at commit time.
 8. A stale source, concurrent/manual change, path or parent identity change,
-   symlink substitution, or unsupported metadata change causes fail-closed
-   rejection.
+   symlink substitution, or unsupported metadata change observable at a
+   required validation or recovery boundary causes fail-closed rejection.
 9. A prepared candidate is never automatically rebased or merged into newly
    changed operator configuration.
 10. The active file is never partially written, opened for writing, or
@@ -560,6 +570,12 @@ implementation review gate, not proven by this design. If it cannot prove
 that the operator's state is preserved across crashes and races, production
 activation remains disabled. Falling back to unchecked `os.replace` is not
 allowed.
+
+The root trust boundary above excludes equivalent-root racing of
+manager-private transaction leaves, whether deliberate or accidental, between
+a completed verification and its immediately following namespace syscall. It
+does not weaken the exchange protocol or its checks for observable manual
+changes to the active config.
 
 The transaction never automatically reparses a changed source and reapplies
 the requested operation. The caller must start over from a fresh read so an

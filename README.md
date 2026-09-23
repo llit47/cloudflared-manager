@@ -5,6 +5,13 @@ on an existing, locally operated Cloudflare Tunnel. The project is intended to
 coordinate ingress configuration, explicitly owned DNS routes, validation, and
 service activation without exposing the management UI through the tunnel.
 
+The management UI is intended for a trusted LAN or a private VPN/overlay
+network such as WireGuard or Tailscale; a private VPN may be treated
+operationally as an extension of the trusted LAN. Direct public Internet
+exposure of the UI is unsupported. An external authentication layer or reverse
+proxy does not change the trusted-host/root threat model or make Cloudflared
+Manager an Internet-facing zero-trust security boundary.
+
 ## Project status
 
 The project currently provides a runnable FastAPI service with typed settings,
