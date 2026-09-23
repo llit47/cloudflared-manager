@@ -251,6 +251,14 @@ class RecordingLock:
         self.entered.append(False)
 
 
+class RecordingActivationGate:
+    def __init__(self, entered: list[bool]) -> None:
+        self.entered = entered
+
+    def require_clean(self) -> None:
+        assert self.entered == [True]
+
+
 def test_stale_configurator_process_is_rejected_inside_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -269,6 +277,7 @@ def test_stale_configurator_process_is_rejected_inside_lock(
             return SHA
 
     monkeypatch.setattr(cli, "DeploymentLock", lambda path: RecordingLock(path, entered))
+    monkeypatch.setattr(cli, "ActivationRecoveryBarrier", lambda paths: RecordingActivationGate(entered))
     monkeypatch.setattr(cli, "ReleaseFilesystem", LockedFilesystem)
     monkeypatch.setattr(cli, "PROCESS_RELEASE_ID", OTHER_SHA)
 
@@ -319,6 +328,7 @@ def test_stale_updater_process_is_rejected_inside_lock(
     monkeypatch.setattr(cli, "SystemdManager", lambda: RuntimeService())
     monkeypatch.setattr(cli, "Updater", RecordingUpdater)
     monkeypatch.setattr(cli, "DeploymentLock", lambda path: RecordingLock(path, entered))
+    monkeypatch.setattr(cli, "ActivationRecoveryBarrier", lambda paths: RecordingActivationGate(entered))
     monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/curl")
     monkeypatch.setattr(cli, "PROCESS_RELEASE_ID", OTHER_SHA)
     monkeypatch.setattr(cli, "resolve_main_sha", unexpected_resolve)
@@ -362,6 +372,7 @@ def test_current_configurator_process_uses_normal_configuration_path(
     entered: list[bool] = []
 
     monkeypatch.setattr(cli, "DeploymentLock", lambda path: RecordingLock(path, entered))
+    monkeypatch.setattr(cli, "ActivationRecoveryBarrier", lambda paths: RecordingActivationGate(entered))
     monkeypatch.setattr(cli, "ReleaseFilesystem", lambda actual_paths: filesystem)
     monkeypatch.setattr(cli, "PROCESS_RELEASE_ID", SHA)
 

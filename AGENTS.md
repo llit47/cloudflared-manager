@@ -120,10 +120,14 @@ changes, configuration validation, and service restarts.
 - Treat the host administrator/root as part of the trusted computing base.
   Reject concurrent or manual changes observable at required validation and
   recovery boundaries; retain all crash-safety and fail-closed recovery checks.
-  Do not require protection against an independently acting process with
-  equivalent root privilege changing manager-private root-owned transaction
-  files, whether deliberately or accidentally, between completed leaf
-  verification and the immediately following namespace syscall.
+  Manager-private root-owned activation state (including candidates, backups,
+  journals, and staging artifacts) MUST NOT be concurrently manipulated by an
+  independent process with equivalent root privilege while activation or
+  recovery is running; such interference is outside the supported threat model,
+  whether deliberate or accidental. Observable inconsistent private state still
+  fails closed. This exception does not apply to the adopted active cloudflared
+  config: external operator edits remain supported interference and MUST be
+  detected at the required validation/recovery boundaries.
 - Preserve PR10's bounded/no-follow snapshots, round-trip structural checks,
   terminal catch-all, exclusive `0600` staging, fsync, retained candidate
   identity, layered parsing, and FD-bound cloudflared validation. Root privilege
