@@ -61,10 +61,13 @@ def test_baseline_and_new_process(service):
     assert parse_show(service._io.raw).settled
     baseline = observe(service)
     assert baseline.stable_milliseconds == 1000
+    witness = service.validate_restart(baseline)
+    assert (witness.main_pid, witness.process_start_ticks) == (42, 123)
+    service.confirm_restart_witness(witness)
     assert service.restart()
     service._io.raw = output(MainPID='43')
     service._io.identity = (124, 1, 2)
-    service.verify(baseline, activation=True)
+    service.verify(baseline, witness, activation=True)
 
 
 def test_queued_job_is_parsed_but_not_settled(service):
@@ -143,10 +146,42 @@ def test_unstable(service, changed):
 
 def test_exit_zero_is_not_verification(service):
     baseline = observe(service)
+    witness = service.validate_restart(baseline)
     assert service.restart()
+    service._io.raw = output(NRestarts='1')
     with pytest.raises(ServiceRefused):
-        service.verify(baseline, activation=True)
-    service.verify(baseline, activation=False)
+        service.verify(baseline, witness, activation=True)
+    with pytest.raises(ServiceRefused):
+        service.verify(baseline, witness, activation=False)
+
+
+@pytest.mark.parametrize('same', ['pid', 'start', 'both'])
+def test_restart_requires_new_pid_and_start_identity(service, same):
+    baseline = observe(service)
+    witness = service.validate_restart(baseline)
+    service._io.raw = output(MainPID='42' if same in {'pid', 'both'} else '43')
+    service._io.identity = (123 if same in {'start', 'both'} else 124, 1, 2)
+    with pytest.raises(ServiceRefused):
+        service.verify(baseline, witness, activation=False)
+
+
+def test_activation_still_requires_new_process_vs_precommit_baseline(service):
+    baseline = observe(service)
+    service._io.raw = output(MainPID='43')
+    service._io.identity = (124, 1, 2)
+    witness = service.validate_restart(baseline)
+    service._io.raw = output()
+    service._io.identity = (123, 1, 2)
+    with pytest.raises(ServiceRefused):
+        service.verify(baseline, witness, activation=True)
+
+
+def test_pre_restart_witness_rejects_intervening_process_change(service):
+    witness = service.validate_restart(observe(service))
+    service._io.raw = output(MainPID='43')
+    service._io.identity = (124, 1, 2)
+    with pytest.raises(ServiceRefused):
+        service.confirm_restart_witness(witness)
 
 
 def test_proc_start_parser():
@@ -303,7 +338,7 @@ def test_executable_changed_since_baseline(service):
     with pytest.raises(ServiceRefused):
         service.validate_restart(baseline)
     with pytest.raises(ServiceRefused):
-        service.verify(baseline, activation=False)
+        service.verify(baseline, baseline, activation=False)
 
 
 def test_private_observation_reprs_are_redacted():

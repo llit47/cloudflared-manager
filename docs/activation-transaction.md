@@ -857,6 +857,14 @@ published, the normal success path is:
 No service action may begin before its authorizing journal phase is durable and
 reverified.
 
+For each authorized restart, a strict stable observation records the running
+process immediately before that command. After filesystem reauthentication,
+the process witness is rechecked before dispatch. A successful command is
+verified only if the stable post-restart process has both a different MainPID
+and a different process-start identity from that witness. Activation also
+requires both to differ from the journaled precommit baseline. If no strict
+pre-command process witness can be established, no restart is issued.
+
 If the live post-exchange continuity observation fails for any reason, publish
 and reverify `ACTIVATION_FAILED` before considering rollback. While the service
 is unsettled, retain that phase and the candidate-active config without a
@@ -932,9 +940,11 @@ rules.
 
 ### Rollback service equivalence
 
-Rollback does not attempt to recreate the original PID. After the exact old
-config is restored and durable, `ROLLBACK_SERVICE` authorizes one fixed
-restart. Verified rollback requires a newly startup-ready, stable
+Rollback does not attempt to recreate the original precommit PID. After the
+exact old config is restored and durable, `ROLLBACK_SERVICE` authorizes one
+fixed restart. Its newly started process must differ from the process witnessed
+immediately before that specific restart, including on a recovery retry.
+Verified rollback requires a newly startup-ready, stable
 `cloudflared.service` with:
 
 - the same fixed unit identity and `Type=notify`;

@@ -42,6 +42,9 @@ class Baseline:
 
 class FakeService(Baseline):
     def validate_restart(self, baseline):
+        return baseline
+
+    def confirm_restart_witness(self, witness):
         pass
 
     def settled(self):
@@ -50,7 +53,7 @@ class FakeService(Baseline):
     def restart(self):
         return True
 
-    def verify(self, baseline, *, activation):
+    def verify(self, baseline, witness, *, activation):
         pass
 
 

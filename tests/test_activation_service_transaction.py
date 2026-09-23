@@ -39,8 +39,9 @@ class TransactionIO(IO):
         assert not (self.paths.config_root / 'activation-journal/journal.next').exists()
         self.actions.append(record.phase)
         outcome = self.outcomes.pop(0) if self.outcomes else 'success'
-        self.pid += 1
-        self.identity = (self.identity[0] + 1, 1, 2)
+        if outcome != 'success-unchanged':
+            self.pid += 1
+            self.identity = (self.identity[0] + 1, 1, 2)
         self.raw = self.healthy()
         if outcome == 'failed-health':
             self.raw = self.healthy(ActiveState='failed', SubState='failed')
@@ -78,16 +79,32 @@ def test_complete_success(full):
     assert engine.run(insert, validator=Validator()).code == 'COMMITTED_SUCCESS'
     assert b'new.example.com' in source.read_bytes()
     assert io.actions == ['SERVICE_ACTIVATING']
+    assert (io.pid, io.identity[0]) == (43, 124)
     clean(paths)
     assert engine.recover().code == 'NO_RECOVERY_REQUIRED'
 
 
-@pytest.mark.parametrize('failure', ['nonzero', 'timeout', 'failed-health'])
+@pytest.mark.parametrize('failure', ['nonzero', 'timeout'])
 def test_settled_failure_rolls_back_and_restarts(full, failure):
     source, paths, engine, io = full
     io.outcomes = [failure, 'success']
     assert engine.run(insert, validator=Validator()).code == 'FAILED_ROLLED_BACK'
     assert source.read_bytes() == _SOURCE
+    assert io.actions == ['SERVICE_ACTIVATING', 'ROLLBACK_SERVICE']
+    clean(paths)
+
+
+def test_failed_service_without_process_witness_retains_rollback_authority(full):
+    source, paths, engine, io = full
+    io.outcomes = ['failed-health', 'success']
+    with pytest.raises(ActivationError) as caught:
+        engine.run(insert, validator=Validator())
+    assert caught.value.code == 'RECOVERY_REQUIRED'
+    assert source.read_bytes() == _SOURCE
+    assert phase(paths) == 'ROLLBACK_SERVICE'
+    assert io.actions == ['SERVICE_ACTIVATING']
+    io.raw = io.healthy()
+    assert engine.recover().code == 'FAILED_ROLLED_BACK'
     assert io.actions == ['SERVICE_ACTIVATING', 'ROLLBACK_SERVICE']
     clean(paths)
 
@@ -99,8 +116,53 @@ def test_config_restored_service_failed_is_distinct(full, failure):
     assert engine.run(insert, validator=Validator()).code == 'CONFIG_RESTORED_SERVICE_RECOVERY_FAILED'
     assert source.read_bytes() == _SOURCE
     assert phase(paths) == 'ROLLBACK_SERVICE'
+    if failure == 'failed-health':
+        io.raw = io.healthy()
     assert engine.recover().code == 'FAILED_ROLLED_BACK'
     clean(paths)
+
+
+def test_rollback_restart_must_replace_process_before_verification(full):
+    source, paths, engine, io = full
+    io.outcomes = ['nonzero', 'success-unchanged', 'success']
+    assert engine.run(insert, validator=Validator()).code == 'CONFIG_RESTORED_SERVICE_RECOVERY_FAILED'
+    assert source.read_bytes() == _SOURCE
+    assert phase(paths) == 'ROLLBACK_SERVICE'
+    assert io.actions == ['SERVICE_ACTIVATING', 'ROLLBACK_SERVICE']
+    assert list((paths.config_root / 'activation-backups').iterdir())
+
+    assert engine.recover().code == 'FAILED_ROLLED_BACK'
+    assert io.actions == ['SERVICE_ACTIVATING', 'ROLLBACK_SERVICE', 'ROLLBACK_SERVICE']
+    clean(paths)
+
+
+def test_reissued_activation_restart_must_replace_current_process(full, monkeypatch):
+    source, paths, engine, io = full
+    original = JournalStore.publish
+    def crash_before_restart(self, record, **kwargs):
+        result = original(self, record, **kwargs)
+        if record.phase == 'SERVICE_ACTIVATING':
+            raise Crash()
+        return result
+    monkeypatch.setattr(JournalStore, 'publish', crash_before_restart)
+    with pytest.raises(Crash):
+        engine.run(insert, validator=Validator())
+
+    io.pid += 1
+    io.identity = (io.identity[0] + 1, 1, 2)
+    io.raw = io.healthy()
+    io.outcomes = ['success-unchanged']
+    def crash_after_failure(self, record, **kwargs):
+        result = original(self, record, **kwargs)
+        if record.phase == 'ACTIVATION_FAILED':
+            raise Crash()
+        return result
+    monkeypatch.setattr(JournalStore, 'publish', crash_after_failure)
+    with pytest.raises(Crash):
+        engine.recover()
+    assert phase(paths) == 'ACTIVATION_FAILED'
+    assert io.actions == ['SERVICE_ACTIVATING']
+    assert b'new.example.com' in source.read_bytes()
 
 
 @pytest.mark.parametrize('failure', ['timeout-transitional', 'nonzero-transitional', 'zero-transitional'])

@@ -11,8 +11,9 @@ class ServiceController(Protocol):
     def observe(self, *, adopted_fingerprint: str, source_digest: str) -> BaselineFacts: ...
     def settled(self) -> bool: ...
     def restart(self) -> bool: ...
-    def validate_restart(self, baseline: BaselineFacts) -> None: ...
-    def verify(self, baseline: BaselineFacts, *, activation: bool) -> None: ...
+    def validate_restart(self, baseline: BaselineFacts) -> BaselineFacts: ...
+    def confirm_restart_witness(self, witness: BaselineFacts) -> None: ...
+    def verify(self, baseline: BaselineFacts, witness: BaselineFacts, *, activation: bool) -> None: ...
 
 
 def resume_service(engine, record, journal, active, backups, active_name, *, recovery=False):
@@ -54,17 +55,18 @@ def resume_service(engine, record, journal, active, backups, active_name, *, rec
         rollback = record.phase == "ROLLBACK_SERVICE"
         if not engine.service.settled():
             return "RECOVERY_REQUIRED"
-        # Observation can take time. Authenticate config/authority again before
-        # the command, while the durably reverified phase remains authority.
-        engine.service.validate_restart(record.baseline)
+        # The stable witness can take time. Reauthenticate under the durable
+        # phase, then confirm that the same process remains before dispatch.
+        witness = engine.service.validate_restart(record.baseline)
         engine._authenticate(record, active, backups)
+        engine.service.confirm_restart_witness(witness)
         try:
             success = engine.service.restart() is True
         except Exception:
             success = False
         if success:
             try:
-                engine.service.verify(record.baseline, activation=not rollback)
+                engine.service.verify(record.baseline, witness, activation=not rollback)
             except Exception:
                 success = False
         if not success:
