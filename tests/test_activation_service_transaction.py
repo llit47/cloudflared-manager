@@ -235,6 +235,105 @@ def test_transitional_post_exchange_failure_waits_for_settlement(full, monkeypat
     clean(paths)
 
 
+def test_transitional_before_rollback_exchange_retains_intent(full, monkeypatch):
+    from cloudflared_manager.activation import transaction
+
+    source, paths, engine, io = full
+    io.outcomes = ['nonzero', 'success']
+    original_publish = JournalStore.publish
+    transition_pending = [True]
+    def become_transitional(self, record, **kwargs):
+        result = original_publish(self, record, **kwargs)
+        if record.phase == 'ROLLBACK_CONFIG' and transition_pending:
+            transition_pending.clear()
+            io.raw = io.healthy(ActiveState='activating', SubState='start')
+        return result
+    monkeypatch.setattr(JournalStore, 'publish', become_transitional)
+    original_exchange = transaction.exchange
+    exchanges = []
+    def tracked_exchange(*args, **kwargs):
+        exchanges.append(phase(paths))
+        return original_exchange(*args, **kwargs)
+    monkeypatch.setattr(transaction, 'exchange', tracked_exchange)
+
+    with pytest.raises(ActivationError) as caught:
+        engine.run(insert, validator=Validator())
+    assert caught.value.code == 'RECOVERY_REQUIRED'
+    record = JournalRecord.parse((paths.config_root / 'activation-journal/journal').read_bytes())
+    assert record.phase == 'ROLLBACK_CONFIG'
+    assert record.restoration is None
+    candidate = source.read_bytes()
+    assert b'new.example.com' in candidate
+    assert exchanges == ['CONFIG_COMMITTING']
+    assert io.actions == ['SERVICE_ACTIVATING']
+
+    for _ in range(2):
+        with pytest.raises(ActivationError) as caught:
+            engine.recover()
+        assert caught.value.code == 'RECOVERY_REQUIRED'
+        assert phase(paths) == 'ROLLBACK_CONFIG'
+        assert source.read_bytes() == candidate
+        assert exchanges == ['CONFIG_COMMITTING']
+        assert io.actions == ['SERVICE_ACTIVATING']
+
+    io.raw = io.healthy()
+    assert engine.recover().code == 'FAILED_ROLLED_BACK'
+    assert exchanges == ['CONFIG_COMMITTING', 'ROLLBACK_CONFIG']
+    assert source.read_bytes() == _SOURCE
+    assert io.actions == ['SERVICE_ACTIVATING', 'ROLLBACK_SERVICE']
+    clean(paths)
+
+
+def test_transitional_before_backup_restoration_exchange(full, monkeypatch):
+    from cloudflared_manager.activation import transaction
+
+    source, paths, engine, io = full
+    io.outcomes = ['nonzero', 'success']
+    original_publish = JournalStore.publish
+    def crash_after_failure(self, record, **kwargs):
+        result = original_publish(self, record, **kwargs)
+        if record.phase == 'ACTIVATION_FAILED':
+            raise Crash()
+        return result
+    monkeypatch.setattr(JournalStore, 'publish', crash_after_failure)
+    with pytest.raises(Crash):
+        engine.run(insert, validator=Validator())
+    record = JournalRecord.parse((paths.config_root / 'activation-journal/journal').read_bytes())
+    assert record.phase == 'ACTIVATION_FAILED'
+    (source.parent / record.candidate_name).unlink()
+
+    transition_pending = [True]
+    def become_transitional(self, record, **kwargs):
+        result = original_publish(self, record, **kwargs)
+        if record.phase == 'ROLLBACK_CONFIG' and transition_pending:
+            transition_pending.clear()
+            io.raw = io.healthy(ActiveState='activating', SubState='start')
+        return result
+    monkeypatch.setattr(JournalStore, 'publish', become_transitional)
+    original_exchange = transaction.exchange
+    exchanges = []
+    def tracked_exchange(*args, **kwargs):
+        exchanges.append(phase(paths))
+        return original_exchange(*args, **kwargs)
+    monkeypatch.setattr(transaction, 'exchange', tracked_exchange)
+
+    with pytest.raises(ActivationError) as caught:
+        engine.recover()
+    assert caught.value.code == 'RECOVERY_REQUIRED'
+    record = JournalRecord.parse((paths.config_root / 'activation-journal/journal').read_bytes())
+    assert record.phase == 'ROLLBACK_CONFIG' and record.restoration is not None
+    assert b'new.example.com' in source.read_bytes()
+    assert exchanges == []
+    assert io.actions == ['SERVICE_ACTIVATING']
+
+    io.raw = io.healthy()
+    assert engine.recover().code == 'FAILED_ROLLED_BACK'
+    assert exchanges == ['ROLLBACK_CONFIG']
+    assert source.read_bytes() == _SOURCE
+    assert io.actions == ['SERVICE_ACTIVATING', 'ROLLBACK_SERVICE']
+    clean(paths)
+
+
 def test_unavailable_post_exchange_observation_records_failure(full, monkeypatch):
     source, paths, engine, io = full
     original = JournalStore.publish

@@ -541,10 +541,11 @@ The localhost bind is deliberate. A production LAN bind must be explicitly
 configured during deployment; the manager must not be exposed through a public
 listener or Cloudflare Tunnel route.
 
-Cloudflared configuration mutation, DNS management, cloudflared service control,
-and managed-record ownership tracking remain deferred to later reviewed
-changes. The production adoption workflow is manager-configuration-only and
-strictly read-only toward cloudflared.
+Browser configuration mutation, DNS management, and managed-record ownership
+tracking remain deferred to later reviewed changes. The production adoption
+workflow is manager-configuration-only and strictly read-only toward
+cloudflared; the internal service activation transaction is not exposed through
+the dashboard or a supported activation CLI.
 
 ## Run tests
 

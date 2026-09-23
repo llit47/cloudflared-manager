@@ -528,6 +528,8 @@ class FilesystemActivation:
                                 exchanged=record.restoration is None,
                                 ctime_ns=(record.commit_ctimes[1] if record.restoration is None
                                           and record.commit_ctimes else None))
+        if not self.service.settled():
+            raise FilesystemRefused("RECOVERY_REQUIRED")
         exchange(active, active_name, target_name)
         self._require_source_at(active, active_name, record.restoration or record.source, exchanged=True)
         self._require_candidate(active, target_name, record.candidate, exchanged=True)
