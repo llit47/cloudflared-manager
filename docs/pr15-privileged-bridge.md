@@ -28,8 +28,11 @@ the capability bounding set and writable mount paths to those needed by the
 bridge. Sudo inherits those mount paths, so root recovery needs them writable.
 Before bridge installation, root checks the complete bounded
 `/etc/cloudflared` tree for unsafe ownership, modes, ACLs, and objects. The
-adoption path repeats that check; the production web entry point checks
-effective write access at startup. The adopted file cannot belong to the web
+check rejects every visible `system.*` xattr, including POSIX default ACLs
+on directories, so newly staged transaction objects cannot inherit a grant
+to the web account. A visible unsupported ACL or unreadable metadata fails
+closed. The adoption path repeats that check; the production web entry point
+checks effective write access at startup. The adopted file cannot belong to the web
 UID, and no object in the tree can grant it direct write access. The root-owned
 `/etc/cloudflared-manager` and `/run/cloudflared-manager` directories must
 remain `0750` and `0700`, respectively; root verifies the private environment

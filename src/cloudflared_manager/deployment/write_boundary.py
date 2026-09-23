@@ -167,10 +167,12 @@ def _no_acl_or_write(path: Path, info: os.stat_result, trusted_uid: int,
         raise HostOperationError("A writable-path object has unsafe ownership.")
     if info.st_mode & 0o022:
         raise HostOperationError("A writable-path object has unsafe permissions.")
+    # Includes POSIX access/default ACLs, NFSv4 ACLs, and rich ACL variants.
+    # A default ACL on a directory could grant writes to future children.
     if not probe_as_service and any(
-        name in {"system.posix_acl_access", "system.nfs4_acl"}
+        name.startswith("system.")
         for name in os.listxattr(path, follow_symlinks=False)
     ):
-        raise HostOperationError("A writable-path object has an unsupported ACL.")
+        raise HostOperationError("A writable-path object has unsupported system metadata.")
     if probe_as_service and os.access(path, os.W_OK):
         raise HostOperationError("The manager service can write a privileged path.")

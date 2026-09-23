@@ -78,6 +78,45 @@ def test_writable_privileged_object_fails_closed(boundary, target, mode):
         check(boundary)
 
 
+@pytest.mark.parametrize("target,attribute", [
+    ("cloudflared", "system.posix_acl_default"),
+    ("cloudflared", "system.posix_acl_access"),
+    ("cloudflared", "system.nfs4_acl"),
+    ("cloudflared", "system.richacl"),
+    ("cloudflared", "system.future_acl"),
+    ("nested", "system.posix_acl_default"),
+    ("config_root", "system.posix_acl_default"),
+    ("runtime_root", "system.posix_acl_default"),
+])
+def test_inheritable_and_other_system_acls_block_write_boundary(
+    boundary, monkeypatch, target, attribute,
+):
+    from cloudflared_manager.deployment import write_boundary
+    paths, cloudflared, config, _, root = boundary
+    nested = cloudflared / "nested"
+    nested.mkdir()
+    target_path = {
+        "cloudflared": cloudflared, "nested": nested,
+        "config_root": paths.config_root, "runtime_root": paths.runtime_root,
+    }[target]
+    original_listxattr = write_boundary.os.listxattr
+
+    def listxattr(path, *, follow_symlinks=True):
+        if Path(path) == target_path:
+            return [attribute]
+        return original_listxattr(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(write_boundary.os, "listxattr", listxattr)
+    with pytest.raises(HostOperationError):
+        check(boundary)
+    assert not (cloudflared / ".cfm-test-candidate").exists()
+    if target in {"cloudflared", "nested"}:
+        with pytest.raises(HostOperationError):
+            require_adopted_write_boundary(config, service_uid=os.getuid() + 1,
+                                           cloudflared_root=cloudflared,
+                                           trusted_uid=os.getuid(), anchor=root)
+
+
 def test_web_owned_adopted_file_fails_even_when_mode_has_no_write_bits(boundary):
     from cloudflared_manager.deployment.write_boundary import _no_acl_or_write
     _, _, config, _, _ = boundary
