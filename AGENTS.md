@@ -121,9 +121,9 @@ changes, configuration validation, and service restarts.
   Reject concurrent or manual changes observable at required validation and
   recovery boundaries; retain all crash-safety and fail-closed recovery checks.
   Do not require protection against an independently acting process with
-  equivalent root privilege deliberately changing manager-private root-owned
-  transaction files between completed leaf verification and the immediately
-  following namespace syscall.
+  equivalent root privilege changing manager-private root-owned transaction
+  files, whether deliberately or accidentally, between completed leaf
+  verification and the immediately following namespace syscall.
 - Preserve PR10's bounded/no-follow snapshots, round-trip structural checks,
   terminal catch-all, exclusive `0600` staging, fsync, retained candidate
   identity, layered parsing, and FD-bound cloudflared validation. Root privilege
