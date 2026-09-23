@@ -857,13 +857,14 @@ published, the normal success path is:
 No service action may begin before its authorizing journal phase is durable and
 reverified.
 
-For each authorized restart, a strict stable observation records the running
-process immediately before that command. After filesystem reauthentication,
-the process witness is rechecked before dispatch. A successful command is
-verified only if the stable post-restart process has both a different MainPID
-and a different process-start identity from that witness. Activation also
-requires both to differ from the journaled precommit baseline. If no strict
-pre-command process witness can be established, no restart is issued.
+For each authorized restart, a strict stable witness records either the running
+process or a settled `failed/failed` or `inactive/dead` unit with MainPID 0.
+After filesystem reauthentication, the witness is rechecked before dispatch.
+For a running witness, the stable post-restart process must have both a
+different MainPID and a different process-start identity. For a no-process
+witness, it must be healthy `active/running` with a valid positive process
+identity. Activation also requires both identities to differ from the journaled
+precommit baseline. A changed or unsupported witness prevents dispatch.
 
 If the live post-exchange continuity observation fails for any reason, publish
 and reverify `ACTIVATION_FAILED` before considering rollback. While the service
@@ -942,8 +943,9 @@ rules.
 
 Rollback does not attempt to recreate the original precommit PID. After the
 exact old config is restored and durable, `ROLLBACK_SERVICE` authorizes one
-fixed restart. Its newly started process must differ from the process witnessed
-immediately before that specific restart, including on a recovery retry.
+fixed restart. Its newly started process must differ from a running process
+witnessed immediately before that specific restart, including on a recovery
+retry; a settled no-process witness requires a new healthy process.
 Verified rollback requires a newly startup-ready, stable
 `cloudflared.service` with:
 

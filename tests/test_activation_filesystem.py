@@ -44,7 +44,7 @@ class FakeService(Baseline):
     def validate_restart(self, baseline):
         return baseline
 
-    def confirm_restart_witness(self, witness):
+    def confirm_restart_witness(self, baseline, witness):
         pass
 
     def settled(self):

@@ -63,7 +63,7 @@ def test_baseline_and_new_process(service):
     assert baseline.stable_milliseconds == 1000
     witness = service.validate_restart(baseline)
     assert (witness.main_pid, witness.process_start_ticks) == (42, 123)
-    service.confirm_restart_witness(witness)
+    service.confirm_restart_witness(baseline, witness)
     assert service.restart()
     service._io.raw = output(MainPID='43')
     service._io.identity = (124, 1, 2)
@@ -177,11 +177,33 @@ def test_activation_still_requires_new_process_vs_precommit_baseline(service):
 
 
 def test_pre_restart_witness_rejects_intervening_process_change(service):
-    witness = service.validate_restart(observe(service))
+    baseline = observe(service)
+    witness = service.validate_restart(baseline)
     service._io.raw = output(MainPID='43')
     service._io.identity = (124, 1, 2)
     with pytest.raises(ServiceRefused):
-        service.confirm_restart_witness(witness)
+        service.confirm_restart_witness(baseline, witness)
+
+
+@pytest.mark.parametrize('state, substate', [('failed', 'failed'), ('inactive', 'dead')])
+def test_settled_no_process_restart_witness(service, state, substate):
+    baseline = observe(service)
+    service._io.raw = output(ActiveState=state, SubState=substate, MainPID='0')
+    witness = service.validate_restart(baseline)
+    assert witness.main_pid is None and witness.process_start_ticks is None
+    service.confirm_restart_witness(baseline, witness)
+    service._io.raw = output(MainPID='43')
+    service._io.identity = (124, 1, 2)
+    service.verify(baseline, witness, activation=False)
+
+
+def test_no_process_witness_change_blocks_restart(service):
+    baseline = observe(service)
+    service._io.raw = output(ActiveState='failed', SubState='failed', MainPID='0')
+    witness = service.validate_restart(baseline)
+    service._io.raw = output(ActiveState='inactive', SubState='dead', MainPID='0')
+    with pytest.raises(ServiceRefused):
+        service.confirm_restart_witness(baseline, witness)
 
 
 def test_proc_start_parser():

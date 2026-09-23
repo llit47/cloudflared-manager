@@ -27,7 +27,8 @@ class TransactionIO(IO):
         self.forbid_observation = False
 
     def healthy(self, **kwargs):
-        return output(MainPID=str(self.pid), ExecStart=EXEC.replace('/private/config.yml', str(self.source)), **kwargs)
+        values = dict(MainPID=str(self.pid), ExecStart=EXEC.replace('/private/config.yml', str(self.source)))
+        return output(**(values | kwargs))
 
     def show(self):
         assert not self.forbid_observation, 'verified boundary must never reconsider live state'
@@ -44,7 +45,9 @@ class TransactionIO(IO):
             self.identity = (self.identity[0] + 1, 1, 2)
         self.raw = self.healthy()
         if outcome == 'failed-health':
-            self.raw = self.healthy(ActiveState='failed', SubState='failed')
+            self.raw = self.healthy(ActiveState='failed', SubState='failed', MainPID='0')
+        if outcome == 'inactive-no-process':
+            self.raw = self.healthy(ActiveState='inactive', SubState='dead', MainPID='0')
         if outcome in {'timeout-transitional', 'nonzero-transitional', 'zero-transitional'}:
             self.raw = self.healthy(ActiveState='activating', SubState='start')
         if outcome.startswith('timeout'):
@@ -84,27 +87,12 @@ def test_complete_success(full):
     assert engine.recover().code == 'NO_RECOVERY_REQUIRED'
 
 
-@pytest.mark.parametrize('failure', ['nonzero', 'timeout'])
+@pytest.mark.parametrize('failure', ['nonzero', 'timeout', 'failed-health', 'inactive-no-process'])
 def test_settled_failure_rolls_back_and_restarts(full, failure):
     source, paths, engine, io = full
     io.outcomes = [failure, 'success']
     assert engine.run(insert, validator=Validator()).code == 'FAILED_ROLLED_BACK'
     assert source.read_bytes() == _SOURCE
-    assert io.actions == ['SERVICE_ACTIVATING', 'ROLLBACK_SERVICE']
-    clean(paths)
-
-
-def test_failed_service_without_process_witness_retains_rollback_authority(full):
-    source, paths, engine, io = full
-    io.outcomes = ['failed-health', 'success']
-    with pytest.raises(ActivationError) as caught:
-        engine.run(insert, validator=Validator())
-    assert caught.value.code == 'RECOVERY_REQUIRED'
-    assert source.read_bytes() == _SOURCE
-    assert phase(paths) == 'ROLLBACK_SERVICE'
-    assert io.actions == ['SERVICE_ACTIVATING']
-    io.raw = io.healthy()
-    assert engine.recover().code == 'FAILED_ROLLED_BACK'
     assert io.actions == ['SERVICE_ACTIVATING', 'ROLLBACK_SERVICE']
     clean(paths)
 
@@ -116,8 +104,6 @@ def test_config_restored_service_failed_is_distinct(full, failure):
     assert engine.run(insert, validator=Validator()).code == 'CONFIG_RESTORED_SERVICE_RECOVERY_FAILED'
     assert source.read_bytes() == _SOURCE
     assert phase(paths) == 'ROLLBACK_SERVICE'
-    if failure == 'failed-health':
-        io.raw = io.healthy()
     assert engine.recover().code == 'FAILED_ROLLED_BACK'
     clean(paths)
 
@@ -162,6 +148,40 @@ def test_reissued_activation_restart_must_replace_current_process(full, monkeypa
         engine.recover()
     assert phase(paths) == 'ACTIVATION_FAILED'
     assert io.actions == ['SERVICE_ACTIVATING']
+    assert b'new.example.com' in source.read_bytes()
+
+
+def test_service_activating_recovery_restarts_settled_no_process(full, monkeypatch):
+    source, paths, engine, io = full
+    original = JournalStore.publish
+    def crash_before_restart(self, record, **kwargs):
+        result = original(self, record, **kwargs)
+        if record.phase == 'SERVICE_ACTIVATING':
+            raise Crash()
+        return result
+    monkeypatch.setattr(JournalStore, 'publish', crash_before_restart)
+    with pytest.raises(Crash):
+        engine.run(insert, validator=Validator())
+    monkeypatch.setattr(JournalStore, 'publish', original)
+    io.raw = io.healthy(ActiveState='failed', SubState='failed', MainPID='0')
+    assert engine.recover().code == 'COMMITTED_SUCCESS'
+    assert io.actions == ['SERVICE_ACTIVATING']
+    assert b'new.example.com' in source.read_bytes()
+    clean(paths)
+
+
+def test_restart_witness_change_before_dispatch_issues_no_command(full, monkeypatch):
+    source, paths, engine, io = full
+    original = engine.service.confirm_restart_witness
+    def changed(baseline, witness):
+        io.raw = io.healthy(ActiveState='inactive', SubState='dead', MainPID='0')
+        return original(baseline, witness)
+    monkeypatch.setattr(engine.service, 'confirm_restart_witness', changed)
+    with pytest.raises(ActivationError) as caught:
+        engine.run(insert, validator=Validator())
+    assert caught.value.code == 'RECOVERY_REQUIRED'
+    assert phase(paths) == 'SERVICE_ACTIVATING'
+    assert io.actions == []
     assert b'new.example.com' in source.read_bytes()
 
 

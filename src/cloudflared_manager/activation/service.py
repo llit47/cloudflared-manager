@@ -45,6 +45,18 @@ class Shape:
         ) in {("active", "running"), ("inactive", "dead"), ("failed", "failed")}
 
 
+@dataclass(frozen=True, repr=False)
+class RestartWitness:
+    active_state: str
+    sub_state: str
+    main_pid: int | None
+    process_start_ticks: int | None
+    restart_counter: int
+
+    def __repr__(self) -> str:
+        return "RestartWitness()"
+
+
 def parse_show(raw: bytes) -> Shape:
     try:
         if len(raw) > MAX_OBSERVATION_BYTES:
@@ -199,23 +211,54 @@ class StrictService:
         except Exception:
             return False
 
-    def validate_restart(self, baseline: BaselineFacts) -> BaselineFacts:
-        """Return a stable process witness for this authorized restart."""
+    def _restart_once(self, baseline: BaselineFacts) -> RestartWitness:
+        _, adopted = self._authority.current()
+        if hashlib.sha256(os.fsencode(adopted)).hexdigest() != baseline.adopted_fingerprint:
+            raise ServiceRefused()
+        shape = parse_show(self._io.show())
+        values = shape.values
+        command = parse_exec(values["ExecStart"])
+        if (not shape.settled or values["Type"] != "notify"
+            or self._io.canonical(command.config) != adopted
+            or self._io.executable(command.executable)
+            != (baseline.executable_device, baseline.executable_inode)):
+            raise ServiceRefused()
+        state = values["ActiveState"], values["SubState"]
+        pid = int(values["MainPID"])
+        ticks = None
+        if state == ("active", "running"):
+            if pid <= 0:
+                raise ServiceRefused()
+            process = self._io.process(pid, command.executable)
+            if process[1:] != (baseline.executable_device, baseline.executable_inode):
+                raise ServiceRefused()
+            ticks = process[0]
+        elif state not in {("failed", "failed"), ("inactive", "dead")} or pid != 0:
+            raise ServiceRefused()
+        if parse_show(self._io.show()) != shape:
+            raise ServiceRefused()
+        if ticks is not None and self._io.process(pid, command.executable) != process:
+            raise ServiceRefused()
+        return RestartWitness(*state, pid if ticks is not None else None, ticks,
+                              int(values["NRestarts"]))
+
+    def validate_restart(self, baseline: BaselineFacts) -> RestartWitness:
+        """Return a stable running or settled no-process restart witness."""
         try:
-            witness = self.observe(adopted_fingerprint=baseline.adopted_fingerprint,
-                                   source_digest=baseline.source_digest)
-            if ((witness.executable_device, witness.executable_inode)
-                != (baseline.executable_device, baseline.executable_inode)):
+            start = self._clock()
+            witness = self._restart_once(baseline)
+            self._sleep(STABILITY_SECONDS)
+            if (self._restart_once(baseline) != witness
+                or not STABILITY_SECONDS <= self._clock() - start <= 15):
                 raise ServiceRefused()
             return witness
         except Exception:
             raise ServiceRefused() from None
 
-    def confirm_restart_witness(self, witness: BaselineFacts) -> None:
+    def confirm_restart_witness(self, baseline: BaselineFacts, witness: RestartWitness) -> None:
         """Reject a process or loaded-target change after filesystem checks."""
         try:
-            current, _ = self._once(witness.adopted_fingerprint, witness.source_digest)
-            if current != witness:
+            if self._restart_once(baseline) != witness:
                 raise ServiceRefused()
         except Exception:
             raise ServiceRefused() from None
@@ -226,14 +269,15 @@ class StrictService:
         except Exception:
             return False
 
-    def verify(self, baseline: BaselineFacts, witness: BaselineFacts, *, activation: bool) -> None:
+    def verify(self, baseline: BaselineFacts, witness: RestartWitness, *, activation: bool) -> None:
         observed = self.observe(adopted_fingerprint=baseline.adopted_fingerprint,
                                 source_digest=baseline.source_digest)
         if ((observed.executable_device, observed.executable_inode)
             != (baseline.executable_device, baseline.executable_inode)):
             raise ServiceRefused()
-        if (observed.main_pid == witness.main_pid
-            or observed.process_start_ticks == witness.process_start_ticks):
+        if (witness.main_pid is not None
+            and (observed.main_pid == witness.main_pid
+                 or observed.process_start_ticks == witness.process_start_ticks)):
             raise ServiceRefused()
         if activation and (observed.main_pid == baseline.main_pid
                            or observed.process_start_ticks == baseline.process_start_ticks):
