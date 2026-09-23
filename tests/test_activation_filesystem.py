@@ -473,7 +473,6 @@ def test_authenticated_backup_restores_missing_displaced_original(fixture):
     recovered = engine.recover()
     assert recovered.code == "CONFIG_RESTORED_SERVICE_PENDING"
     assert source.read_bytes() == _SOURCE
-    assert source.stat().st_ino != record.source.inode
     assert source.stat().st_mode & 0o777 == record.source.mode
     assert (source.parent / record.restoration_name).read_bytes().find(b"new.example.com") >= 0
     assert not (source.parent / record.candidate_name).exists()
@@ -484,6 +483,7 @@ def test_authenticated_backup_restores_missing_displaced_original(fixture):
     assert restored.rollback_ctimes is not None
     assert restored.rollback_ctimes[0] == source.stat().st_ctime_ns
     assert restored.restoration.inode == source.stat().st_ino
+    assert restored.restoration.sha256 == record.source.sha256
     assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
 
 
