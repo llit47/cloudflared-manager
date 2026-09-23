@@ -112,9 +112,9 @@ operations, malformed or inconsistent recovery state, unprivileged symlink or
 path manipulation, and unauthorized writes by the non-root web service.
 
 The contract does not promise protection against an independent process with
-equivalent root privileges deliberately manipulating manager-private
-root-owned transaction files in the narrow interval between completed leaf
-verification and the immediately following namespace syscall. This exception
+equivalent root privileges manipulating manager-private root-owned transaction
+files, whether deliberately or accidentally, in the narrow interval between
+completed leaf verification and the immediately following namespace syscall. This exception
 does not remove any required precondition revalidation, authenticated
 recovery, or durable ordering step.
 
@@ -571,9 +571,9 @@ that the operator's state is preserved across crashes and races, production
 activation remains disabled. Falling back to unchecked `os.replace` is not
 allowed.
 
-The root trust boundary above excludes only deliberate equivalent-root racing
-of manager-private transaction leaves between a completed verification and
-its immediately following namespace syscall. It does not weaken the exchange
+The root trust boundary above excludes equivalent-root racing of
+manager-private transaction leaves, whether deliberate or accidental, between
+a completed verification and its immediately following namespace syscall. It does not weaken the exchange
 protocol or its checks for observable manual changes to the active config.
 
 The transaction never automatically reparses a changed source and reapplies
