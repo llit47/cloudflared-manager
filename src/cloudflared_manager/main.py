@@ -48,6 +48,13 @@ def run() -> None:
     import uvicorn
 
     settings = Settings.from_env()
+    if settings.mode == "production":
+        from cloudflared_manager.deployment.paths import DeploymentPaths
+        from cloudflared_manager.deployment.write_boundary import require_write_boundary
+        require_write_boundary(
+            DeploymentPaths(), adopted=settings.cloudflared_config_path,
+            probe_as_service=True,
+        )
     uvicorn.run(
         "cloudflared_manager.main:app",
         host=settings.bind_host,

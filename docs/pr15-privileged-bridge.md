@@ -25,7 +25,16 @@ release switching are root administrator operations. The manager service is
 previously configured `NoNewPrivileges=true`, which prevented a setuid sudo
 transition. PR15 sets it to `false`, keeps `RestrictSUIDSGID=true`, and limits
 the capability bounding set and writable mount paths to those needed by the
-bridge. `CAP_SYS_PTRACE` is included because PR14 reads
+bridge. Sudo inherits those mount paths, so root recovery needs them writable.
+Before bridge installation, root checks the complete bounded
+`/etc/cloudflared` tree for unsafe ownership, modes, ACLs, and objects. The
+adoption path repeats that check; the production web entry point checks
+effective write access at startup. The adopted file cannot belong to the web
+UID, and no object in the tree can grant it direct write access. The root-owned
+`/etc/cloudflared-manager` and `/run/cloudflared-manager` directories must
+remain `0750` and `0700`, respectively; root verifies the private environment
+file is `0600`. Unsafe state blocks installation, adoption, or startup.
+`CAP_SYS_PTRACE` is included because PR14 reads
 `/proc/<MainPID>/environ` and executable identity when cloudflared may run
 under a different UID; DAC override alone does not pass that ptrace read
 check. The service user still has no ambient capabilities and cannot write

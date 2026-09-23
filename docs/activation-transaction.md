@@ -1611,9 +1611,11 @@ The helper accepts at most 4096 bytes and a single version 1 JSON `recover`
 request, then calls the existing `FilesystemActivation.recover()` method. The
 helper does not expose `run()` or accept a mutation, path, unit, or command.
 Only a root-adopted config directly under `/etc/cloudflared` is eligible. The
-unit sandbox permits write access to that location and manager transaction
-state only after sudo has changed identity; the non-root account cannot write
-those paths by DAC. Recovery retains all PR12–PR14 journal, service readiness,
+unit sandbox includes writable mounts for that location and manager transaction
+state, inherited by sudo. The bridge installer, adoption command, and web
+startup fail closed unless ownership, modes, and effective DAC access deny
+the web account direct writes while retaining root recovery authority.
+Recovery retains all PR12–PR14 journal, service readiness,
 rollback, and fail-closed rules. Automated tests use fake root/service
 boundaries; a real host must verify sudo and systemd namespace behavior before
 relying on recovery.

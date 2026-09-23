@@ -47,7 +47,8 @@ def setup(tmp_path):
 
 def test_explicit_bridge_install_is_idempotent_and_restrictive(setup):
     paths, release, visudo = setup
-    installer = BridgeInstaller(paths, Filesystem(), visudo=visudo)
+    installer = BridgeInstaller(paths, Filesystem(), visudo=visudo,
+                                boundary_check=lambda paths: None)
     assert installer.install(release)
     assert paths.helper_path.stat().st_mode & 0o777 == 0o755
     assert paths.sudoers_path.stat().st_mode & 0o777 == 0o440
@@ -58,13 +59,26 @@ def test_bridge_install_rejects_symlink_target(setup):
     paths, release, visudo = setup
     paths.helper_path.symlink_to(release / "deploy/privileged-helper.sh")
     with pytest.raises(HostOperationError):
-        BridgeInstaller(paths, Filesystem(), visudo=visudo).install(release)
+        BridgeInstaller(paths, Filesystem(), visudo=visudo,
+                        boundary_check=lambda paths: None).install(release)
 
 
 def test_bridge_install_fails_before_install_when_visudo_unavailable(setup):
     paths, release, _ = setup
     with pytest.raises(HostOperationError):
-        BridgeInstaller(paths, Filesystem(), visudo=Path("/missing/visudo")).install(release)
+        BridgeInstaller(paths, Filesystem(), visudo=Path("/missing/visudo"),
+                        boundary_check=lambda paths: None).install(release)
+    assert not paths.helper_path.exists()
+    assert not paths.sudoers_path.exists()
+
+
+def test_bridge_install_rejects_unsafe_write_boundary_before_grant(setup):
+    paths, release, visudo = setup
+    def unsafe(_):
+        raise HostOperationError("unsafe write boundary")
+    with pytest.raises(HostOperationError, match="unsafe write boundary"):
+        BridgeInstaller(paths, Filesystem(), visudo=visudo,
+                        boundary_check=unsafe).install(release)
     assert not paths.helper_path.exists()
     assert not paths.sudoers_path.exists()
 

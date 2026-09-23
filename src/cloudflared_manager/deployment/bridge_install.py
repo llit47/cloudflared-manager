@@ -6,11 +6,15 @@ import os
 import stat
 import subprocess
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
+from cloudflared_manager.deployment.environment import read_environment, require_safe_environment
 from cloudflared_manager.deployment.errors import HostOperationError
 from cloudflared_manager.deployment.paths import DeploymentPaths
 from cloudflared_manager.deployment.release import ReleaseFilesystem
+from cloudflared_manager.deployment.settings import settings_from_document
+from cloudflared_manager.deployment.write_boundary import require_write_boundary
 
 _HELPER_ASSET = "deploy/privileged-helper.sh"
 _SUDOERS_ASSET = "deploy/cloudflared-manager-bridge.sudoers"
@@ -19,12 +23,15 @@ _VISUDO = Path("/usr/sbin/visudo")
 
 class BridgeInstaller:
     def __init__(self, paths: DeploymentPaths, filesystem: ReleaseFilesystem,
-                 *, visudo: Path = _VISUDO) -> None:
+                 *, visudo: Path = _VISUDO,
+                 boundary_check: Callable[[DeploymentPaths], None] | None = None) -> None:
         self.paths = paths
         self.filesystem = filesystem
         self.visudo = visudo
+        self.boundary_check = boundary_check or _production_boundary_check
 
     def install(self, release: Path) -> bool:
+        self.boundary_check(self.paths)
         self.filesystem.validate_deployment_assets(release)
         self._require_parent(self.paths.helper_path.parent)
         self._require_parent(self.paths.sudoers_path.parent)
@@ -84,3 +91,9 @@ class BridgeInstaller:
         finally:
             if name is not None:
                 os.unlink(name)
+
+
+def _production_boundary_check(paths: DeploymentPaths) -> None:
+    require_safe_environment(paths.environment_file, owner=(0, 0))
+    settings = settings_from_document(read_environment(paths.environment_file)[0])
+    require_write_boundary(paths, adopted=settings.cloudflared_config_path)

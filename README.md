@@ -173,8 +173,14 @@ only `CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_SETGID`,
 read check when `cloudflared.service` runs under another UID, so recovery needs
 `CAP_SYS_PTRACE` in the bounding set. The unit makes `/etc/cloudflared`,
 `/etc/cloudflared-manager`, and `/run/cloudflared-manager` writable in its mount
-namespace. The non-root
-process receives no ambient capabilities.
+namespace so the sudo child can recover. Before installing the bridge, root
+checks that these locations are not writable by the web account. Adoption
+checks the cloudflared tree; the production web entry point checks again at
+startup. The adopted file cannot be owned or writable by the manager account.
+The cloudflared directory and its contents cannot grant manager write access.
+Manager-private directories must be root-owned `0750` and `0700`, with a
+root-owned `0600` environment file. Unsafe or unverifiable permissions fail
+closed. The non-root process receives no ambient capabilities.
 
 `GET /healthz` is the minimal public monitoring endpoint. Its response contract
 remains exactly:
@@ -538,7 +544,8 @@ sudo cfm-config install-bridge
 ```
 
 This checks the active release identity, root-owned release assets and target
-directories, validates the policy with `/usr/sbin/visudo -cf`, then atomically
+directories, the writable mount paths, and the policy with
+`/usr/sbin/visudo -cf`, then atomically
 installs `/opt/cloudflared-manager/privileged-helper` as root `0755` and
 `/etc/sudoers.d/cloudflared-manager-bridge` as root `0440`. An ordinary install
 or update does not grant sudo. A missing `visudo`, unsafe collision, or stale
@@ -567,7 +574,11 @@ checks. A compromised web process can request repeated recovery attempts; it
 cannot supply a config mutation, destination, executable, service verb, or unit.
 The root administrator, root-owned installed release, sudoers policy, and
 existing cloudflared unit are trusted. The web service account must not own or
-write the installed helper, release, sudoers file, adopted config, or journal.
+write the installed helper, release, sudoers file, adopted config, its parent,
+or journal. Sudo inherits the service mount namespace, so the root helper
+uses the same writable mounts. DAC denies direct web writes while retaining
+root recovery. If permissions change after installation, startup fails closed;
+rerun bridge installation after correcting host ownership or modes.
 
 For privileged host verification, run
 `sudo visudo -cf /etc/sudoers.d/cloudflared-manager-bridge`, inspect ownership
