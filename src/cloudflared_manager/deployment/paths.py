@@ -19,6 +19,8 @@ class DeploymentPaths:
     config_link: Path = Path("/usr/local/sbin/cfm-config")
     runtime_root: Path = Path("/run/cloudflared-manager")
     sudoers_path: Path = Path("/etc/sudoers.d/cloudflared-manager-bridge")
+    tmpfiles_path: Path = Path("/etc/tmpfiles.d/cloudflared-manager.conf")
+    tmpfiles_executable: Path = Path("/usr/bin/systemd-tmpfiles")
 
     @property
     def helper_path(self) -> Path:

@@ -56,6 +56,7 @@ def _installed(
     release = filesystem.prepare_release(source, OLD_SHA, Path("/usr/bin/python3"))
     filesystem.switch_current(OLD_SHA)
     filesystem.install_unit(release)
+    filesystem.install_runtime_tmpfiles(release)
     if stable_administration:
         filesystem.install_stable_administration(release)
     atomic_write_environment(

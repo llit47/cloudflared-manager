@@ -32,6 +32,7 @@ class DeploymentReconciler:
 
     def reconcile(self, release: Path, settings: ManagerSettings) -> ReconcileResult:
         self.filesystem.validate_deployment_assets(release)
+        runtime_changed = self.filesystem.install_runtime_tmpfiles(release)
         unit_snapshot = self.filesystem.snapshot(self.filesystem.paths.unit_path)
         initial_runtime = self.service.runtime_state()
         was_active = initial_runtime.active
@@ -80,7 +81,7 @@ class DeploymentReconciler:
                 service_changed = True
             administration_changed = self.filesystem.install_stable_administration(release)
             return ReconcileResult(
-                changed=unit_changed or service_changed or administration_changed
+                changed=runtime_changed or unit_changed or service_changed or administration_changed
             )
         except Exception as error:
             rollback_errors: list[Exception] = [error] if isinstance(error, RollbackError) else []

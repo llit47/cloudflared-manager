@@ -34,6 +34,7 @@ def _archive(path: Path, *, unsafe_name: str | None = None) -> None:
     files = {
         "pyproject.toml": b"[project]\nname='test'\n",
         "deploy/cloudflared-manager.service": b"[Service]\n",
+        "deploy/cloudflared-manager.tmpfiles.conf": b"d /run/cloudflared-manager 0700 root root -\n",
         "deploy/update.sh": b"#!/bin/bash\n",
         "deploy/config.sh": b"#!/bin/bash\n",
         "src/cloudflared_manager/deployment/cli.py": b"# fixture\n",

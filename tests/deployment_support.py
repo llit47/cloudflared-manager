@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 from pathlib import Path
 
 from cloudflared_manager.deployment.paths import DeploymentPaths
@@ -25,14 +26,27 @@ def fake_readiness(
 
 
 def make_paths(root: Path) -> DeploymentPaths:
+    tmpfiles_executable = root / "usr" / "bin" / "systemd-tmpfiles"
+    tmpfiles_executable.parent.mkdir(parents=True, exist_ok=True)
+    runtime_root = root / "run" / "cloudflared-manager"
+    tmpfiles_executable.write_text(
+        "#!/bin/sh\n"
+        "[ \"$1\" = --create ] || exit 1\n"
+        f"mkdir -p -- {shlex.quote(str(runtime_root))}\n"
+        f"chmod 0700 -- {shlex.quote(str(runtime_root))}\n",
+        encoding="utf-8",
+    )
+    tmpfiles_executable.chmod(0o755)
     return DeploymentPaths(
         install_root=root / "opt" / "cloudflared-manager",
         config_root=root / "etc" / "cloudflared-manager",
         unit_path=root / "etc" / "systemd" / "system" / "cloudflared-manager.service",
         update_link=root / "usr" / "local" / "sbin" / "cfm-update",
         config_link=root / "usr" / "local" / "sbin" / "cfm-config",
-        runtime_root=root / "run" / "cloudflared-manager",
+        runtime_root=runtime_root,
         sudoers_path=root / "etc" / "sudoers.d" / "cloudflared-manager-bridge",
+        tmpfiles_path=root / "etc" / "tmpfiles.d" / "cloudflared-manager.conf",
+        tmpfiles_executable=tmpfiles_executable,
     )
 
 
@@ -47,6 +61,9 @@ def make_source(
     (source / "src" / "cloudflared_manager").mkdir(parents=True)
     (source / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="utf-8")
     (source / "deploy" / "cloudflared-manager.service").write_bytes(unit)
+    (source / "deploy" / "cloudflared-manager.tmpfiles.conf").write_text(
+        "d /run/cloudflared-manager 0700 root root -\n", encoding="ascii",
+    )
     (source / "deploy" / "update.sh").write_text(
         f"#!/bin/bash\n# {administration_version} update\n",
         encoding="utf-8",

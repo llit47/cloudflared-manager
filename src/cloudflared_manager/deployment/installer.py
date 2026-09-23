@@ -89,6 +89,7 @@ class Installer:
         self.filesystem.ensure_layout()
         release = self.filesystem.prepare_release(source, revision, python)
         self.filesystem.validate_deployment_assets(release)
+        self.filesystem.install_runtime_tmpfiles(release)
 
         environment_existed = (
             self.paths.environment_file.exists()

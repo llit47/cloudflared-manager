@@ -13,8 +13,20 @@ from tests.deployment_support import make_paths
 
 class Filesystem:
     owner = None
+    def __init__(self, paths):
+        self.paths = paths
     def validate_deployment_assets(self, release):
         pass
+    def install_runtime_tmpfiles(self, release):
+        target = self.paths.tmpfiles_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        content = (release / "deploy/cloudflared-manager.tmpfiles.conf").read_bytes()
+        changed = not target.exists() or target.read_bytes() != content or not self.paths.runtime_root.exists()
+        target.write_bytes(content)
+        target.chmod(0o644)
+        self.paths.runtime_root.mkdir(parents=True, exist_ok=True)
+        self.paths.runtime_root.chmod(0o700)
+        return changed
     def _validate_regular_asset(self, target, candidate, relative):
         if target.is_symlink():
             raise HostOperationError("unsafe")
@@ -37,6 +49,8 @@ def setup(tmp_path):
     (release / "deploy/privileged-helper.sh").write_text("#!/bin/bash\nexit 0\n")
     (release / "deploy/cloudflared-manager-bridge.sudoers").write_text(
         'cloudflared-manager ALL=(root) NOPASSWD: /opt/cloudflared-manager/privileged-helper ""\n')
+    (release / "deploy/cloudflared-manager.tmpfiles.conf").write_text(
+        "d /run/cloudflared-manager 0700 root root -\n")
     (release / "deploy/privileged-helper.sh").chmod(0o644)
     (release / "deploy/cloudflared-manager-bridge.sudoers").chmod(0o644)
     visudo = tmp_path / "visudo"
@@ -47,11 +61,13 @@ def setup(tmp_path):
 
 def test_explicit_bridge_install_is_idempotent_and_restrictive(setup):
     paths, release, visudo = setup
-    installer = BridgeInstaller(paths, Filesystem(), visudo=visudo,
+    installer = BridgeInstaller(paths, Filesystem(paths), visudo=visudo,
                                 boundary_check=lambda paths: None)
     assert installer.install(release)
     assert paths.helper_path.stat().st_mode & 0o777 == 0o755
     assert paths.sudoers_path.stat().st_mode & 0o777 == 0o440
+    assert paths.tmpfiles_path.read_text() == "d /run/cloudflared-manager 0700 root root -\n"
+    assert paths.runtime_root.stat().st_mode & 0o777 == 0o700
     assert not installer.install(release)
 
 
@@ -59,14 +75,14 @@ def test_bridge_install_rejects_symlink_target(setup):
     paths, release, visudo = setup
     paths.helper_path.symlink_to(release / "deploy/privileged-helper.sh")
     with pytest.raises(HostOperationError):
-        BridgeInstaller(paths, Filesystem(), visudo=visudo,
+        BridgeInstaller(paths, Filesystem(paths), visudo=visudo,
                         boundary_check=lambda paths: None).install(release)
 
 
 def test_bridge_install_fails_before_install_when_visudo_unavailable(setup):
     paths, release, _ = setup
     with pytest.raises(HostOperationError):
-        BridgeInstaller(paths, Filesystem(), visudo=Path("/missing/visudo"),
+        BridgeInstaller(paths, Filesystem(paths), visudo=Path("/missing/visudo"),
                         boundary_check=lambda paths: None).install(release)
     assert not paths.helper_path.exists()
     assert not paths.sudoers_path.exists()
@@ -77,7 +93,7 @@ def test_bridge_install_rejects_unsafe_write_boundary_before_grant(setup):
     def unsafe(_):
         raise HostOperationError("unsafe write boundary")
     with pytest.raises(HostOperationError, match="unsafe write boundary"):
-        BridgeInstaller(paths, Filesystem(), visudo=visudo,
+        BridgeInstaller(paths, Filesystem(paths), visudo=visudo,
                         boundary_check=unsafe).install(release)
     assert not paths.helper_path.exists()
     assert not paths.sudoers_path.exists()

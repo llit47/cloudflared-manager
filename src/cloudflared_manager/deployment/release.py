@@ -27,6 +27,8 @@ READY_MARKER = ".release-ready"
 INCOMPLETE_MARKER = ".release-incomplete"
 DEPLOYMENT_MARKER = ".cloudflared-manager-owned"
 DEPLOYMENT_MARKER_CONTENT = b"cloudflared-manager deployment v1\n"
+_TMPFILES_ASSET = "deploy/cloudflared-manager.tmpfiles.conf"
+_TMPFILES_RULE = b"d /run/cloudflared-manager 0700 root root -\n"
 
 
 class ProcessRunner(Protocol):
@@ -330,12 +332,72 @@ class ReleaseFilesystem:
         self.atomic_write(self.paths.unit_path, content, 0o644)
         return True
 
+    def install_runtime_tmpfiles(self, release: Path) -> bool:
+        """Install the fixed boot rule and apply it before starting the service."""
+
+        self.require_owned_layout()
+        self._require_ready_release(release)
+        source = release / _TMPFILES_ASSET
+        if not source.exists() and not source.is_symlink():
+            if b"/run/cloudflared-manager" in (release / "deploy/cloudflared-manager.service").read_bytes():
+                raise HostOperationError("The release lacks its required runtime directory rule.")
+            return False
+        if source.read_bytes() != _TMPFILES_RULE:
+            raise HostOperationError("The release has an unsafe runtime directory rule.")
+        target = self.paths.tmpfiles_path
+        self._ensure_system_directory(target.parent)
+        parent = target.parent.lstat()
+        if (parent.st_mode & 0o022 or (self.owner is not None
+            and (parent.st_uid, parent.st_gid) != self.owner)):
+            raise HostOperationError("The tmpfiles configuration directory is unsafe.")
+        self._validate_regular_asset(target, _TMPFILES_RULE, _TMPFILES_ASSET)
+        self._ensure_system_directory(self.paths.runtime_root.parent)
+        existed = self._require_safe_runtime_root(required=False)
+        changed = not self._regular_asset_matches(target, _TMPFILES_RULE, 0o644)
+        if changed:
+            self.atomic_write(target, _TMPFILES_RULE, 0o644)
+        try:
+            result = subprocess.run(
+                [str(self.paths.tmpfiles_executable), "--create", str(target)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=10, check=False, shell=False,
+                env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            raise HostOperationError("The runtime directory could not be created.") from None
+        if result.returncode != 0:
+            raise HostOperationError("The runtime directory could not be created.")
+        self._require_safe_runtime_root(required=True)
+        return changed or not existed
+
+    def _require_safe_runtime_root(self, *, required: bool) -> bool:
+        path = self.paths.runtime_root
+        parent = path.parent.lstat()
+        if (not stat.S_ISDIR(parent.st_mode) or parent.st_mode & 0o022
+            or (self.owner is not None and (parent.st_uid, parent.st_gid) != self.owner)):
+            raise HostOperationError("The runtime directory parent is unsafe.")
+        if not path.exists() and not path.is_symlink():
+            if required:
+                raise HostOperationError("The runtime directory is unavailable.")
+            return False
+        info = path.lstat()
+        try:
+            unsupported = any(name.startswith("system.")
+                              for name in os.listxattr(path, follow_symlinks=False))
+        except OSError:
+            raise HostOperationError("The runtime directory metadata is unavailable.") from None
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700
+            or (self.owner is not None and (info.st_uid, info.st_gid) != self.owner)
+            or unsupported):
+            raise HostOperationError("The runtime directory is unsafe.")
+        return True
+
     def validate_deployment_assets(self, release: Path) -> None:
         """Preflight every external manager-owned path before mutating any of them."""
 
         self.require_owned_layout()
         self._require_ready_release(release)
-        candidates = (
+        candidates = [
             (
                 self.paths.unit_path,
                 release / "deploy" / "cloudflared-manager.service",
@@ -343,7 +405,12 @@ class ReleaseFilesystem:
             ),
             (self.paths.stable_update, release / "deploy" / "update.sh", "deploy/update.sh"),
             (self.paths.stable_config, release / "deploy" / "config.sh", "deploy/config.sh"),
-        )
+        ]
+        tmpfiles_source = release / _TMPFILES_ASSET
+        if tmpfiles_source.exists() or tmpfiles_source.is_symlink():
+            candidates.append((self.paths.tmpfiles_path, tmpfiles_source, _TMPFILES_ASSET))
+        elif b"/run/cloudflared-manager" in (release / "deploy/cloudflared-manager.service").read_bytes():
+            raise HostOperationError("The release lacks its required runtime directory rule.")
         for target, candidate, relative in candidates:
             self._validate_regular_asset(target, candidate.read_bytes(), relative)
         self._validate_command_link(self.paths.update_link, self.paths.stable_update)
@@ -603,6 +670,7 @@ class ReleaseFilesystem:
         for relative in (
             "pyproject.toml",
             "deploy/cloudflared-manager.service",
+            _TMPFILES_ASSET,
             "deploy/update.sh",
             "deploy/config.sh",
         ):

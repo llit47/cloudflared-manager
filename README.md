@@ -182,6 +182,14 @@ Manager-private directories must be root-owned `0750` and `0700`, with a
 root-owned `0600` environment file. Unsafe or unverifiable permissions fail
 closed. The non-root process receives no ambient capabilities.
 
+Installation places `/etc/tmpfiles.d/cloudflared-manager.conf` with the fixed
+`d /run/cloudflared-manager 0700 root root -` rule. The system
+`systemd-tmpfiles-setup.service` applies it after `/run` is cleared at boot.
+Install, update, reconciliation, and explicit bridge installation also run
+`/usr/bin/systemd-tmpfiles --create` for this one file immediately, then
+verify the root-owned `0700` directory. An unsafe existing directory is
+rejected before tmpfiles can change it; the web startup check stays strict.
+
 `GET /healthz` is the minimal public monitoring endpoint. Its response contract
 remains exactly:
 
@@ -544,7 +552,8 @@ sudo cfm-config install-bridge
 ```
 
 This checks the active release identity, root-owned release assets and target
-directories, the writable mount paths, and the policy with
+directories, installs and applies the fixed runtime tmpfiles rule, verifies
+the writable mount paths, and validates the policy with
 `/usr/sbin/visudo -cf`, then atomically
 installs `/opt/cloudflared-manager/privileged-helper` as root `0755` and
 `/etc/sudoers.d/cloudflared-manager-bridge` as root `0440`. An ordinary install
@@ -582,7 +591,10 @@ rerun bridge installation after correcting host ownership or modes.
 
 For privileged host verification, run
 `sudo visudo -cf /etc/sudoers.d/cloudflared-manager-bridge`, inspect ownership
-and modes with `stat`, and send the version 1 recovery JSON through
+and modes with `stat`, confirm the tmpfiles rule with
+`cat /etc/tmpfiles.d/cloudflared-manager.conf`, and verify
+`stat -c '%U:%G %a' /run/cloudflared-manager` reports `root:root 700`.
+Then send the version 1 recovery JSON through
 `sudo -n -u cloudflared-manager /usr/bin/sudo -n /opt/cloudflared-manager/privileged-helper`
 on a clean, adopted test host. A successful result has code
 `NO_RECOVERY_REQUIRED`. Verify that adding an argument is denied and malformed

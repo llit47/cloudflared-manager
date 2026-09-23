@@ -37,6 +37,7 @@ def installed(tmp_path):
         fs.prepare_release(make_source(tmp_path / sha), sha, PYTHON)
     fs.switch_current(A)
     fs.install_unit(paths.release(A))
+    fs.install_runtime_tmpfiles(paths.release(A))
     fs.install_stable_administration(paths.release(A))
     atomic_write_environment(paths.environment_file, initial_environment(SETTINGS.bind_host, 8000), owner=None)
 

@@ -40,6 +40,7 @@ def installed(tmp_path: Path) -> tuple[ReleaseFilesystem, Path]:
     )
     filesystem.switch_current(A_SHA)
     filesystem.install_unit(release)
+    filesystem.install_runtime_tmpfiles(release)
     filesystem.install_stable_administration(release)
     atomic_write_environment(
         paths.environment_file, initial_environment("192.168.1.20", 8000), owner=None

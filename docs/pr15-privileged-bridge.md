@@ -64,5 +64,9 @@ or select another privileged action.
   `cfm-config install-bridge` validates and installs both assets explicitly.
 - `deploy/cloudflared-manager.service` permits the sudo transition within a
   bounded capability and mount namespace.
+- `deploy/cloudflared-manager.tmpfiles.conf` recreates root-owned `0700`
+  `/run/cloudflared-manager` through systemd-tmpfiles at boot. Install, update,
+  reconciliation, and bridge installation apply the fixed rule immediately
+  and reject unsafe pre-existing runtime metadata before applying it.
 - Deterministic tests use fake service boundaries and temporary paths. Manual
   host verification is described in the README.

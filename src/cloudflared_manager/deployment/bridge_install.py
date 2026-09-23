@@ -31,8 +31,9 @@ class BridgeInstaller:
         self.boundary_check = boundary_check or _production_boundary_check
 
     def install(self, release: Path) -> bool:
-        self.boundary_check(self.paths)
         self.filesystem.validate_deployment_assets(release)
+        runtime_changed = self.filesystem.install_runtime_tmpfiles(release)
+        self.boundary_check(self.paths)
         self._require_parent(self.paths.helper_path.parent)
         self._require_parent(self.paths.sudoers_path.parent)
         helper = self._source(release / _HELPER_ASSET)
@@ -46,7 +47,7 @@ class BridgeInstaller:
             self.filesystem.atomic_write(self.paths.helper_path, helper, 0o755)
         if sudoers_changed:
             self.filesystem.atomic_write(self.paths.sudoers_path, sudoers, 0o440)
-        return helper_changed or sudoers_changed
+        return runtime_changed or helper_changed or sudoers_changed
 
     def _source(self, path: Path) -> bytes:
         try:
