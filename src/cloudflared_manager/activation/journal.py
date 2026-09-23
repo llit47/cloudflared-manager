@@ -59,7 +59,7 @@ def _parse_ctimes(value: object) -> tuple[int, int] | None:
 
 @dataclass(frozen=True, slots=True)
 class BaselineFacts:
-    """Sanitized evidence supplied by a future independently verified service gate."""
+    """Sanitized evidence supplied by the independently verified service gate."""
 
     unit: str
     load_state: str

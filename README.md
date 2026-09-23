@@ -472,7 +472,8 @@ Candidate preparation follows this bounded sequence:
    Candidate bytes and source identity are checked around validation, and any
    failed preparation removes its candidate.
 5. Return either an explicit no-op or a validated, disposable candidate. Stop
-   there: no code can activate the candidate in this release.
+   there in the candidate preparation API. The separate internal activation
+   transaction is described below.
 
 Raw YAML, local config paths, validator output, and credential-bearing values
 are not added to browser models or safe exception messages. Normal dashboard
@@ -480,25 +481,43 @@ requests do not create or validate candidates, and the installed service stays
 unprivileged. `cloudflared.service` is never restarted, reloaded, started, or
 stopped by this foundation.
 
-The next activation-focused change must introduce and review a narrow
-privileged boundary; revalidate the adopted path at mutation time; reject stale
-or concurrent source changes; preserve exact owner, group, and mode; back up
-the exact previous bytes; use same-filesystem atomic activation with file and
-directory `fsync`; restart or reload cloudflared and verify process/service
-readiness; and roll back on activation failure while proving that the previous
-working state was restored. A simple backup copy followed by
-`os.replace(candidate, config)` is not treated as a sufficient transaction.
-None of those activation, backup, rollback, service-control, sudoers, systemd
-privilege, permission-broadening, or production write concerns is implemented
-here. Cloudflare API and DNS mutation also remain unimplemented.
+PR12 and PR14 provide a separate **internal, unwired** activation transaction.
+There is no supported activation CLI, web mutation route, or web-to-root
+transport. Deployment does not grant the web service config or service-control
+permissions.
 
-The design contract for that future work is
-[`docs/activation-transaction.md`](docs/activation-transaction.md). It defines
-the trust boundary, stale-write and race requirements, transaction state
-machine, metadata and durability rules, minimal crash journal, service/readiness
-verification, rollback outcomes, phased implementation plan, and adversarial
-test matrix. The document is a design only: it does not enable config writes,
-privilege, service control, HTTP mutations, or DNS/API behavior.
+The internal transaction extends PR12's authenticated atomic config exchange,
+exact backup, durable journal, rollback, and recovery barrier with PR14's strict
+Linux/systemd service observer. It supports only an already healthy
+`cloudflared.service`, `Type=notify`, and an explicit local `--config` resolving
+to the root-adopted config. The sole service mutation is a fixed restart.
+Success requires a new stable process, executable/config identity checks, and
+authenticated cleanup with durable journal retirement. A failed activation
+restores the exact old config and verifies a rollback restart. Transitional
+systemd jobs retain recovery authority without racing config restoration.
+Durable service-verification phases proceed only to cleanup on recovery; later
+runtime outages never reopen rollback selection.
+
+The implementation currently requires canonical, regular, root-owned
+executables with trusted non-writable ancestry, including fixed
+`/usr/bin/systemctl`. Symlink executable paths fail closed. Loaded `ExecStart`
+must be a single, unescaped command using `tunnel run`, explicit `--config`
+(`--config=...` is also accepted), and optionally `--no-autoupdate`. Unknown
+flags, quoted/escaped arguments, token environment overrides, remote-managed
+execution, and pending unit reloads fail closed. Observations capture at most
+64 KiB, use a five-second command deadline, and compare consistent observations
+across a fixed one-second stability interval. Restart has a thirty-second
+command deadline. These bounds are internal constants, not caller options.
+Readiness follows systemd notify startup plus stable process observations;
+it does not promise continuous Cloudflare connectivity or invent a metrics
+endpoint.
+
+The normative contract is
+[`docs/activation-transaction.md`](docs/activation-transaction.md). All automated
+activation tests use temporary configs and fake service/process boundaries.
+Host systemd/cloudflared integration has not been exercised by these tests.
+Cloudflare API/DNS mutations and application mutation authorization remain
+separate future work.
 
 ## Run the development server
 

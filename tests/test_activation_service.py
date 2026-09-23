@@ -31,6 +31,8 @@ class IO:
         return path
     def process(self, pid, executable):
         return self.identity
+    def executable(self, path):
+        return self.identity[1:]
     def restart(self):
         self.calls += 1
         return True
@@ -194,3 +196,146 @@ def test_clock_cannot_claim_unobserved_stability(service):
     service._sleep = lambda seconds: None
     with pytest.raises(ServiceRefused):
         observe(service)
+
+
+@pytest.mark.parametrize('case', ['good', 'wrong-exe', 'token-env', 'oversized-env', 'bad-stat', 'pid-reuse'])
+def test_proc_io_is_bounded_and_binds_executable(tmp_path, monkeypatch, case):
+    import os
+    from contextlib import contextmanager
+    from cloudflared_manager.activation import service_io
+    raw = b'42 (cloudflared) S ' + b'0 ' * 18 + b'123 0 0'
+    (tmp_path / 'stat').write_bytes(raw if case != 'bad-stat' else b'secret')
+    (tmp_path / 'environ').write_bytes(b'TUNNEL_TOKEN=secret\0' if case == 'token-env' else
+                                      b'x' * 65537 if case == 'oversized-env' else b'LANG=C\0')
+    (tmp_path / 'exe').write_bytes(b'binary')
+    info = (tmp_path / 'exe').stat()
+    @contextmanager
+    def executable(path):
+        yield 999, (info.st_dev, info.st_ino + (case == 'wrong-exe'))
+    real_open = os.open
+    def proc_open(path, *args, **kwargs):
+        if path == '/proc/42':
+            path = tmp_path
+        return real_open(path, *args, **kwargs)
+    original_read = service_io._read_proc
+    reads = 0
+    def read(directory, leaf, limit):
+        nonlocal reads
+        data = original_read(directory, leaf, limit)
+        if leaf == 'stat':
+            reads += 1
+            if case == 'pid-reuse' and reads == 2:
+                data = data.replace(b'123', b'124')
+        return data
+    monkeypatch.setattr(service_io, 'verified_executable', executable)
+    monkeypatch.setattr(service_io.os, 'open', proc_open)
+    monkeypatch.setattr(service_io, '_read_proc', read)
+    io = service_io.LinuxServiceIO()
+    if case == 'good':
+        assert io.process(42, Path('/usr/bin/cloudflared')) == (123, info.st_dev, info.st_ino)
+    else:
+        with pytest.raises(ServiceRefused) as caught:
+            io.process(42, Path('/usr/bin/cloudflared'))
+        assert 'secret' not in repr(caught.value)
+
+
+def test_bounded_restart_timeout_kills_only_command_client(monkeypatch):
+    import os
+    from contextlib import contextmanager
+    from cloudflared_manager.activation import service_io
+    read_fd, write_fd = os.pipe()
+    class Process:
+        stdout = os.fdopen(read_fd, 'rb')
+        killed = False
+        def poll(self):
+            return None
+        def kill(self):
+            self.killed = True
+        def wait(self, timeout):
+            assert timeout <= 5
+            return -9
+    process = Process()
+    @contextmanager
+    def executable(path):
+        yield 999, (1, 2)
+    times = iter([0, 31])
+    monkeypatch.setattr(service_io, 'verified_executable', executable)
+    monkeypatch.setattr(service_io.subprocess, 'Popen', lambda *args, **kwargs: process)
+    monkeypatch.setattr(service_io.time, 'monotonic', lambda: next(times))
+    try:
+        with pytest.raises(ServiceRefused):
+            service_io.LinuxServiceIO().restart()
+        assert process.killed
+        assert process.stdout.closed
+    finally:
+        os.close(write_fd)
+
+
+@pytest.mark.parametrize('change', [dict(Type='simple'), dict(ExecStart=EXEC.replace('tunnel run', 'tunnel run --token secret')),
+                                   dict(ExecStart=EXEC.replace('/private/config.yml', '/other'))])
+def test_changed_target_refused_before_restart(service, change):
+    baseline = observe(service)
+    service._io.raw = output(**change)
+    with pytest.raises(ServiceRefused):
+        service.validate_restart(baseline)
+    assert service._io.calls == 0
+
+
+def test_executable_changed_since_baseline(service):
+    baseline = observe(service)
+    service._io.identity = (124, 1, 3)
+    with pytest.raises(ServiceRefused):
+        service.validate_restart(baseline)
+    with pytest.raises(ServiceRefused):
+        service.verify(baseline, activation=False)
+
+
+def test_private_observation_reprs_are_redacted():
+    assert repr(parse_show(output())) == 'Shape()'
+    assert repr(parse_exec(EXEC)) == 'ExecFacts()'
+
+
+@pytest.mark.parametrize('case', ['good', 'symlink', 'writable', 'setuid', 'not-executable', 'hardlink', 'non-root'])
+def test_verified_executable_policy(tmp_path, monkeypatch, case):
+    import os
+    from contextlib import contextmanager
+    from cloudflared_manager.activation import service_io
+    executable = tmp_path / 'systemctl'
+    executable.write_bytes(b'fake executable')
+    executable.chmod(0o755)
+    if case == 'symlink':
+        link = tmp_path / 'alias'
+        link.symlink_to(executable)
+        executable = link
+    elif case == 'writable':
+        executable.chmod(0o775)
+    elif case == 'setuid':
+        executable.chmod(0o4755)
+    elif case == 'not-executable':
+        executable.chmod(0o644)
+    elif case == 'hardlink':
+        os.link(executable, tmp_path / 'hardlink')
+    class Directory:
+        def __init__(self, path):
+            self.fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        def revalidate(self):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            os.close(self.fd)
+    real_fstat, real_stat = os.fstat, os.stat
+    def root_stat(info):
+        values = list(info)
+        values[4] = 1000 if case == 'non-root' else 0
+        return os.stat_result(values)
+    monkeypatch.setattr(service_io, 'PinnedDirectory', Directory)
+    monkeypatch.setattr(service_io.os, 'fstat', lambda fd: root_stat(real_fstat(fd)))
+    monkeypatch.setattr(service_io.os, 'stat', lambda *a, **kw: root_stat(real_stat(*a, **kw)))
+    if case == 'good':
+        with service_io.verified_executable(executable) as (fd, identity):
+            assert identity == (real_fstat(fd).st_dev, real_fstat(fd).st_ino)
+    else:
+        with pytest.raises(ServiceRefused):
+            with service_io.verified_executable(executable):
+                pytest.fail('unsafe executable accepted')

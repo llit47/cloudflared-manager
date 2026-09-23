@@ -127,6 +127,7 @@ class FilesystemActivation:
                     backup_facts: FileFacts | None = None
                     record: JournalRecord | None = None
                     original: str | None = None
+                    service_phase = False
                     transaction_id = secrets.token_hex(16)
                     try:
                         snapshot = prepared.source
@@ -171,9 +172,15 @@ class FilesystemActivation:
                         record = journal.publish(record.successor("CONFIG_COMMITTED",
                                                                   commit_ctimes=commit_ctimes),
                                                  authenticate=lambda item: self._authenticate(item, active, backups))
+                        service_phase = True
                         return FilesystemResult(self._resume_service(
                             record, journal, active, backups, adopted.name), transaction_id)
                     except Exception as error:
+                        if service_phase:
+                            # Never retry or select rollback after a failed service-
+                            # phase publication in the same invocation. Recovery
+                            # must establish durable authority afresh.
+                            raise ActivationError("RECOVERY_REQUIRED", original=_failure_code(error)) from None
                         original = (
                             error.original_code
                             if isinstance(error, FilesystemRefused) and error.original_code is not None

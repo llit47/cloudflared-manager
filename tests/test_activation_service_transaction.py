@@ -227,3 +227,114 @@ def test_changed_active_after_service_verified_preserved(full, monkeypatch):
         engine.recover()
     assert io.actions == before
     assert source.read_bytes() == b'operator config'
+
+
+@pytest.mark.parametrize('target', ['SERVICE_ACTIVATING', 'SERVICE_VERIFIED', 'ROLLBACK_SERVICE',
+                                    'ROLLBACK_VERIFIED', 'COMMIT_CLEANUP_PENDING', 'ROLLBACK_CLEANUP_PENDING'])
+@pytest.mark.parametrize('after', [False, True])
+def test_publication_failure_stops_without_dependent_action(full, monkeypatch, target, after):
+    source, paths, engine, io = full
+    if target.startswith('ROLLBACK'):
+        io.outcomes = ['nonzero']
+    original = JournalStore.publish
+    actions_at_failure = []
+    def fail(self, record, **kwargs):
+        if record.phase == target:
+            if after:
+                original(self, record, **kwargs)
+            actions_at_failure[:] = io.actions
+            raise OSError('secret path')
+        return original(self, record, **kwargs)
+    monkeypatch.setattr(JournalStore, 'publish', fail)
+    with pytest.raises(ActivationError) as caught:
+        engine.run(insert, validator=Validator())
+    assert caught.value.code == 'RECOVERY_REQUIRED'
+    assert 'secret' not in repr(caught.value)
+    assert io.actions == actions_at_failure
+    assert list((paths.config_root / 'activation-backups').iterdir())
+    monkeypatch.setattr(JournalStore, 'publish', original)
+    assert engine.recover().code in {'COMMITTED_SUCCESS', 'FAILED_ROLLED_BACK'}
+    clean(paths)
+
+
+def test_recovery_never_restarts_changed_loaded_target(full, monkeypatch):
+    source, paths, engine, io = full
+    original = JournalStore.publish
+    def crash(self, record, **kwargs):
+        result = original(self, record, **kwargs)
+        if record.phase == 'SERVICE_ACTIVATING':
+            raise Crash()
+        return result
+    monkeypatch.setattr(JournalStore, 'publish', crash)
+    with pytest.raises(Crash):
+        engine.run(insert, validator=Validator())
+    monkeypatch.setattr(JournalStore, 'publish', original)
+    io.raw = io.raw.replace(b'tunnel run', b'tunnel run --token secret')
+    with pytest.raises(ActivationError):
+        engine.recover()
+    assert io.actions == []
+    assert phase(paths) == 'SERVICE_ACTIVATING'
+    assert b'new.example.com' in source.read_bytes()
+
+
+def test_baseline_change_before_exchange_has_no_service_command(full, monkeypatch):
+    source, paths, engine, io = full
+    original = JournalStore.publish
+    def changed(self, record, **kwargs):
+        result = original(self, record, **kwargs)
+        if record.phase == 'CONFIG_COMMITTING':
+            io.pid += 1
+            io.raw = io.healthy()
+        return result
+    monkeypatch.setattr(JournalStore, 'publish', changed)
+    with pytest.raises(ActivationError) as caught:
+        engine.run(insert, validator=Validator())
+    assert caught.value.code == 'FAILED_PRECOMMIT'
+    assert io.actions == []
+    assert source.read_bytes() == _SOURCE
+    clean(paths)
+
+
+def test_unhealthy_initial_service_never_commits(full):
+    source, paths, engine, io = full
+    io.raw = io.healthy(ActiveState='failed', SubState='failed')
+    with pytest.raises(ActivationError) as caught:
+        engine.run(insert, validator=Validator())
+    assert caught.value.code == 'SERVICE_BASELINE_UNAVAILABLE'
+    assert io.actions == []
+    assert source.read_bytes() == _SOURCE
+    clean(paths)
+
+
+@pytest.mark.parametrize('failure_boundary', ['directory-fsync', 'published-authentication'])
+def test_authorizing_phase_not_used_before_durable_reverification(full, monkeypatch, failure_boundary):
+    from cloudflared_manager.activation import journal as journal_module
+    source, paths, engine, io = full
+    original_sync = journal_module.fsync_directory
+    original_auth = engine._authenticate
+    def fail_sync(directory):
+        if directory.path == paths.config_root / 'activation-journal':
+            leaf = directory.path / 'journal'
+            if leaf.exists() and JournalRecord.parse(leaf.read_bytes()).phase == 'SERVICE_ACTIVATING':
+                raise OSError('injected private path')
+        original_sync(directory)
+    def fail_auth(record, active, backups):
+        original_auth(record, active, backups)
+        if record.phase == 'SERVICE_ACTIVATING' and phase(paths) == 'SERVICE_ACTIVATING':
+            raise OSError('injected private output')
+    if failure_boundary == 'directory-fsync':
+        monkeypatch.setattr(journal_module, 'fsync_directory', fail_sync)
+    else:
+        monkeypatch.setattr(engine, '_authenticate', fail_auth)
+    with pytest.raises(ActivationError) as caught:
+        engine.run(insert, validator=Validator())
+    assert caught.value.code == 'RECOVERY_REQUIRED'
+    assert io.actions == []
+    assert phase(paths) == 'SERVICE_ACTIVATING'
+    raw = (paths.config_root / 'activation-journal/journal').read_bytes()
+    assert str(source).encode() not in raw
+    assert b'ExecStart' not in raw
+    monkeypatch.setattr(journal_module, 'fsync_directory', original_sync)
+    monkeypatch.setattr(engine, '_authenticate', original_auth)
+    assert engine.recover().code == 'COMMITTED_SUCCESS'
+    assert io.actions == ['SERVICE_ACTIVATING']

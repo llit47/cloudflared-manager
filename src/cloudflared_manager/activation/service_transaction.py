@@ -11,6 +11,7 @@ class ServiceController(Protocol):
     def observe(self, *, adopted_fingerprint: str, source_digest: str) -> BaselineFacts: ...
     def settled(self) -> bool: ...
     def restart(self) -> bool: ...
+    def validate_restart(self, baseline: BaselineFacts) -> None: ...
     def verify(self, baseline: BaselineFacts, *, activation: bool) -> None: ...
 
 
@@ -51,8 +52,12 @@ def resume_service(engine, record, journal, active, backups, active_name, *, rec
             return "RECOVERY_REQUIRED"
         # Observation can take time. Authenticate config/authority again before
         # the command, while the durably reverified phase remains authority.
+        engine.service.validate_restart(record.baseline)
         engine._authenticate(record, active, backups)
-        success = engine.service.restart()
+        try:
+            success = engine.service.restart() is True
+        except Exception:
+            success = False
         if success:
             try:
                 engine.service.verify(record.baseline, activation=not rollback)

@@ -46,6 +46,13 @@ def verified_executable(path: Path):
 
 
 def _command(*, restart: bool) -> tuple[bool, bytes]:
+    try:
+        return _execute(restart=restart)
+    except Exception:
+        raise ServiceRefused() from None
+
+
+def _execute(*, restart: bool) -> tuple[bool, bytes]:
     process = None
     try:
         with verified_executable(_SYSTEMCTL) as (fd, _):
@@ -116,7 +123,17 @@ class LinuxServiceIO:
         except Exception:
             raise ServiceRefused() from None
 
+    def executable(self, path: Path) -> tuple[int, int]:
+        with verified_executable(path) as (_, identity):
+            return identity
+
     def process(self, pid: int, executable: Path) -> tuple[int, int, int]:
+        try:
+            return self._process(pid, executable)
+        except Exception:
+            raise ServiceRefused() from None
+
+    def _process(self, pid: int, executable: Path) -> tuple[int, int, int]:
         directory = None
         try:
             if type(pid) is not int or not 0 < pid < 2**31:

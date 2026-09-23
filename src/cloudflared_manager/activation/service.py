@@ -28,6 +28,7 @@ class ServiceIO(Protocol):
     def restart(self) -> bool: ...
     def process(self, pid: int, executable: Path) -> tuple[int, int, int]: ...
     def canonical(self, path: Path) -> Path: ...
+    def executable(self, path: Path) -> tuple[int, int]: ...
 
 
 @dataclass(frozen=True, repr=False)
@@ -79,7 +80,16 @@ _EXEC = re.compile(
 )
 
 
-def parse_exec(raw: str) -> tuple[Path, Path]:
+@dataclass(frozen=True, repr=False)
+class ExecFacts:
+    executable: Path
+    config: Path
+
+    def __repr__(self) -> str:
+        return "ExecFacts()"
+
+
+def parse_exec(raw: str) -> ExecFacts:
     """Accept one unambiguous local-config tunnel run, rejecting unknown flags.
 
     Escaped/quoted systemd argv is deliberately unsupported: show's string
@@ -110,7 +120,7 @@ def parse_exec(raw: str) -> tuple[Path, Path]:
     for path in (Path(executable), config):
         if ".." in path.parts or str(path).startswith("//"):
             raise ServiceRefused()
-    return Path(executable), config
+    return ExecFacts(Path(executable), config)
 
 
 def parse_start(raw: bytes, pid: int) -> int:
@@ -164,14 +174,14 @@ class StrictService:
         if (not shape.settled or values["ActiveState"] != "active" or values["Type"] != "notify"
             or int(values["MainPID"]) <= 0):
             raise ServiceRefused()
-        executable, config = parse_exec(values["ExecStart"])
-        if self._io.canonical(config) != adopted:
+        command = parse_exec(values["ExecStart"])
+        if self._io.canonical(command.config) != adopted:
             raise ServiceRefused()
         pid = int(values["MainPID"])
-        ticks, device, inode = self._io.process(pid, executable)
+        ticks, device, inode = self._io.process(pid, command.executable)
         if parse_show(self._io.show()) != shape:
             raise ServiceRefused()
-        if self._io.process(pid, executable) != (ticks, device, inode):
+        if self._io.process(pid, command.executable) != (ticks, device, inode):
             raise ServiceRefused()
         result = BaselineFacts(UNIT, "loaded", "active", "running", pid, ticks, device, inode,
                                fingerprint, digest, int(STABILITY_SECONDS * 1000), int(values["NRestarts"]))
@@ -186,6 +196,20 @@ class StrictService:
             return first.settled
         except Exception:
             return False
+
+    def validate_restart(self, baseline: BaselineFacts) -> None:
+        """Reject a changed loaded target before dispatch, including recovery."""
+        try:
+            _, adopted = self._authority.current()
+            shape = parse_show(self._io.show())
+            command = parse_exec(shape.values["ExecStart"])
+            if (not shape.settled or shape.values["Type"] != "notify"
+                or hashlib.sha256(os.fsencode(adopted)).hexdigest() != baseline.adopted_fingerprint
+                or self._io.canonical(command.config) != adopted
+                or self._io.executable(command.executable) != (baseline.executable_device, baseline.executable_inode)):
+                raise ServiceRefused()
+        except Exception:
+            raise ServiceRefused() from None
 
     def restart(self) -> bool:
         try:
