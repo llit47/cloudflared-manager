@@ -304,6 +304,8 @@ class FilesystemActivation:
                             self._finish_abort(record, journal, active, backups)
                             return FilesystemResult("FAILED_PRECOMMIT", record.transaction_id)
                         if record.phase in {"ACTIVATION_FAILED", "ROLLBACK_CONFIG"}:
+                            if record.phase == "ACTIVATION_FAILED" and not self.service.settled():
+                                return FilesystemResult("RECOVERY_REQUIRED", record.transaction_id)
                             current, _ = named_file(active, adopted.name)
                             if current.same_after_exchange(record.restoration or record.source):
                                 if record.phase == "ACTIVATION_FAILED":

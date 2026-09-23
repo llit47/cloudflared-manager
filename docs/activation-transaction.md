@@ -865,6 +865,13 @@ published, the normal success path is:
 No service action may begin before its authorizing journal phase is durable and
 reverified.
 
+If the live post-exchange continuity observation fails for any reason, publish
+and reverify `ACTIVATION_FAILED` before considering rollback. While the service
+is unsettled, retain that phase and the candidate-active config without a
+restart or config restoration. Recovery may begin rollback only after the
+service settles. A crash recovery that finds `CONFIG_COMMITTED` without a
+recorded continuity result does not infer this failure.
+
 `SERVICE_VERIFIED` is a durable success observation, not a provisional
 failure-selection phase. PR14 MUST remove the
 `SERVICE_VERIFIED -> ACTIVATION_FAILED` transition. Once

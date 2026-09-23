@@ -30,9 +30,10 @@ def resume_service(engine, record, journal, active, backups, active_name, *, rec
 
     engine._authenticate(record, active, backups)
     if record.phase == "CONFIG_COMMITTED":
-        if not engine.service.settled():
-            return "RECOVERY_REQUIRED"
-        if not recovery:
+        if recovery:
+            if not engine.service.settled():
+                return "RECOVERY_REQUIRED"
+        else:
             try:
                 observed = engine.baseline.observe(
                     adopted_fingerprint=record.adopted_fingerprint,
@@ -41,6 +42,9 @@ def resume_service(engine, record, journal, active, backups, active_name, *, rec
                 if observed != record.baseline:
                     raise FilesystemRefused("BASELINE_CHANGED")
             except Exception:
+                record = publish("ACTIVATION_FAILED")
+                if not engine.service.settled():
+                    return "RECOVERY_REQUIRED"
                 return engine._handle_failure(record, journal, active, backups, active_name)
         record = publish("SERVICE_ACTIVATING")
     elif record.phase == "ROLLBACK_CONFIG":

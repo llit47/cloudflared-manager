@@ -193,6 +193,89 @@ def test_post_exchange_continuity_failure_rolls_back(full, monkeypatch):
     clean(paths)
 
 
+def test_transitional_post_exchange_failure_waits_for_settlement(full, monkeypatch):
+    from cloudflared_manager.activation import transaction
+
+    source, paths, engine, io = full
+    original_publish = JournalStore.publish
+    def transitional(self, record, **kwargs):
+        result = original_publish(self, record, **kwargs)
+        if record.phase == 'CONFIG_COMMITTED':
+            io.raw = io.healthy(ActiveState='activating', SubState='start')
+        return result
+    monkeypatch.setattr(JournalStore, 'publish', transitional)
+    original_exchange = transaction.exchange
+    exchanges = []
+    def tracked_exchange(*args, **kwargs):
+        if exchanges:
+            assert phase(paths) == 'ROLLBACK_CONFIG'
+        exchanges.append(phase(paths))
+        return original_exchange(*args, **kwargs)
+    monkeypatch.setattr(transaction, 'exchange', tracked_exchange)
+
+    assert engine.run(insert, validator=Validator()).code == 'RECOVERY_REQUIRED'
+    assert phase(paths) == 'ACTIVATION_FAILED'
+    assert exchanges == ['CONFIG_COMMITTING']
+    candidate = source.read_bytes()
+    assert b'new.example.com' in candidate
+    assert io.actions == []
+
+    for _ in range(2):
+        assert engine.recover().code == 'RECOVERY_REQUIRED'
+        assert phase(paths) == 'ACTIVATION_FAILED'
+        assert source.read_bytes() == candidate
+        assert io.actions == []
+        assert exchanges == ['CONFIG_COMMITTING']
+
+    io.raw = io.healthy()
+    assert engine.recover().code == 'FAILED_ROLLED_BACK'
+    assert exchanges == ['CONFIG_COMMITTING', 'ROLLBACK_CONFIG']
+    assert source.read_bytes() == _SOURCE
+    assert io.actions == ['ROLLBACK_SERVICE']
+    clean(paths)
+
+
+def test_unavailable_post_exchange_observation_records_failure(full, monkeypatch):
+    source, paths, engine, io = full
+    original = JournalStore.publish
+    def unavailable(self, record, **kwargs):
+        result = original(self, record, **kwargs)
+        if record.phase == 'CONFIG_COMMITTED':
+            io.forbid_observation = True
+        return result
+    monkeypatch.setattr(JournalStore, 'publish', unavailable)
+
+    assert engine.run(insert, validator=Validator()).code == 'RECOVERY_REQUIRED'
+    assert phase(paths) == 'ACTIVATION_FAILED'
+    assert b'new.example.com' in source.read_bytes()
+    assert io.actions == []
+
+
+def test_crash_at_config_committed_does_not_invent_continuity_failure(full, monkeypatch):
+    source, paths, engine, io = full
+    original = JournalStore.publish
+    def crash(self, record, **kwargs):
+        result = original(self, record, **kwargs)
+        if record.phase == 'CONFIG_COMMITTED':
+            raise Crash()
+        return result
+    monkeypatch.setattr(JournalStore, 'publish', crash)
+    with pytest.raises(Crash):
+        engine.run(insert, validator=Validator())
+    monkeypatch.setattr(JournalStore, 'publish', original)
+
+    io.raw = io.healthy(ActiveState='activating', SubState='start')
+    assert engine.recover().code == 'RECOVERY_REQUIRED'
+    assert phase(paths) == 'CONFIG_COMMITTED'
+    assert io.actions == []
+    assert b'new.example.com' in source.read_bytes()
+
+    io.raw = io.healthy()
+    assert engine.recover().code == 'COMMITTED_SUCCESS'
+    assert io.actions == ['SERVICE_ACTIVATING']
+    clean(paths)
+
+
 @pytest.mark.parametrize('target', ['SERVICE_ACTIVATING', 'ROLLBACK_SERVICE'])
 def test_no_restart_before_publication_completes(full, monkeypatch, target):
     source, paths, engine, io = full
