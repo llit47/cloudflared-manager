@@ -116,6 +116,56 @@ def test_final_baseline_change_aborts_before_exchange(fixture):
     assert list(source.parent.glob(".cfm-candidate-*")) == []
 
 
+@pytest.mark.parametrize("interference", ["source", "candidate", "authority"])
+def test_final_revalidation_detects_changes_during_baseline_observation(
+    fixture, monkeypatch, interference,
+):
+    source, paths, engine, root = fixture
+    from cloudflared_manager.activation import transaction
+
+    exchanges = 0
+
+    def forbidden_exchange(*_args):
+        nonlocal exchanges
+        exchanges += 1
+        raise FilesystemRefused("EXCHANGE_REACHED")
+
+    monkeypatch.setattr(transaction, "exchange", forbidden_exchange)
+
+    class InterferingBaseline(Baseline):
+        calls = 0
+
+        def observe(self, **kwargs):
+            self.calls += 1
+            if self.calls == 3:
+                if interference == "source":
+                    replacement = source.with_name("operator.new")
+                    replacement.write_bytes(b"operator change\n")
+                    os.replace(replacement, source)
+                elif interference == "candidate":
+                    candidate = next(source.parent.glob(".cfm-candidate-*.yaml"))
+                    before = candidate.stat()
+                    os.utime(candidate, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+                else:
+                    engine.authority.source = source.with_name("other.yml")
+            return super().observe(**kwargs)
+
+    engine.baseline = InterferingBaseline()
+    with pytest.raises(ActivationError) as caught:
+        engine.run(insert, validator=Validator())
+    assert exchanges == 0
+    assert caught.value.code == "RECOVERY_REQUIRED"
+    assert caught.value.original == {
+        "source": "STALE_SOURCE",
+        "candidate": "STALE_CANDIDATE",
+        "authority": "STALE_AUTHORITY",
+    }[interference]
+    assert source.read_bytes() == (b"operator change\n" if interference == "source" else _SOURCE)
+    with PinnedDirectory(paths.config_root / "activation-journal", anchor=root, owner=os.getuid()) as directory:
+        record = JournalStore(directory, owner=os.getuid()).load()
+    assert record is not None and record.phase == "CONFIG_COMMITTING"
+
+
 def test_failed_post_exchange_publication_rolls_back_with_durable_intent(fixture, monkeypatch):
     source, paths, engine, root = fixture
     original_publish = JournalStore.publish

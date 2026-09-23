@@ -148,13 +148,15 @@ class FilesystemActivation:
                         journal.publish(record, authenticate=lambda item: self._authenticate(item, active, backups))
                         record = journal.publish(record.successor("CONFIG_COMMITTING"),
                                                  authenticate=lambda item: self._authenticate(item, active, backups))
-                        # This is the final observation. There is no journal write or
-                        # filesystem preparation between it and the exchange.
+                        # Observe the service first: that check may take time, so
+                        # source, candidate, and authority must be checked after it.
+                        if self._baseline(adopted, source) != baseline:
+                            raise FilesystemRefused("BASELINE_CHANGED")
+                        # No journal write or filesystem preparation intervenes
+                        # between these final identity checks and exchange.
                         require_source(snapshot, active)
                         self._require_candidate(active, handle.name, candidate)
                         self._require_authority(release, adopted)
-                        if self._baseline(adopted, source) != baseline:
-                            raise FilesystemRefused("BASELINE_CHANGED")
                         exchange(active, adopted.name, handle.name)
                         self._require_candidate(active, adopted.name, candidate, exchanged=True)
                         self._require_source_at(active, handle.name, source, exchanged=True)
