@@ -207,7 +207,8 @@ def test_service_unit_runs_unprivileged_with_manager_owned_paths() -> None:
     assert "Group=cloudflared-manager" in unit
     assert "EnvironmentFile=/etc/cloudflared-manager/cloudflared-manager.env" in unit
     assert "ExecStart=/opt/cloudflared-manager/current/.venv/bin/cloudflared-manager" in unit
-    assert "NoNewPrivileges=true" in unit
+    assert "NoNewPrivileges=false" in unit
     assert "ProtectSystem=strict" in unit
-    assert "CapabilityBoundingSet=\n" in unit
+    assert "ReadWritePaths=-/etc/cloudflared /etc/cloudflared-manager /run/cloudflared-manager" in unit
+    assert "CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETGID CAP_SETUID" in unit
     assert "cloudflared.service" not in unit

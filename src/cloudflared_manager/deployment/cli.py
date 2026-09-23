@@ -18,6 +18,7 @@ from cloudflared_manager.deployment.adoption import (
     CloudflaredConfigAdopter,
 )
 from cloudflared_manager.deployment.bootstrap import BootstrapError, downloaded_source, resolve_main_sha
+from cloudflared_manager.deployment.bridge_install import BridgeInstaller
 from cloudflared_manager.deployment.configurator import ConfigResult, Configurator
 from cloudflared_manager.deployment.environment import read_environment
 from cloudflared_manager.deployment.errors import (
@@ -146,6 +147,7 @@ def configure(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="cfm-config")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("status", help="show sanitized manager status")
+    subparsers.add_parser("install-bridge", help="explicitly install the recovery-only sudo bridge")
     bind_parser = subparsers.add_parser("set-bind", help="set a concrete RFC1918 bind address")
     bind_parser.add_argument("address")
     port_parser = subparsers.add_parser("set-port", help="set an unprivileged TCP port")
@@ -174,6 +176,18 @@ def configure(arguments: list[str]) -> int:
     try:
         _require_root()
         paths = DeploymentPaths()
+        if parsed.command == "install-bridge":
+            with DeploymentLock(paths.lock_path):
+                filesystem = ReleaseFilesystem(paths)
+                release = filesystem.read_current_sha()
+                if PROCESS_RELEASE_ID != release:
+                    raise HostOperationError(
+                        "The configuration process does not match the current manager release."
+                    )
+                changed = BridgeInstaller(paths, filesystem).install(paths.release(release))
+            print("Privileged recovery bridge installed." if changed else
+                  "Privileged recovery bridge already installed.")
+            return 0
         service = SystemdManager()
         configurator = Configurator(paths, service, _health)
         adopter = CloudflaredConfigAdopter(configurator)

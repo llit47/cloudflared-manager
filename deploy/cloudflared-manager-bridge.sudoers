@@ -1,0 +1,2 @@
+Defaults:cloudflared-manager env_reset, !setenv
+cloudflared-manager ALL=(root) NOPASSWD: /opt/cloudflared-manager/privileged-helper ""

@@ -32,6 +32,7 @@ def make_paths(root: Path) -> DeploymentPaths:
         update_link=root / "usr" / "local" / "sbin" / "cfm-update",
         config_link=root / "usr" / "local" / "sbin" / "cfm-config",
         runtime_root=root / "run" / "cloudflared-manager",
+        sudoers_path=root / "etc" / "sudoers.d" / "cloudflared-manager-bridge",
     )
 
 
