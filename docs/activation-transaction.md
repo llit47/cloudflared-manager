@@ -103,20 +103,29 @@ any future write capability. Detection does not imply adoption, and an upgrade
 must not silently enable write capability.
 
 The host administrator/root is part of the trusted computing base. Concurrent
-manual administration is still expected: a change observable at a required
-validation or recovery boundary MUST cause stale-state rejection or a distinct
-rollback outcome rather than silent overwrite. This includes source,
-candidate, and active-config state. The manager MUST still handle crashes,
-reboot or power loss, interrupted commit/rollback/cleanup, partial filesystem
-operations, malformed or inconsistent recovery state, unprivileged symlink or
-path manipulation, and unauthorized writes by the non-root web service.
+manual administration of the adopted active cloudflared configuration is still
+expected: a change observable at a required validation or recovery boundary
+MUST cause stale-state rejection or a distinct rollback outcome rather than
+silent overwrite. The manager MUST still handle crashes, reboot or power loss,
+interrupted commit/rollback/cleanup, partial filesystem operations, malformed
+or inconsistent recovery state, unprivileged symlink or path manipulation, and
+unauthorized writes by the non-root web service.
 
-The contract does not promise protection against an independent process with
-equivalent root privileges manipulating manager-private root-owned transaction
-files, whether deliberately or accidentally, in the narrow interval between
-completed leaf verification and the immediately following namespace syscall.
-This exception does not remove any required precondition revalidation,
-authenticated recovery, or durable ordering step.
+Manager-private root-owned activation state — including candidates, backups,
+the authoritative journal, journal staging, and other private recovery
+artifacts — is not an independently administered namespace. The supported
+deployment assumes that no independent process with equivalent root privileges
+modifies that private state while an activation or recovery operation is
+running. Deliberate or accidental equivalent-root interference with those
+private artifacts is outside the threat model. If inconsistent private state is
+observable at a required validation or recovery boundary, the manager still
+MUST fail closed; this exception does not remove required precondition
+revalidation, authenticated recovery, crash consistency, or durable ordering.
+
+This private-state exception does not apply to the adopted active cloudflared
+configuration. External operator edits to the active config remain supported
+interference and MUST still be detected at the defined validation/recovery
+boundaries.
 
 ### Narrow privileged activation component
 
@@ -571,11 +580,10 @@ that the operator's state is preserved across crashes and races, production
 activation remains disabled. Falling back to unchecked `os.replace` is not
 allowed.
 
-The root trust boundary above excludes equivalent-root racing of
-manager-private transaction leaves, whether deliberate or accidental, between
-a completed verification and its immediately following namespace syscall. It
-does not weaken the exchange protocol or its checks for observable manual
-changes to the active config.
+The root trust boundary above excludes concurrent equivalent-root modification
+of manager-private activation state while activation or recovery is running.
+It does not weaken the exchange protocol, crash/recovery guarantees, or checks
+for observable manual changes to the adopted active cloudflared config.
 
 The transaction never automatically reparses a changed source and reapplies
 the requested operation. The caller must start over from a fresh read so an
