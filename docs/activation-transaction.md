@@ -870,9 +870,10 @@ failure-selection phase. PR14 MUST remove the
 `SERVICE_VERIFIED -> ACTIVATION_FAILED` transition. Once
 `SERVICE_VERIFIED` is published, later unrelated service/network failure
 cannot retroactively turn the completed activation observation into automatic
-config rollback. If recovery cannot re-establish enough current state to finish
-cleanup safely, it retains the journal and reports recovery required instead of
-inventing a new activation failure.
+config rollback. After `SERVICE_VERIFIED` is durable, recovery does not re-judge live service
+health. It reauthenticates the candidate-active filesystem/journal authority and
+finishes the commit cleanup decision; later service or network failure belongs
+to runtime operations, not to the completed activation decision.
 
 ### Restart timeout and transitional state
 
@@ -902,20 +903,19 @@ Recovery follows these rules:
   After proving the unit is non-transitional, reissue the fixed restart and
   verify from scratch. A repeated restart is preferable to guessing whether a
   previous job completed.
-- `SERVICE_VERIFIED`: issue no new service command. Reauthenticate the
-  candidate-active filesystem state and current supported service shape. If it
-  can still be verified, continue to `COMMIT_CLEANUP_PENDING`; otherwise keep
-  recovery authority and require explicit recovery rather than automatically
-  rolling back a previously verified activation.
+- `SERVICE_VERIFIED`: issue no new service command and do not re-judge live
+  service health. Reauthenticate the candidate-active filesystem and journaled
+  authority, then continue to `COMMIT_CLEANUP_PENDING`. Later runtime failures
+  do not retroactively reopen the activation decision.
 - `ROLLBACK_CONFIG`: complete exact filesystem restoration first, then
   durably publish/reverify `ROLLBACK_SERVICE` before any service action.
 - `ROLLBACK_SERVICE`: after proving the unit is non-transitional, reissue the
   fixed restart against the restored config and verify rollback health from
   scratch.
-- `ROLLBACK_VERIFIED`: issue no new service command. Reauthenticate the
-  restored filesystem and supported service shape, then continue to
-  `ROLLBACK_CLEANUP_PENDING`; if verification is unavailable, retain recovery
-  authority rather than inventing a new mutation.
+- `ROLLBACK_VERIFIED`: issue no new service command and do not re-judge live
+  service health. Reauthenticate the restored filesystem and journaled
+  authority, then continue to `ROLLBACK_CLEANUP_PENDING`. Later runtime changes
+  do not reopen the already verified rollback decision.
 - cleanup-pending phases never choose a new activation or rollback decision;
   they only finish the already durable authenticated cleanup decision.
 
