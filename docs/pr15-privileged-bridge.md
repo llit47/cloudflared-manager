@@ -25,7 +25,10 @@ release switching are root administrator operations. The manager service is
 previously configured `NoNewPrivileges=true`, which prevented a setuid sudo
 transition. PR15 sets it to `false`, keeps `RestrictSUIDSGID=true`, and limits
 the capability bounding set and writable mount paths to those needed by the
-bridge. The service user still has no ambient capabilities and cannot write
+bridge. `CAP_SYS_PTRACE` is included because PR14 reads
+`/proc/<MainPID>/environ` and executable identity when cloudflared may run
+under a different UID; DAC override alone does not pass that ptrace read
+check. The service user still has no ambient capabilities and cannot write
 the root-owned release, config, journal, helper, or sudoers file by DAC.
 
 The root-owned immutable release and stable administration launcher pattern in
@@ -42,8 +45,9 @@ or select another privileged action.
 - `activation/bridge_client.py` invokes fixed `/usr/bin/sudo -n` argv.
 - `activation/bridge_helper.py` dispatches only `recover()` and sanitizes
   results.
-- `deploy/privileged-helper.sh` launches the active root-owned release with
-  `python -I` and a fixed minimal environment.
+- `deploy/privileged-helper.sh` enters Bash privileged mode, invokes the sole
+  pre-sanitization external command as `/usr/bin/readlink`, and launches the
+  active root-owned release with `python -I` and a fixed minimal environment.
 - `deploy/cloudflared-manager-bridge.sudoers` grants the exact helper path;
   `cfm-config install-bridge` validates and installs both assets explicitly.
 - `deploy/cloudflared-manager.service` permits the sudo transition within a

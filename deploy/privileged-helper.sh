@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -p
 set -Eeuo pipefail
 
 if [[ ${EUID} -ne 0 || $# -ne 0 ]]; then
@@ -12,7 +12,7 @@ if [[ ! -L ${current_link} ]]; then
     printf 'Privileged helper unavailable.\n' >&2
     exit 1
 fi
-current_target=$(readlink --no-newline -- "${current_link}") || exit 1
+current_target=$(/usr/bin/readlink --no-newline -- "${current_link}") || exit 1
 if [[ ! ${current_target} =~ ^releases/([0-9a-f]{40})$ ]]; then
     printf 'Privileged helper unavailable.\n' >&2
     exit 1

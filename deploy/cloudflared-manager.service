@@ -33,7 +33,9 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
 RemoveIPC=true
-CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETGID CAP_SETUID
+# PR14 reads /proc/<MainPID>/environ for a possibly different cloudflared UID.
+# Linux applies a ptrace read check there; root recovery needs CAP_SYS_PTRACE.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETGID CAP_SETUID CAP_SYS_PTRACE
 AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native

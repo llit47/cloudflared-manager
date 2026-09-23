@@ -1,5 +1,7 @@
 """Explicit root installation contract with disposable paths and fake visudo."""
 
+import shlex
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -72,3 +74,49 @@ def test_sudoers_grants_exact_helper_with_no_arguments():
     assert 'NOPASSWD: /opt/cloudflared-manager/privileged-helper ""' in policy
     assert "ALL=(ALL)" not in policy
     assert "*" not in policy
+
+
+def test_privileged_launcher_ignores_hostile_path_and_bash_startup(tmp_path):
+    """Exercise the real launcher below the root gate against pre-env injection."""
+    source = (Path(__file__).parents[1] / "deploy/privileged-helper.sh").read_text()
+    assert source.startswith("#!/bin/bash -p\n")
+    assert source.count("/usr/bin/readlink --no-newline") == 1
+    assert source.count("[[ ${EUID} -ne 0 || $# -ne 0 ]]") == 1
+    assert source.count("readonly install_root='/opt/cloudflared-manager'") == 1
+
+    root = tmp_path / "install"
+    release = root / "releases" / ("a" * 40)
+    python = release / ".venv/bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_text("#!/bin/sh\nprintf 'SAFE\\n'\n")
+    python.chmod(0o755)
+    (root / "current").symlink_to(f"releases/{release.name}")
+
+    # A disposable copy changes only the root guard and fixed install root, so
+    # CI can execute the privileged path without root or production paths.
+    test_source = source.replace("[[ ${EUID} -ne 0 || $# -ne 0 ]]", "[[ $# -ne 0 ]]", 1)
+    test_source = test_source.replace(
+        "readonly install_root='/opt/cloudflared-manager'",
+        f"readonly install_root={shlex.quote(str(root))}", 1,
+    )
+    assert test_source != source and "${EUID}" not in test_source
+    launcher = tmp_path / "privileged-helper"
+    launcher.write_text(test_source)
+    launcher.chmod(0o755)
+
+    marker = tmp_path / "injected"
+    startup = tmp_path / "startup.sh"
+    startup.write_text('printf "startup" > "$ATTACK_MARKER"\n')
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_readlink = fake_bin / "readlink"
+    fake_readlink.write_text('#!/bin/sh\nprintf "path" > "$ATTACK_MARKER"\nexit 98\n')
+    fake_readlink.chmod(0o755)
+    environment = {
+        "PATH": str(fake_bin), "BASH_ENV": str(startup), "ATTACK_MARKER": str(marker),
+    }
+    completed = subprocess.run([str(launcher)], env=environment,
+                               capture_output=True, timeout=5, check=False)
+    assert completed.returncode == 0
+    assert completed.stdout == b"SAFE\n"
+    assert not marker.exists()

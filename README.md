@@ -167,9 +167,13 @@ unit enables automatic restart on failure and uses protections including `Privat
 `PrivateDevices`, `ProtectHome`, `ProtectSystem=strict`, kernel/control-group
 protections, and a restricted address-family set. To permit the explicit
 `sudo -n` bridge, `NoNewPrivileges=false`; the capability bounding set contains
-only `CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_SETGID`, and
-`CAP_SETUID`. The unit makes `/etc/cloudflared`, `/etc/cloudflared-manager`,
-and `/run/cloudflared-manager` writable in its mount namespace. The non-root
+only `CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_SETGID`,
+`CAP_SETUID`, and `CAP_SYS_PTRACE`. PR14 checks
+`/proc/<MainPID>/environ` and `/proc/<MainPID>/exe`; Linux applies a ptrace
+read check when `cloudflared.service` runs under another UID, so recovery needs
+`CAP_SYS_PTRACE` in the bounding set. The unit makes `/etc/cloudflared`,
+`/etc/cloudflared-manager`, and `/run/cloudflared-manager` writable in its mount
+namespace. The non-root
 process receives no ambient capabilities.
 
 `GET /healthz` is the minimal public monitoring endpoint. Its response contract
@@ -544,7 +548,9 @@ assets is idempotent.
 The policy permits the `cloudflared-manager` account to execute **only** that
 helper as root with **no arguments** and no password. The unprivileged client
 uses fixed argv `/usr/bin/sudo -n /opt/cloudflared-manager/privileged-helper`.
-The helper launcher runs only the active root-owned release's Python module
+The helper launcher uses Bash privileged mode to ignore caller-supplied shell
+startup settings, invokes `/usr/bin/readlink` by absolute path before clearing
+the environment, then runs only the active root-owned release's Python module
 with `-I` and a fixed minimal environment. The request is one UTF-8 JSON
 document of at most 4096 bytes on stdin, currently exactly
 `{"version":1,"operation":"recover"}`. Unknown versions, operations, fields,

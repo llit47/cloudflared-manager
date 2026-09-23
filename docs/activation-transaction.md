@@ -333,8 +333,13 @@ The manager unit retains a restricted mount namespace, with write access to
 that directory and manager-owned transaction state; DAC still prevents the
 unprivileged process from writing them. Because a setuid sudo transition is
 required, PR15 sets `NoNewPrivileges=false` and bounds potential capabilities
-to `CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_SETGID`, and
-`CAP_SETUID`. Manual host verification of sudo, systemd namespace, and service
+to `CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_SETGID`, `CAP_SETUID`, and
+`CAP_SYS_PTRACE`. The last capability is required for PR14's
+`/proc/<MainPID>/environ` and executable identity checks when cloudflared runs
+under a different non-root UID; DAC override does not satisfy Linux's ptrace
+read check. The launcher enters Bash privileged mode and resolves the sole
+pre-sanitization external command through fixed `/usr/bin/readlink`.
+Manual host verification of sudo, systemd namespace, and service
 control remains required.
 
 ## Transaction inputs and derived authority
