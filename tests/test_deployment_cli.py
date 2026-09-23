@@ -1,9 +1,33 @@
 from pathlib import Path
+from contextlib import nullcontext
 
 from cloudflared_manager.deployment import cli
 from cloudflared_manager.deployment.adoption import AdoptionStatus
 from cloudflared_manager.deployment.configurator import ConfigResult
 from cloudflared_manager.deployment.settings import ManagerSettings
+
+
+def test_bridge_install_is_explicit_root_admin_action(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(cli, "_require_root", lambda: None)
+    monkeypatch.setattr(cli, "DeploymentLock", lambda path: nullcontext())
+    monkeypatch.setattr(cli, "PROCESS_RELEASE_ID", "a" * 40)
+    class Filesystem:
+        def __init__(self, paths):
+            pass
+        def read_current_sha(self):
+            return "a" * 40
+    class Installer:
+        def __init__(self, paths, filesystem):
+            pass
+        def install(self, release):
+            calls.append(release)
+            return True
+    monkeypatch.setattr(cli, "ReleaseFilesystem", Filesystem)
+    monkeypatch.setattr(cli, "BridgeInstaller", Installer)
+    assert cli.configure(["install-bridge"]) == 0
+    assert calls == [cli.DeploymentPaths().release("a" * 40)]
+    assert "installed" in capsys.readouterr().out
 
 
 class _LocalAddresses:
