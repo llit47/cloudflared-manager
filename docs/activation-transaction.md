@@ -2,26 +2,28 @@
 
 ## Status and purpose
 
-This document is the security and engineering contract for a future
-Cloudflared Manager activation implementation. It is a design specification,
-not a description of capability that exists today. Cloudflared Manager remains
-operationally **READ-ONLY**: no current web, CLI, deployment, or editing path
-activates a candidate, changes DNS, or controls `cloudflared.service`.
+This document is the security and engineering contract for privileged
+cloudflared activation.
 
-The design starts from the candidate-only foundation introduced in PR10. That
-foundation snapshots an adopted source, performs a narrow round-trip YAML
-mutation, stages a separate candidate in the source directory, and validates
-the staged identity with both the application parser and cloudflared. It stops
-before replacing the active file.
+PR12 implemented the internal filesystem transaction foundation and persistent
+recovery barrier on `main`: validated candidate transfer, durable backup and
+journal publication, race-aware same-directory exchange, authenticated
+filesystem rollback, idempotent cleanup, and the authority-mutation barrier.
+That foundation is intentionally **unwired**. Cloudflared Manager remains
+operationally **READ-ONLY**: no current web or supported CLI path can activate a
+candidate, change DNS, or control `cloudflared.service`.
 
-The future transaction has one purpose: change the one explicitly adopted
-cloudflared configuration through a narrow privileged boundary, and either
-prove the new configuration and service are working or restore and prove the
-previous working state. Convenience is subordinate to failing safely.
+PR14 adds an internal, fixed `cloudflared.service` lifecycle controller,
+post-restart readiness verification, service-aware rollback, and crash recovery.
+It remains unwired: no web mutation route or supported activation CLI exposes
+the transaction.
 
-The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative. Sections
-labelled "Proposed implementation" are the preferred implementation subject to
-the review gates and unresolved decisions at the end of this document.
+The transaction still builds on PR10's candidate-only foundation: snapshot an
+adopted source, perform a narrow round-trip YAML mutation, stage a separate
+candidate in the source directory, and validate that retained identity with the
+application parser and cloudflared before any activation decision.
+
+The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 ## Scope and non-goals
 
@@ -33,12 +35,19 @@ This design covers:
 - a durable backup and filesystem commit;
 - cloudflared service activation and readiness verification;
 - rollback, crash recovery, locking, and safe error reporting; and
-- an adversarial test contract for later implementation PRs.
+- an adversarial test contract for the internal transaction and later integrations.
 
-This documentation PR does **not** implement any part of that transaction. It
-must not add production writes, sudoers policy, a privileged helper, service
-control, HTTP mutation routes, enabled Add/Edit/Delete operations, Cloudflare
-API access, or DNS mutation.
+PR12's filesystem transaction and PR14's fixed service-control and verification
+layer exist as an internal foundation. Neither exposes sudoers policy, a generic
+privileged helper, HTTP mutation routes, enabled Add/Edit/Delete operations,
+Cloudflare API access, DNS mutation, systemd unit editing, or a supported
+user-facing activation command.
+
+PR14 supports only the existing `cloudflared.service` on Linux/systemd in the
+strict local-config shape defined below. It does not install, rewrite,
+daemon-reload, enable, disable, start from inactive, or repair the cloudflared
+unit. Non-systemd service managers, remote-token tunnels, arbitrary unit names,
+and automatic metrics-endpoint configuration are outside PR14.
 
 The activation transaction itself also excludes DNS and Cloudflare API work.
 It changes one local configuration file and, in the service phase, activates
@@ -257,7 +266,7 @@ paths, or a command string passed through a shell are rejected. Argument
 matching is not domain authorization, and such interfaces are difficult to
 constrain as features grow.
 
-**Permanent privileged daemon.** Not preferred for the first implementation.
+**Permanent privileged daemon.** Not used by the internal implementation.
 It creates a long-lived parser and IPC attack surface, lifecycle concerns, and
 an additional privileged state machine. FD passing over a Unix socket could be
 useful later, but requires a demonstrated need and separate threat review.
@@ -312,8 +321,8 @@ variables. Standard input/output are bounded. Results use stable sanitized
 codes; diagnostics with sensitive subprocess output are retained only if a
 future root-only logging policy explicitly permits it.
 
-No sudoers syntax is specified here. The first implementation does not need
-one. Before a later web bridge is enabled, review must settle the exact request
+No sudoers syntax is specified here; the internal implementation has no sudoers
+grant. Before a later web bridge is enabled, review must settle the exact request
 transport, invocation path, caller authentication, rate/concurrency control,
 and how the active web process/release is bound to the request.
 
@@ -367,7 +376,6 @@ BACKUP_DURABLE or CONFIG_COMMITTING
 Failure after the active name changed or may have changed:
 
 CONFIG_COMMITTING or CONFIG_COMMITTED or SERVICE_ACTIVATING
-or SERVICE_VERIFIED (only before durable COMMIT_CLEANUP_PENDING)
   -> ACTIVATION_FAILED
   -> ROLLBACK_CONFIG
   -> ROLLBACK_SERVICE
@@ -441,9 +449,9 @@ journal decision until cleanup, journal retirement, journal-directory fsync,
 and clean namespace verification finish.
 
 The only published predecessors of `ACTIVATION_FAILED` are
-`CONFIG_COMMITTING`, `CONFIG_COMMITTED`, `SERVICE_ACTIVATING`, and
-`SERVICE_VERIFIED`, subject to the phase-specific guards in the transition
-table. The helper publishes and reverifies `ACTIVATION_FAILED` before
+`CONFIG_COMMITTING`, `CONFIG_COMMITTED`, and `SERVICE_ACTIVATING`, subject to
+the phase-specific guards in the transition table. `SERVICE_VERIFIED` is not a
+failure-selection phase and cannot transition to `ACTIVATION_FAILED`. The helper publishes and reverifies `ACTIVATION_FAILED` before
 beginning rollback. Each subsequent rollback intent is likewise published
 before the config or service side effect it authorizes. If any such
 publication is interrupted, the still-published predecessor phase remains
@@ -481,25 +489,22 @@ side effect in that row begins only afterward.
 | `PRE_EXCHANGE_REVALIDATED -> CONFIG_COMMITTED` | Immediately invoke the race-aware same-directory exchange; displaced object must be exact expected source and new active object exact candidate | Atomic namespace exchange, then active file fsync as applicable and parent directory fsync; publish `CONFIG_COMMITTED` before any service action | An interrupted phase publication leaves published `CONFIG_COMMITTING`, which safely classifies the namespace; once exchange may have occurred, publish and reverify failure/rollback intent before any compensating namespace mutation, or fail closed if that cannot be done |
 | `{BACKUP_DURABLE, CONFIG_COMMITTING} -> PRECOMMIT_ABORT` | Recovery cannot safely continue or final revalidation failed, and descriptor/digest/metadata checks prove the active name is still the exact original source | Publish precommit-abort decision and authenticated cleanup allowlist before deletion | No cleanup deletion before durable publication; no active-config or service action; unknown/candidate active identity cannot take this path |
 | `PRECOMMIT_ABORT -> DURABLY_CLEAN_JOURNAL_NAMESPACE -> FAILED_PRECOMMIT` | Durable abort decision authentic; each existing transaction artifact matches its journaled identity | Remove only authenticated candidate/backup/journaled artifacts idempotently, tolerate already-absent allowlisted artifacts, fsync affected directories, securely unlink the journal, fsync its directory, recheck the namespace clean, then expose the logical failure result | Resume abort cleanup/retirement after crash; no service action and no config rollback; do not finalize failure while a journal may remain or absence is not durable |
-| `CONFIG_COMMITTED -> SERVICE_ACTIVATING` | Active bytes/digest, metadata, and adopted name reverified; post-exchange observation confirms the pre-activation service baseline did not disappear/change across the unavoidable race; service phase implemented | Publish `SERVICE_ACTIVATING`, then begin the fixed allowlisted restart or verified reload | Publication failure issues no service command; a baseline mismatch after exchange publishes activation failure/rollback intent before rollback action |
+| `CONFIG_COMMITTED -> SERVICE_ACTIVATING` | Active bytes/digest, metadata, and adopted name reverified; post-exchange observation confirms the pre-activation service baseline did not disappear/change across the unavoidable race; supported service shape remains intact | Publish `SERVICE_ACTIVATING`, then begin the fixed `systemctl restart cloudflared.service` operation | Publication failure issues no service command; a baseline mismatch after exchange publishes activation failure/rollback intent before rollback action |
 | `SERVICE_ACTIVATING -> SERVICE_VERIFIED` | systemd command succeeded and bounded readiness checks prove expected service/process/config stability | Read-only service observations, then publish verification evidence without secrets | Publish activation failure/rollback intent before any rollback side effect |
-| `SERVICE_VERIFIED -> COMMIT_CLEANUP_PENDING` | Active candidate and service stability reverified; success is eligible to be selected | Publish commit decision and complete cleanup allowlist before any rollback artifact is removed | Publication failure leaves artifacts intact and no user-visible success; recovery classifies the published phase, which may still be `SERVICE_VERIFIED` or may be the durable commit decision |
+| `SERVICE_VERIFIED -> COMMIT_CLEANUP_PENDING` | Durable `SERVICE_VERIFIED` authentic; candidate-active filesystem and transaction authority reauthenticate. No new live-service health decision is made | Publish commit decision and complete cleanup allowlist before any rollback artifact is removed | Publication failure leaves artifacts intact and no user-visible success; recovery resumes from durable `SERVICE_VERIFIED` without reopening activation failure selection |
 | `COMMIT_CLEANUP_PENDING -> DURABLY_CLEAN_JOURNAL_NAMESPACE -> COMMITTED_SUCCESS` | Durable commit decision authentic; each existing cleanup artifact matches its journaled identity | Remove authenticated artifacts idempotently, tolerate already-absent allowlisted artifacts, fsync every affected directory, securely unlink the journal, fsync its directory, recheck the namespace clean, then expose the logical success result | Resume cleanup/retirement on restart; never roll back solely because a cleanup artifact is absent; do not report success while a journal may remain or absence is not durable |
 | `CONFIG_COMMITTING -> ACTIVATION_FAILED` | Active namespace may have changed and the candidate is verified at the active name; a failed exchange/displaced-object or commit check rules out success. Exact original active instead takes `PRECOMMIT_ABORT`; unknown third-party active state remains fail-closed/manual recovery | Publish and reverify `ACTIVATION_FAILED` through the fixed-leaf protocol | No compensating namespace or service action before durable publication; then publish `ROLLBACK_CONFIG` before any restoration |
 | `CONFIG_COMMITTED -> ACTIVATION_FAILED` | Committed candidate is verified at the active name, but post-exchange continuity, healthy baseline, or active-state verification fails before successful service activation | Publish and reverify `ACTIVATION_FAILED` through the fixed-leaf protocol | No rollback side effect before durable publication; then proceed to `ROLLBACK_CONFIG` |
-| `SERVICE_ACTIVATING -> ACTIVATION_FAILED` | Restart/reload command fails or times out, or process identity, readiness, or bounded stability verification fails | Publish and reverify `ACTIVATION_FAILED` through the fixed-leaf protocol | No rollback side effect before durable publication; then proceed to `ROLLBACK_CONFIG` |
-| `SERVICE_VERIFIED -> ACTIVATION_FAILED` | Final active-candidate or service revalidation fails while `SERVICE_VERIFIED` remains the published phase, before `COMMIT_CLEANUP_PENDING` is durably published | Publish and reverify `ACTIVATION_FAILED` through the fixed-leaf protocol | No rollback side effect before durable publication; then proceed to `ROLLBACK_CONFIG`; this transition is forbidden after the durable commit decision |
-| `ACTIVATION_FAILED -> ROLLBACK_CONFIG` | Published failure state plus durable backup and/or retained displaced original authenticate | Publish `ROLLBACK_CONFIG`, then restore exact old bytes/metadata using secure same-directory staging and atomic namespace operation; fsync file and directory | Publication failure performs no restoration; later uncertainty becomes `ROLLBACK_FAILED` |
+| `SERVICE_ACTIVATING -> ACTIVATION_FAILED` | The fixed restart has failed or timed out **and** the unit is proven settled/non-transitional, or settled post-restart process/config/readiness/stability verification fails | Publish and reverify `ACTIVATION_FAILED` through the fixed-leaf protocol | A still-transitional unit retains `SERVICE_ACTIVATING` and returns `RECOVERY_REQUIRED`; no rollback side effect begins until the service state is settled and failure intent is durably published |
+| `ACTIVATION_FAILED -> ROLLBACK_CONFIG` | Published failure state plus durable backup and/or retained displaced original authenticate | Publish `ROLLBACK_CONFIG`, complete staging and authentication, then recheck settled service state immediately before restoring exact old bytes/metadata by atomic namespace exchange; fsync file and directory | Publication failure or unsettled service performs no restoration; retain `ROLLBACK_CONFIG` for recovery after the service settles |
 | `ROLLBACK_CONFIG -> ROLLBACK_SERVICE` | Old config digest and metadata verified at adopted name | Publish `ROLLBACK_SERVICE`, then use fixed service activation for restored config | Publication failure performs no service action; otherwise distinguish config-restored/service-unrecovered outcome |
 | `ROLLBACK_SERVICE -> ROLLBACK_VERIFIED` | Old file is exact; service is again loaded, active, ready, and stably equivalent to the journaled healthy baseline, with the expected executable/config relationship | Read-only verification, then publish `ROLLBACK_VERIFIED` evidence | Failure becomes a distinct config-restored/service-recovery or rollback failure |
-| `ROLLBACK_VERIFIED -> ROLLBACK_CLEANUP_PENDING` | Exact old config and a healthy baseline-equivalent service are proven; rollback is irrevocably selected | Publish rollback-complete decision and cleanup allowlist before artifact deletion | Publication failure leaves artifacts intact and rollback outcome unfinalized |
+| `ROLLBACK_VERIFIED -> ROLLBACK_CLEANUP_PENDING` | Durable `ROLLBACK_VERIFIED` authentic; exact restored filesystem and transaction authority reauthenticate. No new live-service health decision is made | Publish rollback-complete decision and cleanup allowlist before artifact deletion | Publication failure leaves artifacts intact and recovery resumes from the already verified rollback decision |
 | `ROLLBACK_CLEANUP_PENDING -> DURABLY_CLEAN_JOURNAL_NAMESPACE -> FAILED_ROLLED_BACK` | Durable rollback decision authentic; each existing cleanup artifact matches its journaled identity | Remove authenticated artifacts idempotently, tolerate already-absent allowlisted artifacts, fsync every affected directory, securely unlink the journal, fsync its directory, recheck the namespace clean, then expose the logical verified-rollback result | Resume cleanup/retirement on restart; missing allowlisted artifacts alone are not indeterminate; return activation failure only after the namespace is durably clean |
 
-Implementation PR A, if intentionally limited to filesystem mechanics, stops
-with a test-only/internal transaction boundary and does not advertise a
-production-successful activation. Production success requires the service
-phase unless review establishes that cloudflared already consumes the new file
-without a restart/reload, which must not be assumed.
+PR12 stopped at an internal filesystem transaction boundary and did not
+advertise production-successful activation. The current internal transaction
+requires PR14's verified service phase before reporting success.
 
 ## Source revalidation and stale-write protection
 
@@ -527,10 +532,9 @@ metadata changes are independently rejected. Unsupported file types, multiple
 hard links, unsafe writable ancestry, symlinks, mounts changing underneath the
 walk, or an unreadable component fail closed.
 
-PR10 does not currently retain every parent ownership fact listed above.
-Implementation PR A must extend the immutable snapshot deliberately (without
-putting paths or contents in `repr`) rather than treating an absent fact as a
-match.
+PR12's privileged path checks retain and revalidate the required parent
+identity and ownership facts. An absent fact is never treated as a match;
+paths and contents remain excluded from sensitive `repr` output.
 
 Hashing is performed from retained descriptors with pre/post `fstat` checks,
 bounded reads, and size/digest verification. Path lookup is checked against the
@@ -571,14 +575,11 @@ and automatic compensation fail closed.
 
 This is compare-and-verify, not a true kernel compare-and-swap on destination
 inode. A cooperating manager lock plus exchange minimizes the gap, but an
-independent root process can still race any userspace protocol. Implementation
-PR A MUST prototype the exchange and adversarially test rename, replacement,
-open-file writes, and compensation after durable rollback intent. The exact
-safe compensation algorithm for an unexpected displaced file is an
-implementation review gate, not proven by this design. If it cannot prove
-that the operator's state is preserved across crashes and races, production
-activation remains disabled. Falling back to unchecked `os.replace` is not
-allowed.
+independent root process can still race any userspace protocol. PR12's
+exchange and adversarial tests cover rename, replacement, open-file writes,
+and compensation after durable rollback intent. Unexpected displaced state
+must remain preserved for authenticated recovery or manual intervention;
+unchecked `os.replace` is not allowed.
 
 The root trust boundary above excludes concurrent equivalent-root modification
 of manager-private activation state while activation or recovery is running.
@@ -656,8 +657,8 @@ rename, exchange, unlink, and journal/backup lifecycle changes.
 
 Replacing an inode can lose ACLs, extended attributes, capabilities, security
 labels, file flags, or other filesystem-specific metadata even when
-UID/GID/mode are copied. The first implementation MUST enumerate supported
-metadata before commit. The minimum safe initial policy is:
+UID/GID/mode are copied. The internal implementation enumerates supported
+metadata before commit. Its minimum safe policy is:
 
 - require one regular link and ordinary UID/GID/mode;
 - reject POSIX ACLs beyond the mode-equivalent base ACL;
@@ -723,110 +724,242 @@ clean-namespace rules and ends by exposing logical result `FAILED_PRECOMMIT`.
 Because the exact original source remains active, this path never restores
 config bytes and never invokes service control.
 
-Bounded historical backups are not required for the first implementation.
+Bounded historical backups are not required for the internal transaction.
 They increase secret retention and require a separate retention/audit policy.
 Operators who need historical configuration should use an independently
 secured configuration-management system.
 
 ## Service activation and readiness model
 
-### Required healthy baseline
+### PR14 supported service boundary
 
-The first production activation implementation supports only a service that is
-already healthy. The helper verifies a `SERVICE_BASELINE_VERIFIED` baseline
-before `PRECOMMIT_REVALIDATED`, persists sanitized baseline facts before commit
-intent, and freshly rechecks the complete baseline after durable
-`CONFIG_COMMITTING` and immediately before namespace exchange. At minimum the
-baseline requires:
+PR14 deliberately supports one narrow service shape. Before the filesystem
+transaction may publish commit intent, a strict privileged observer MUST prove
+all of the following:
 
-- the fixed `cloudflared.service` unit is loaded;
-- `ActiveState` is `active` and `SubState` is the expected running state for the
-  supported unit type;
-- `MainPID` is positive and stable across a bounded observation interval;
-- process start identity is unchanged, preventing PID-reuse confusion;
-- `/proc/<MainPID>/exe` or an equivalent check identifies the expected
-  cloudflared executable;
-- the effective service configuration refers to the explicitly adopted config,
-  using strict parsing and identity comparison rather than substring matching;
-- the process and unit remain ready/healthy for the bounded baseline stability
-  interval; and
-- observations before and after readiness agree on unit, PID, process start,
-  executable, and adopted-config relationship.
+- the unit name is exactly `cloudflared.service`;
+- systemd reports `LoadState=loaded`, `ActiveState=active`, and
+  `SubState=running`;
+- the loaded unit is `Type=notify`;
+- `MainPID` is positive;
+- the loaded `ExecStart` is bounded and strictly parseable in memory;
+- `ExecStart` resolves to an absolute cloudflared executable and an explicit
+  local `--config` argument whose canonical path is exactly the root-adopted
+  config;
+- token/token-file or otherwise remotely managed execution is rejected;
+- `/proc/<MainPID>/stat` supplies a stable process-start identity and
+  `/proc/<MainPID>/exe` resolves to the expected cloudflared executable
+  device/inode; and
+- the unit/process facts remain unchanged across the bounded stability window.
 
-An inactive, failed, restart-looping, transitional, wrong-executable,
-wrong-config, unstable, or unverifiable service found by either pre-exchange
-check fails closed before active-file namespace mutation. The helper does not
-start, restart, reload, or repair it as part of the first activation design.
-The administrator must establish a healthy baseline independently and begin a
-new transaction.
+Raw `ExecStart`, `/proc/<pid>/cmdline`, environment contents, local paths,
+tokens, stdout, and stderr MUST NOT be journaled or logged. Bounded
+`systemctl show` output may be parsed in memory and reduced to the existing
+sanitized baseline facts. Activation should share strict pure parsing helpers
+with discovery where practical, but MUST NOT reuse best-effort discovery
+semantics that silently return unknown values.
 
-The `BACKUP_DURABLE` journal record, which is durable before
-`CONFIG_COMMITTING`, captures only sanitized baseline facts: an allowlisted unit
-identity, normalized load/active/substate enums, baseline MainPID and
-process-start identity, executable device/inode and/or trusted digest/version
-identity, an adopted-config fingerprint and source digest relationship, the
-bounded stability duration/result, and any bounded restart-counter/timestamp
-facts required to detect instability. It contains no raw `ExecStart`, config or
-executable path, command line, environment, token, YAML, stdout, or stderr.
+A custom or changed unit is supported only if it satisfies this exact shape.
+PR14 does not repair an unsupported unit. It fails closed before active config
+mutation.
 
-Immediately after a successful exchange and before issuing the planned service
-operation, the helper compares live PID/start identity, unit state, executable,
-config relationship, restart counters, and relevant timestamps with the
-journaled baseline. A changed or ambiguous continuity record means the service
-changed after the final pre-exchange check; that is activation failure and
-enters rollback without attempting to reinterpret the new state as healthy.
-Post-operation verification must likewise distinguish the one planned
-lifecycle operation from any unplanned exit or restart. If that distinction
-cannot be proven from bounded systemd/process facts, it fails closed and rolls
-back. These observations detect the race; they do not make process liveness and
-filesystem exchange atomic.
+### Restart, not reload
 
-Rollback does not promise to recreate the same PID. "Previous service state
-restored" means that the exact old config is active and a newly observed
-service is healthy and equivalent to the journaled baseline in unit,
-executable, adopted-config relationship, readiness, and bounded stability. The
-old MainPID/process-start facts prove what was healthy before mutation and
-prevent the transaction from inventing a baseline after failure.
+PR14 uses one service mutation only:
 
-Candidate acceptance has distinct layers:
+`systemctl restart cloudflared.service`
 
-1. round-trip document and structural mutation validation;
-2. existing application parser validation;
-3. `cloudflared tunnel --config <FD-bound-candidate> ingress validate`;
-4. healthy precommit service baseline verification;
-5. durable filesystem commit verification;
-6. systemd operation result;
-7. systemd active state and stable positive `MainPID`;
-8. process/config identity and meaningful post-start readiness; and
-9. a bounded stability window with unchanged process identity.
+The systemctl executable is an absolute verified path, the unit and verb are
+fixed constants, argv is fixed, `shell=False`, output is bounded, and the
+subprocess timeout is bounded. No caller input selects the executable, verb,
+unit, environment, timeout, or arguments.
 
-`systemctl restart` returning zero proves only that systemd accepted/completed
-that job. It is not activation success. The service could exit immediately,
-restart-loop, run a different config, or be unable to reach Cloudflare.
+PR14 MUST NOT use `reload`. The currently supported Cloudflare Linux workflow
+loads config changes by restarting the service, and the cloudflared-generated
+systemd unit does not define an `ExecReload` action. PR14 also MUST NOT use
+`daemon-reload`, edit the unit, or emulate restart with separate stop/start
+operations.
 
-The implementation PR must inspect the installed cloudflared version and its
-unit before choosing reload or restart. Reload is preferred only if the
-specific cloudflared/systemd combination has documented, testable semantics
-that reread the intended config and expose failure. No safe reload capability
-is assumed by this design. Otherwise use restart.
+A successful restart command is necessary but never sufficient for activation
+success.
 
-Systemd commands use an absolute verified `systemctl`, a fixed unit name
-`cloudflared.service`, fixed argv, `shell=False`, a minimal environment,
-bounded output, and bounded timeouts. The helper never accepts a unit name or
-systemctl verb from the caller.
+### Baseline and notify-based readiness
 
-At minimum, post-operation verification obtains `LoadState`, `ActiveState`,
-`SubState`, `MainPID`, restart counters/timestamps useful for stability, and
-the effective `ExecStart` config relationship without exposing raw command
-lines. It checks state before and after readiness and requires a stable,
-positive MainPID. A process identity check should bind `/proc/<MainPID>` facts
-to the expected cloudflared executable and config. The exact application-level
-readiness signal is unresolved: candidates include a syntactically valid
-ingress table, but meaningful tunnel connectivity may require cloudflared
-metrics, logs, or another local signal. Implementation PR B must define and
-test that signal and the stability window before production activation is
-enabled.
+The precommit baseline is established by at least two consistent observations
+separated by a fixed, bounded, non-user-controlled stability interval. Each
+observation verifies the unit state, MainPID, process-start identity,
+executable device/inode, restart counter, unit type, and adopted-config
+relationship. The MainPID/start identity and restart counter MUST remain
+stable throughout the interval.
 
+For the supported `Type=notify` unit, systemd does not consider startup
+complete until cloudflared reports `READY=1`. Cloudflared's notify path is
+triggered after its first tunnel connection succeeds. PR14 therefore uses the
+combination of `Type=notify`, completed systemd restart, active/running state,
+new stable process identity, and the post-start stability window as its startup
+readiness proof.
+
+This is deliberately not a promise of continuous Cloudflare-edge liveness.
+PR14 does not guess cloudflared's metrics port, scrape logs, or require an
+implicitly discovered `/ready` endpoint. A process that became disconnected
+from the edge after an earlier successful startup can remain active. If a
+network outage exists when PR14 performs the planned restart, the new process
+will not satisfy the supported startup/readiness proof and activation cannot be
+reported as success. The transaction then restores the old config and attempts
+the same fixed restart for the restored config. If the network remains
+unavailable, the correct result is config restored but service recovery
+unverified/failed, never success.
+
+A future separately reviewed capability MAY bind and probe an explicit metrics
+endpoint for continuous edge readiness. It is not part of PR14 and MUST NOT be
+approximated by port scanning or log parsing.
+
+### Mandatory pre-exchange service revalidation
+
+The journaled baseline is captured before `CONFIG_COMMITTING`. After
+`CONFIG_COMMITTING` is durably published and reverified, the helper performs
+the complete bounded service observation first, then immediately revalidates
+source, candidate, adopted authority, and filesystem identities before
+`RENAME_EXCHANGE`.
+
+Any observed change in baseline PID/start identity, executable identity,
+restart counter, unit state/type, or adopted-config relationship while the
+active name is still proven to be the original source takes
+`PRECOMMIT_ABORT`. No cloudflared lifecycle command is issued.
+
+The manager lock coordinates Cloudflared Manager processes only. An independent
+root administrator can still edit/reload the unit or issue direct systemctl
+commands. The supported deployment assumes no equivalent-root lifecycle or
+loaded-unit mutation races the activation transaction. Any such change that is
+observable at a required boundary fails closed; PR14 does not claim atomic
+exclusion from an independently racing root administrator.
+
+### Service activation state machine
+
+After the filesystem exchange is verified and `CONFIG_COMMITTED` is durably
+published, the normal success path is:
+
+1. recheck post-exchange service continuity against the precommit baseline;
+2. durably publish and reverify `SERVICE_ACTIVATING`;
+3. issue the one fixed restart;
+4. require the command to complete successfully;
+5. verify `loaded/active/running`, `Type=notify`, the same executable
+   identity and adopted-config relationship, and a **new** MainPID/process-start
+   identity relative to the precommit baseline;
+6. require the new process and restart counter to remain stable for the bounded
+   post-start stability window;
+7. durably publish and reverify `SERVICE_VERIFIED`;
+8. durably publish and reverify `COMMIT_CLEANUP_PENDING`;
+9. run the existing authenticated artifact cleanup and durable journal
+   retirement; and
+10. only then return logical `COMMITTED_SUCCESS`.
+
+No service action may begin before its authorizing journal phase is durable and
+reverified.
+
+For each authorized restart, a strict stable witness records either the running
+process or a settled `failed/failed` or `inactive/dead` unit with MainPID 0.
+After filesystem reauthentication, the witness is rechecked before dispatch.
+For a running witness, the stable post-restart process must have both a
+different MainPID and a different process-start identity. For a no-process
+witness, it must be healthy `active/running` with a valid positive process
+identity. Activation also requires both identities to differ from the journaled
+precommit baseline. A changed or unsupported witness prevents dispatch.
+
+If the live post-exchange continuity observation fails for any reason, publish
+and reverify `ACTIVATION_FAILED` before considering rollback. While the service
+is unsettled, retain that phase and the candidate-active config without a
+restart or config restoration. Recovery may begin rollback only after the
+service settles. A crash recovery that finds `CONFIG_COMMITTED` without a
+recorded continuity result does not infer this failure.
+
+`SERVICE_VERIFIED` is a durable success observation, not a provisional
+failure-selection phase. The journal disallows
+`SERVICE_VERIFIED -> ACTIVATION_FAILED`. Once
+`SERVICE_VERIFIED` is published, later unrelated service/network failure
+cannot retroactively turn the completed activation observation into automatic
+config rollback. After `SERVICE_VERIFIED` is durable, recovery does not re-judge live service
+health. It reauthenticates the candidate-active filesystem/journal authority and
+finishes the commit cleanup decision; later service or network failure belongs
+to runtime operations, not to the completed activation decision.
+
+### Restart timeout and transitional state
+
+A timeout, transport error, or nonzero systemctl result does not prove that
+systemd performed no action. The helper MUST inspect the unit after such a
+failure.
+
+If the unit is still `activating`, `deactivating`, `reloading`, or
+otherwise transitional, PR14 MUST NOT race that service job by exchanging or
+restoring config underneath it. It retains the authoritative
+`SERVICE_ACTIVATING` or `ROLLBACK_SERVICE` journal and returns
+`RECOVERY_REQUIRED`. Recovery may wait for a bounded observation interval,
+but if the unit does not settle it stops without additional filesystem or
+service mutation.
+
+Only after the unit is proven non-transitional may recovery reissue the fixed
+restart or select the next durable failure/rollback phase.
+
+Before restoring the old active config, rollback also rechecks that the service
+is settled after `ROLLBACK_CONFIG` publication, any backup restoration staging,
+and artifact authentication. An unsettled result retains `ROLLBACK_CONFIG`,
+the candidate-active config, and recovery artifacts without exchanging config
+or restarting the service. This last observation narrows the race; it does not
+make systemd state and filesystem exchange atomic.
+
+### Deterministic crash recovery for service phases
+
+Recovery follows these rules:
+
+- `CONFIG_COMMITTED`: authenticate the exact candidate-active filesystem
+  state, publish/reverify `SERVICE_ACTIVATING`, then perform the normal fixed
+  restart and verification path.
+- `SERVICE_ACTIVATING`: never infer success from an interrupted restart.
+  After proving the unit is non-transitional, reissue the fixed restart and
+  verify from scratch. A repeated restart is preferable to guessing whether a
+  previous job completed.
+- `SERVICE_VERIFIED`: issue no new service command and do not re-judge live
+  service health. Reauthenticate the candidate-active filesystem and journaled
+  authority, then continue to `COMMIT_CLEANUP_PENDING`. Later runtime failures
+  do not retroactively reopen the activation decision.
+- `ROLLBACK_CONFIG`: complete exact filesystem restoration first, then
+  durably publish/reverify `ROLLBACK_SERVICE` before any service action.
+- `ROLLBACK_SERVICE`: after proving the unit is non-transitional, reissue the
+  fixed restart against the restored config and verify rollback health from
+  scratch.
+- `ROLLBACK_VERIFIED`: issue no new service command and do not re-judge live
+  service health. Reauthenticate the restored filesystem and journaled
+  authority, then continue to `ROLLBACK_CLEANUP_PENDING`. Later runtime changes
+  do not reopen the already verified rollback decision.
+- cleanup-pending phases never choose a new activation or rollback decision;
+  they only finish the already durable authenticated cleanup decision.
+
+Repeated recovery is idempotent at the journal/state-machine level. It may
+repeat an explicitly authorized restart, but it never repeats an exchange or
+cleanup side effect without the existing filesystem/journal authentication
+rules.
+
+### Rollback service equivalence
+
+Rollback does not attempt to recreate the original precommit PID. After the
+exact old config is restored and durable, `ROLLBACK_SERVICE` authorizes one
+fixed restart. Its newly started process must differ from a running process
+witnessed immediately before that specific restart, including on a recovery
+retry; a settled no-process witness requires a new healthy process.
+Verified rollback requires a newly startup-ready, stable
+`cloudflared.service` with:
+
+- the same fixed unit identity and `Type=notify`;
+- the same expected executable device/inode as the journaled baseline;
+- the same explicit adopted-config relationship;
+- a positive stable MainPID/process-start identity;
+- no restart-counter change during the rollback stability window; and
+- exact restored config bytes/metadata already authenticated by the filesystem
+  transaction.
+
+If the old config is restored but the service cannot reach this state, the
+result remains a distinct config-restored/service-recovery failure and recovery
+artifacts are retained as required by the journal phase.
 ## Rollback contract
 
 Failure after durable `CONFIG_COMMITTING` intent does not by itself require
@@ -855,9 +988,10 @@ rollback procedure:
 3. restores and verifies intended UID, GID, mode, and every supported metadata
    item;
 4. fsyncs the restored file and active directory in the required order;
-5. uses the fixed service operation to return cloudflared to the prior config;
-6. verifies service/process/readiness state is stably equivalent to the
-   journaled healthy baseline; and
+5. durably publishes and reverifies `ROLLBACK_SERVICE`, then uses the one
+   fixed restart operation to make cloudflared load the restored config;
+6. verifies the restarted service/process/startup-readiness state is stably
+   equivalent to the journaled supported baseline; and
 7. verifies the restored active digest and metadata before completing the
    failure result.
 
@@ -1212,15 +1346,15 @@ does not authenticate recovery, and cannot open or close this barrier.
 | Service baseline changes after the final check, during exchange, or after exchange | Candidate may be active while the process no longer matches the baseline | Post-commit continuity verification detects the mismatch; publish and reverify `ACTIVATION_FAILED`, then publish each rollback intent before restoring config and baseline-equivalent service state |
 | After active file fsync but before active-directory fsync | File data durable; name swap may not be | Same classification; do not assume either namespace survived power loss |
 | After active-directory fsync but before durable `CONFIG_COMMITTED` publication | New active is durable; authoritative journal remains `CONFIG_COMMITTING`; `journal.next` may be partial/complete | Discard recognized staging durably, classify the active namespace from `CONFIG_COMMITTING`, then republish/advance or roll back; issue no service command from staging contents |
-| After `CONFIG_COMMITTED` but before service operation | New active durable; old process may still use old config | Resume bounded service activation when PR B supports it; post-exchange continuity/baseline/active-state failure permits `CONFIG_COMMITTED -> ACTIVATION_FAILED`; PR A must report recovery required rather than success |
-| During restart/reload | New active durable; published phase is `SERVICE_ACTIVATING`; service state unknown | Reinspect systemd and process identity; command failure, timeout, bad identity, readiness failure, or instability permits `SERVICE_ACTIVATING -> ACTIVATION_FAILED`; do not trust prior command status |
-| After service becomes healthy but before durable `SERVICE_VERIFIED` publication | New active and possibly healthy service; authoritative journal remains `SERVICE_ACTIVATING`; `journal.next` may exist | Discard recognized staging durably, repeat readiness/stability verification from the published phase, and republish; failure publishes `ACTIVATION_FAILED`, while success is not inferred from staging |
-| After `SERVICE_VERIFIED` but before durable cleanup-decision publication | Active/service state was verified, but final revalidation can fail; staging may contain a proposed decision | Do not delete artifacts; discard interrupted staging and reverify from published `SERVICE_VERIFIED`; publish `COMMIT_CLEANUP_PENDING` only on success, otherwise publish and reverify `ACTIVATION_FAILED` before rollback |
+| After `CONFIG_COMMITTED` but before service operation | New active durable; old process may still use old config | Recover through PR14's bounded service activation after the unit settles; a live observed post-exchange continuity failure durably selects `ACTIVATION_FAILED` before rollback, while crash recovery does not invent an unrecorded failure |
+| During the fixed restart | New active durable; published phase is `SERVICE_ACTIVATING`; service state may be transitional or the restart result may be unknown | If the unit remains transitional, retain `SERVICE_ACTIVATING` and return recovery required; once settled, recovery reissues the fixed restart and verifies from scratch. Only a settled failed verification may select `ACTIVATION_FAILED` |
+| After the restart may have succeeded but before durable `SERVICE_VERIFIED` publication | New active may be healthy; authoritative journal remains `SERVICE_ACTIVATING`; `journal.next` may exist | Discard recognized staging durably; after the unit is non-transitional, reissue the fixed restart rather than inferring completion from an interrupted operation, then verify from scratch and publish `SERVICE_VERIFIED` or settled `ACTIVATION_FAILED` |
+| After `SERVICE_VERIFIED` but before durable cleanup-decision publication | Candidate/service startup was already durably verified; staging may contain a proposed cleanup decision | Do not issue another service command, re-check edge health, or select automatic rollback. Discard interrupted staging, reauthenticate candidate-active filesystem/journal authority, and publish `COMMIT_CLEANUP_PENDING`; later runtime failure does not reopen the activation decision |
 | After durable `COMMIT_CLEANUP_PENDING`, before or during cleanup | Commit is irrevocably selected; some or all rollback artifacts may remain | Never re-select `ACTIVATION_FAILED` or roll back solely for missing cleanup artifacts; authenticate and remove those still present, accept already-absent allowlisted artifacts, and fsync affected directories |
 | After commit cleanup directory fsync, before journal retirement | Commit decision and completed cleanup are durable; journal still says `COMMIT_CLEANUP_PENDING` | Reverify cleanup, securely unlink/fsync/recheck the journal namespace, then expose logical `COMMITTED_SUCCESS`; never write a persistent success journal or report success earlier |
 | During rollback staging or namespace restoration | Journal says rollback; active may be candidate or restored source | Classify only known digests and artifacts; continue exact restoration if safe; otherwise `ROLLBACK_FAILED_STATE_INDETERMINATE` |
 | After restored file fsync but before directory fsync | Restored bytes exist but namespace durability uncertain | Repeat classification and required fsync; service recovery waits for durable namespace |
-| During rollback service recovery | Old config durable; service state unknown | Verify/retry bounded fixed activation and readiness; distinguish config-restored/service-failed |
+| During rollback service recovery | Old config durable; published phase is `ROLLBACK_SERVICE`; service state may be transitional or restart completion unknown | While transitional, retain recovery authority. Once settled, reissue the fixed restart against the restored config and verify from scratch; distinguish verified rollback from config-restored/service-unverified failure |
 | After `ROLLBACK_VERIFIED` but before rollback decision | Old config and baseline-equivalent service proven; all required recovery artifacts remain | Do not delete artifacts; publish and reverify `ROLLBACK_CLEANUP_PENDING` first |
 | After durable `ROLLBACK_CLEANUP_PENDING`, before or during cleanup | Verified rollback is irrevocably selected; artifacts may be partially absent | Authenticate and remove remaining allowlisted artifacts idempotently, accept already-absent allowlisted artifacts, and fsync affected directories |
 | After rollback cleanup directory fsync, before journal retirement | Restored config/service and cleanup are durable; journal still says `ROLLBACK_CLEANUP_PENDING` | Reverify cleanup, securely unlink/fsync/recheck the journal namespace, then expose logical `FAILED_ROLLED_BACK`; never write a persistent rollback-result journal |
@@ -1365,11 +1499,11 @@ Root privilege increases the consequences of a bug. It does not make unsafe
 YAML, ambiguous ingress, path-only validation, unbounded reads, or stale
 snapshots acceptable.
 
-## Proposed implementation sequence
+## Implementation history and remaining scope
 
-### Implementation PR A: privileged filesystem transaction foundation
+### PR12: privileged filesystem transaction foundation
 
-Keep the first code review narrow:
+PR12 established the internal filesystem foundation with these review bounds:
 
 - a root-only, allowlisted internal/helper entry point with no sudoers and no
   web/CLI mutation exposed to the application user;
@@ -1403,41 +1537,55 @@ Keep the first code review narrow:
 - no cloudflared service restart/reload and no claim of production activation
   success.
 
-Because a config commit without service integration is not an end-user feature,
-PR A should remain unwired or require an explicit root-only test/admin mode that
-cannot be mistaken for complete activation. Review must decide which is safer
-before merge. No candidate may be committed from dashboard traffic.
+PR12 remained unwired and did not claim complete activation. No candidate can
+be committed from dashboard traffic.
 
-Production activation MUST NOT be enabled until every existing root manager
-operation that can change the active release, adopted config identity, or
-related persistent authority establishes the durably clean journal namespace
-under the shared outer lock before it revalidates and changes authority. This
-is a required integration invariant, not optional follow-up hardening. If gate
-integration is split into a separate prerequisite PR, activation remains
-unwired/disabled until that PR is merged and verified.
+PR12 integrated the durably clean journal-namespace gate into root manager
+operations that change the active release, adopted config identity, or related
+persistent authority. They prove that gate under the shared outer lock before
+revalidating and changing authority. It remains a required invariant.
 
-### Implementation PR B: cloudflared service activation and rollback
+### PR14: internal cloudflared service activation and rollback
 
-- fixed service-control interface and executable/unit identity;
-- mandatory precommit `SERVICE_BASELINE_VERIFIED` capture, bounded stability,
-  and fail-closed rejection of inactive, failed, mismatched, or unstable
-  initial service state;
-- durable sanitized baseline facts sufficient to prove baseline-equivalent
-  service restoration without storing raw command lines or paths;
-- fresh baseline revalidation after durable `CONFIG_COMMITTING`, immediate
-  exchange with no intervening work, and post-exchange continuity checks that
-  turn any detected/ambiguous asynchronous service change into rollback;
-- verified reload support or an explicit restart decision;
-- systemd job, active-state, stable MainPID, executable/config identity, and
-  readiness checks;
-- stability windows and bounded timeouts;
-- integration with durable journal recovery;
-- restart/reload of restored config on failure;
-- distinct config-restored/service-failed outcomes; and
-- end-to-end activation/rollback tests using fakes or isolated disposable
-  systemd fixtures, never the host's production cloudflared service.
+PR14 completes the internal transaction foundation but remains unwired from
+browser and supported mutation CLI surfaces.
 
-Only after both foundations are reviewed should later PRs address:
+PR14's implemented scope includes:
+
+- a strict cloudflared service observer/controller separate from the
+  existing manager-service controller;
+- bounded systemd `ExecStart` parsing with unknown/ambiguous facts causing
+  fail-closed activation refusal;
+- support for only exact `cloudflared.service`, `Type=notify`, local-config mode,
+  explicit adopted `--config`, and the expected executable identity;
+- fixed restart-only service activation; no reload, daemon-reload,
+  unit editing, enable/disable, arbitrary service control, or service repair;
+- bounded baseline, immediate pre-exchange revalidation,
+  post-exchange continuity classification, and stable post-restart verification;
+- every restart behind durable `SERVICE_ACTIVATING` or
+  `ROLLBACK_SERVICE` authority;
+- restart timeout/transitional states recovery-required rather than racing
+  config mutation against a still-running systemd job;
+- deterministic recovery rules for `CONFIG_COMMITTED`,
+  `SERVICE_ACTIVATING`, `SERVICE_VERIFIED`, `ROLLBACK_SERVICE`, and
+  `ROLLBACK_VERIFIED` above;
+- no `SERVICE_VERIFIED -> ACTIVATION_FAILED` transition, so delayed unrelated outages
+  cannot retroactively select automatic rollback;
+- commit and rollback cleanup through the existing PR12 durable
+  cleanup-decision protocol;
+- sanitized journal/error output without raw systemd
+  `ExecStart`, command lines, paths, tokens, logs, stdout, or stderr;
+- deterministic fake-clock/fake-systemd tests for every service transition,
+  timeout, transitional state, crash/recovery point, PID/start reuse case,
+  restart-loop case, wrong executable/config relationship, and rollback-service
+  failure;
+- the complete repository suite and existing PR12 crash/recovery tests; and
+- no web mutation route, API/DNS behavior, sudoers policy, general root
+  command proxy, or production activation command.
+
+Both foundations remain internal. Any future journal/baseline schema change
+must remain strictly parsed and tested; no production migration may be assumed
+to exist. Later, separately reviewed PRs may address:
 
 - a web-to-privileged-boundary authorization mechanism;
 - Cloudflare API credentials and positively owned DNS records;
@@ -1465,7 +1613,7 @@ touches `/etc/cloudflared`, the real systemd manager, DNS, or Cloudflare.
 | Locking | second activation rejected; manager update/config action contention; shared outer lock precedes journal-directory verification, clean-namespace proof, authority revalidation, and any activation lock; reverse order rejected; lock symlink/type/owner/mode attacks; crash releases descriptor locks but journal barrier remains; manual edit still detected despite manager lock |
 | Persistent recovery barrier | every valid authoritative journal with remaining transaction/recovery/cleanup work blocks release update, installer/reconciliation switching, adopt, and clear; malformed/unknown-schema/impossible authoritative state and unsafe/unknown namespace objects also block; recognized current-plus-staging and staging-only crash shapes are cleaned by the fixed protocol rather than mislabeled ambiguous; cleanup-decision identity mismatch blocks and is never ignored; every rejection leaves current release, adopted setting, journal/artifacts, cloudflared config, and both services byte/state unchanged |
 | Journal publication | initial generation 1; complete successor; same transaction ID; generation exactly `current + 1`; predecessor generation/digest; allowlisted `BACKUP_DURABLE` or `CONFIG_COMMITTING` abort transition; other illegal transition; short/failed write; staging fsync failure; parse/reverification failure; rename failure; directory-fsync failure; crash after directory fsync but before published reverification; published reopen/digest/namespace failure; assert no successor-dependent side effect before rename plus directory fsync plus published reverification |
-| Activation-failure transitions | allow and guard `CONFIG_COMMITTING`, `CONFIG_COMMITTED`, `SERVICE_ACTIVATING`, and pre-decision `SERVICE_VERIFIED` as the only published predecessors of `ACTIVATION_FAILED`; exact original active uses `PRECOMMIT_ABORT`, unknown third-party active state fails closed, and `COMMIT_CLEANUP_PENDING` cannot re-select rollback; inject failure before/during each `ACTIVATION_FAILED` publication and assert no rollback side effect until publication is durable and reverified, then `ACTIVATION_FAILED -> ROLLBACK_CONFIG` |
+| Activation-failure transitions | allow and guard only `CONFIG_COMMITTING`, `CONFIG_COMMITTED`, and `SERVICE_ACTIVATING` as published predecessors of `ACTIVATION_FAILED`; prove `SERVICE_VERIFIED -> ACTIVATION_FAILED` is rejected; exact original active uses `PRECOMMIT_ABORT`, unknown third-party active state fails closed, and cleanup-decision phases cannot re-select rollback; inject failure before/during each `ACTIVATION_FAILED` publication and assert no rollback side effect until publication is durable and reverified, then `ACTIVATION_FAILED -> ROLLBACK_CONFIG` |
 | Interrupted journal publication | crash/power loss halfway through staging write, after staging fsync, immediately before rename, immediately after rename, and after rename before directory fsync; valid old plus valid/malformed staging; invalid old plus valid-looking staging; staging-only initial publication; recognized staging symlink/wrong owner/mode/type/link count; extra/alternate journal object; second recovery process; verify `journal` alone is authority, staging is never promoted, supported cleanup is directory-fsynced, and unknown shapes fail closed |
 | Durably clean journal namespace | initially absent fixed journal still requires verified-directory fsync and post-fsync absence rescan; directory/ancestor rename, replacement, or identity change around scan/fsync fails closed; injected fsync/rescan failure blocks update/adopt/clear; cleanup-decision journal with already-absent artifacts authenticates against current authority, repeats affected-directory fsyncs, and retires; crash immediately before unlink, immediately after unlink, after unlink before fsync, after reboot with observed absence, and a second crash all resume deterministically; journal reappearance resumes recovery rather than becoming history; authority change immediately after the clean proof cannot resurrect the old journal or require old authority; no authority action or final result before the clean proof |
 | Recovery contention | activation recovery and update/config acquire the same outer lock; recovery holding it blocks authority mutation; update/config holding it blocks recovery until release; after acquisition each rechecks the barrier; repeated rejection and recovery are deterministic and deadlock-free |
@@ -1478,55 +1626,75 @@ touches `/etc/cloudflared`, the real systemd manager, DNS, or Cloudflare.
 | Successful commit | exact candidate at adopted name; exact intended owner/group/mode; supported metadata preserved; displaced source matches snapshot; active directory durable; source was never truncated in place |
 | Service baseline | unit missing/not loaded; inactive, failed, activating, deactivating, or unexpected substate; zero/unstable/reused PID; restart loop; wrong executable; wrong adopted-config relationship; readiness failure; stability-window failure; every case rejects before namespace mutation and performs no service action |
 | Baseline journal | sanitized enums, PID/start identity, executable identity, adopted-config fingerprint/digest relationship, and stability evidence round-trip; no raw `ExecStart`, paths, YAML, token, command line, stdout, or stderr; baseline change before intent or during the mandatory post-intent pre-exchange recheck rejects |
-| Service command | fixed absolute executable and unit; no caller-controlled argv/env; timeout; nonzero systemctl result; active-but-zero PID; PID changes during check; wrong executable/config; restart loop; readiness never arrives; readiness arrives then process dies |
+| Service command | fixed absolute `systemctl restart cloudflared.service` only; reject reload/alternate unit/caller-controlled argv or env; `Type=notify` and strict local-config `ExecStart`; timeout/nonzero result with transitional versus settled classification; active-but-zero PID; PID/start reuse; wrong executable/config; restart loop; notify readiness never arrives; readiness arrives then process dies during the stability window |
 | Rollback | activation failure with exact rollback to baseline-equivalent health; config restored but service recovery fails; backup corrupt/missing before terminal decision; active matches unknown third-party state; metadata restore failure; rollback fsync failure; reverse exchange failure; restoration verification mismatch; distinct sanitized outcomes |
 | Commit cleanup | crash before commit decision retains every rollback artifact; durable `COMMIT_CLEANUP_PENDING` precedes deletion; crash before/after each artifact unlink, affected-directory fsync, journal unlink, journal-directory fsync, and clean rescan; existing artifact identity mismatch rejects; already-absent allowlisted artifact resumes safely; no success or persistent `COMMITTED_SUCCESS` journal before namespace cleanliness |
 | Rollback cleanup | crash before rollback decision retains every recovery artifact; durable `ROLLBACK_CLEANUP_PENDING` precedes deletion; crash before/after each artifact unlink, affected-directory fsync, journal unlink, journal-directory fsync, and clean rescan; identity mismatch rejects; already-absent allowlisted artifact resumes safely; no verified-rollback result or persistent `FAILED_ROLLED_BACK` journal before namespace cleanliness |
 | `CONFIG_COMMITTING` recovery | exact original active selects precommit abort/cleanup with no service action; exact candidate plus exact displaced source can continue committed recovery; exact candidate plus unexpected displaced object requires durable failure/rollback intent before compensation or manual recovery; any other active identity is indeterminate/manual recovery; identical classification after an in-memory `PRE_EXCHANGE_REVALIDATED` crash |
 | Crash recovery | every row in the crash matrix; old/candidate/unknown active digest; malformed or impossible journal; stale release/adopted path; journal symlink/permissions/tamper; phase-sensitive required versus cleanup-optional missing artifacts; multiple artifacts; idempotent repeated recovery and retirement; no new transaction or authority change until the journal namespace is durably clean |
 | Information safety | secret-looking YAML, paths, stdout/stderr, environment and tokens never appear in exceptions, reprs, logs, journal, CLI safe output, or browser models |
-| Scope regression | web routes remain GET-only; Add/Edit/Delete remain disabled; no Cloudflare API/DNS calls; no production config writes from web; no sudoers/unit privilege broadening; no cloudflared service call in PR A |
+| Scope regression | web routes remain GET-only; Add/Edit/Delete remain disabled; no Cloudflare API/DNS calls; no production config writes or cloudflared service calls from web; no sudoers/unit privilege broadening |
 
 Tests must inject short writes, `EINTR`/I/O errors where relevant, fsync and
 close failures, timeout boundaries, and failures after every durable state
 transition. Property/state-machine tests are encouraged for journal transition
 legality, but do not replace explicit attack regressions.
 
-## Unresolved decisions and mandatory review gates
+## Resolved decisions and remaining review gates
 
-The design deliberately leaves these questions open until the corresponding
-implementation can prove them:
+The following earlier design questions are now resolved by the merged PR12
+foundation:
 
-1. **Commit primitive:** confirm that directory-FD-relative
-   `renameat2(RENAME_EXCHANGE)` plus displaced-identity verification meets the
-   concurrent-edit contract on every supported filesystem. Prototype and
-   adversarially test compensation of an unexpected displaced object only
-   after durable rollback intent; this document does not prove the exact
-   exchange-back algorithm safe. If the operator object cannot be preserved
-   across crashes and races, activation remains disabled; unchecked replace
-   is not a fallback.
-2. **Metadata support:** decide which ACL/xattr/security-label environments are
-   supported. The default is fail closed on nontrivial metadata.
-3. **State locations:** choose fixed root-owned backup/journal locations and
-   demonstrate permissions, mount assumptions, fsync behavior, and recovery.
-4. **PR A exposure:** decide whether filesystem transaction code is entirely
-   unwired or has a root-only administrative test command. It cannot be exposed
-   to the web service or called a complete activation.
-5. **Service operation:** verify cloudflared reload support for the deployed
-   version/unit; otherwise use restart. Do not infer support from systemctl
-   accepting `reload`.
-6. **Readiness:** define a meaningful, bounded signal proving the expected
-   cloudflared process is stably using the committed config, including behavior
-   during network outages.
-7. **Future web authorization:** choose an exact non-wildcard invocation and
-   request transport, bind it to the active manager process/release, and review
-   HTTP authentication/CSRF/rate limits before adding sudoers or mutation
-   routes.
-8. **Recovery policy after committed config:** decide when an authenticated
-   incomplete transaction may resume service verification versus conservatively
-   rolling back. Either path must be deterministic and tested.
+1. **Commit primitive:** same-directory
+   `renameat2(RENAME_EXCHANGE)` is required; unavailable/ambiguous support
+   fails closed, and unexpected displaced state is preserved for authenticated
+   rollback or manual recovery rather than overwritten.
+2. **Metadata support:** the initial implementation supports ordinary
+   UID/GID/mode and fails closed on nontrivial extended metadata/file flags.
+3. **State locations and recovery:** fixed restrictive manager-owned journal and
+   backup directories plus the persistent recovery barrier are implemented.
+4. **PR12 exposure:** the filesystem transaction is internal/unwired. There is
+   no supported browser or ordinary CLI activation path.
 
-No implementation PR may silently resolve these by weakening an invariant.
-Its description must list the decision made, evidence/tests supporting it,
-deployment implications, and any unsupported host/filesystem state that now
-fails closed.
+PR14 resolves the service-layer questions as follows:
+
+5. **Service operation:** restart only; no reload. The supported unit is fixed
+   `cloudflared.service` with `Type=notify`, strict local-config
+   `ExecStart`, and the adopted config path.
+6. **Readiness:** startup readiness is proven by the notify-based systemd
+   contract plus process/executable/config identity and a bounded stability
+   window. PR14 intentionally does not invent a metrics endpoint or claim
+   continuous edge connectivity after startup.
+7. **Committed-service recovery:** `CONFIG_COMMITTED` and
+   `SERVICE_ACTIVATING` deterministically resume by an authorized/repeated
+   restart after the unit is non-transitional; durable `SERVICE_VERIFIED`
+   closes service failure selection and recovery proceeds to authenticated
+   commit cleanup without re-judging later runtime health.
+8. **Rollback-service recovery:** `ROLLBACK_SERVICE` may repeat the fixed
+   restart after non-transitional classification; durable `ROLLBACK_VERIFIED`
+   closes service recovery selection and proceeds to authenticated cleanup
+   without re-judging later runtime health.
+
+The following remain separate future review gates and are explicitly outside
+PR14:
+
+9. **Web authorization and privilege transport:** choose the exact
+   non-wildcard web-to-privileged invocation, authentication, CSRF/rate-limit
+   boundary, and install-time privilege policy before exposing mutations.
+10. **Continuous edge readiness:** an optional explicit metrics `/ready`
+    capability may be designed later, but must bind a deterministic endpoint to
+    the expected cloudflared instance. Port guessing/scanning and log scraping
+    are not acceptable substitutes.
+11. **Broader service environments:** non-systemd managers, remote-token
+    tunnels, non-notify units, alternate unit names, and reload semantics need a
+    separate capability contract rather than weakening PR14's fail-closed
+    boundary.
+12. **DNS/API domain transactions:** record ownership, compensation, and
+    Add/Edit/Enable/Disable/Delete remain separate from local config/service
+    activation.
+
+No implementation PR may silently resolve a remaining gate by weakening these
+invariants. Its description must list the decisions made, evidence/tests
+supporting them, deployment implications, and unsupported host/service state
+that fails closed.
+

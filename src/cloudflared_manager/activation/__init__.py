@@ -1,1 +1,1 @@
-"""Internal filesystem activation foundation; no production invocation in PR12."""
+"""Internal config/service activation and recovery; no web or CLI invocation."""
