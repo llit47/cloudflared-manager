@@ -13,6 +13,14 @@ from cloudflared_manager.activation.bridge_protocol import (
 
 HELPER_PATH = Path("/opt/cloudflared-manager/privileged-helper")
 SUDO_PATH = Path("/usr/bin/sudo")
+# Longest recovery: CONFIG_COMMITTED's extra settled check, then a failed
+# activation and verified rollback. Six settled checks (2 shows + 1s each),
+# two witnesses (4 shows + 1s each), two confirmations (2 shows each), two
+# restarts, and two verifications (4 shows + 1s each) cost 230s at the PR14
+# 5s show/30s restart limits. A failed final activation show may add 5s to
+# reap its process; helper input may take 5s. 300s leaves 60s for startup,
+# filesystem/journal work, and scheduling without cutting off that path.
+RECOVERY_TIMEOUT_SECONDS = 300
 _RESULT_CODES = frozenset({
     "NO_RECOVERY_REQUIRED", "COMMITTED_SUCCESS", "FAILED_PRECOMMIT",
     "FAILED_ROLLED_BACK", "RECOVERY_REQUIRED",
@@ -38,7 +46,7 @@ def recover(*, runner=subprocess.run) -> BridgeResult:
         completed = runner(
             [str(SUDO_PATH), "-n", str(HELPER_PATH)],
             input=request, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=120, check=False, shell=False,
+            timeout=RECOVERY_TIMEOUT_SECONDS, check=False, shell=False,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise BridgeUnavailable("The privileged helper is unavailable.") from None

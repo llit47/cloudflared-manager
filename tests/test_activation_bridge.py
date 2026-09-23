@@ -8,10 +8,14 @@ from types import SimpleNamespace
 import pytest
 
 from cloudflared_manager.activation.bridge_client import (
-    HELPER_PATH, SUDO_PATH, BridgeUnavailable, recover,
+    HELPER_PATH, RECOVERY_TIMEOUT_SECONDS, SUDO_PATH, BridgeUnavailable, recover,
 )
-from cloudflared_manager.activation.bridge_helper import serve
+from cloudflared_manager.activation.bridge_helper import REQUEST_READ_TIMEOUT_SECONDS, serve
 from cloudflared_manager.activation.bridge_protocol import parse_request, ProtocolRefused
+from cloudflared_manager.activation.service import STABILITY_SECONDS
+from cloudflared_manager.activation.service_io import (
+    COMMAND_TERMINATION_TIMEOUT_SECONDS, RESTART_TIMEOUT_SECONDS, SHOW_TIMEOUT_SECONDS,
+)
 from cloudflared_manager.activation.transaction import ActivationError
 
 
@@ -115,11 +119,27 @@ def test_client_uses_fixed_sudo_argv_and_no_shell():
     argv, kwargs = seen[0]
     assert argv == [str(SUDO_PATH), "-n", str(HELPER_PATH)]
     assert kwargs["shell"] is False
+    assert kwargs["timeout"] == RECOVERY_TIMEOUT_SECONDS
     assert json.loads(kwargs["input"])["operation"] == "recover"
 
 
+def test_client_timeout_covers_failed_activation_and_verified_rollback():
+    # CONFIG_COMMITTED recovery first checks settled state, then enters the
+    # SERVICE_ACTIVATING path. Its failure path checks settled state twice more
+    # before exchange; rollback has its own settled/witness/restart/verify.
+    settled = 2 * SHOW_TIMEOUT_SECONDS + STABILITY_SECONDS
+    witness = 4 * SHOW_TIMEOUT_SECONDS + STABILITY_SECONDS
+    confirmation = 2 * SHOW_TIMEOUT_SECONDS
+    verification = 4 * SHOW_TIMEOUT_SECONDS + STABILITY_SECONDS
+    service_bound = (6 * settled + 2 * witness + 2 * confirmation
+                     + 2 * RESTART_TIMEOUT_SECONDS + 2 * verification
+                     + COMMAND_TERMINATION_TIMEOUT_SECONDS)
+    assert service_bound == 235
+    assert RECOVERY_TIMEOUT_SECONDS >= service_bound + REQUEST_READ_TIMEOUT_SECONDS + 60
+
+
 @pytest.mark.parametrize("failure", [
-    FileNotFoundError(), subprocess.TimeoutExpired("sudo", 120),
+    FileNotFoundError(), subprocess.TimeoutExpired("sudo", RECOVERY_TIMEOUT_SECONDS),
 ])
 def test_client_reports_sudo_or_helper_unavailable(failure):
     def runner(*args, **kwargs):

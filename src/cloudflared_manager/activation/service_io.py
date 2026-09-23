@@ -18,6 +18,9 @@ _SYSTEMCTL = Path("/usr/bin/systemctl")
 _ENV = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C", "SYSTEMD_PAGER": "cat"}
 _SHOW = (str(_SYSTEMCTL), "show", UNIT, "--no-pager", "--property=" + ",".join(PROPERTIES))
 _RESTART = (str(_SYSTEMCTL), "restart", UNIT)
+SHOW_TIMEOUT_SECONDS = 5
+RESTART_TIMEOUT_SECONDS = 30
+COMMAND_TERMINATION_TIMEOUT_SECONDS = 5
 
 
 @contextmanager
@@ -61,7 +64,9 @@ def _execute(*, restart: bool) -> tuple[bool, bytes]:
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 shell=False, close_fds=True, pass_fds=(fd,), env=dict(_ENV), cwd="/",
             )
-            deadline = time.monotonic() + (30 if restart else 5)
+            deadline = time.monotonic() + (
+                RESTART_TIMEOUT_SECONDS if restart else SHOW_TIMEOUT_SECONDS
+            )
             output = bytearray()
             assert process.stdout is not None
             with selectors.DefaultSelector() as selector:
@@ -86,7 +91,7 @@ def _execute(*, restart: bool) -> tuple[bool, bytes]:
         if process is not None:
             if process.poll() is None:
                 process.kill()
-                process.wait(timeout=5)
+                process.wait(timeout=COMMAND_TERMINATION_TIMEOUT_SECONDS)
             if process.stdout is not None:
                 process.stdout.close()
 

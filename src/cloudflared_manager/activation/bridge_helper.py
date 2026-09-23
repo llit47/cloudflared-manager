@@ -23,6 +23,7 @@ _SUCCESS_CODES = frozenset({
     "FAILED_ROLLED_BACK", "RECOVERY_REQUIRED",
     "CONFIG_RESTORED_SERVICE_RECOVERY_FAILED", "ROLLBACK_FAILED_STATE_INDETERMINATE",
 })
+REQUEST_READ_TIMEOUT_SECONDS = 5.0
 
 
 def dispatch(request: Request, recover: Callable[[], object]) -> tuple[bool, str]:
@@ -66,7 +67,7 @@ def _read_request(stdin: BinaryIO) -> bytes:
         fd = stdin.fileno()
     except (AttributeError, OSError):
         return stdin.read(MAX_REQUEST_BYTES + 1)
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + REQUEST_READ_TIMEOUT_SECONDS
     chunks: list[bytes] = []
     size = 0
     while size <= MAX_REQUEST_BYTES:

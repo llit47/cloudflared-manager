@@ -1606,7 +1606,13 @@ administrator runs `sudo cfm-config install-bridge` explicitly. That command
 requires the current release, validates the fixed sudoers text with `visudo`,
 and installs one root-owned helper and one root-owned policy file. The policy
 allows the dedicated service account only the no-argument helper path. The
-unprivileged client uses `sudo -n` with fixed argv and a 120-second deadline.
+unprivileged client uses `sudo -n` with fixed argv and a 300-second deadline.
+The longest service path (recovery from `CONFIG_COMMITTED`, failed activation,
+then verified rollback) permits 230 seconds of show, restart, and stability
+checks, plus up to five seconds of failed-command cleanup and five seconds of
+request input. The remaining 60 seconds allow for startup, local filesystem
+work, and scheduling. Filesystem latency has no strict wall-clock bound;
+an actual client timeout remains a fail-closed recovery case.
 The helper accepts at most 4096 bytes and a single version 1 JSON `recover`
 request, then calls the existing `FilesystemActivation.recover()` method. The
 helper does not expose `run()` or accept a mutation, path, unit, or command.
