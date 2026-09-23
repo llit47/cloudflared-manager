@@ -117,6 +117,13 @@ changes, configuration validation, and service restarts.
 - Revalidate the adopted path, active manager release, source bytes and
   file/parent identity immediately before commit. Reject concurrent or manual
   changes; never merge or rebase a prepared mutation onto changed config.
+- Treat the host administrator/root as part of the trusted computing base.
+  Reject concurrent or manual changes observable at required validation and
+  recovery boundaries; retain all crash-safety and fail-closed recovery checks.
+  Do not require protection against an independently acting process with
+  equivalent root privilege changing manager-private root-owned transaction
+  files, whether deliberately or accidentally, between completed leaf
+  verification and the immediately following namespace syscall.
 - Preserve PR10's bounded/no-follow snapshots, round-trip structural checks,
   terminal catch-all, exclusive `0600` staging, fsync, retained candidate
   identity, layered parsing, and FD-bound cloudflared validation. Root privilege
