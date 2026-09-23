@@ -16,7 +16,7 @@ EXEC = ('{ path=/usr/bin/cloudflared ; argv[]=/usr/bin/cloudflared --no-autoupda
 def output(**changes):
     values = dict(Id='cloudflared.service', LoadState='loaded', ActiveState='active',
                   SubState='running', Type='notify', MainPID='42', NRestarts='0',
-                  ExecStart=EXEC, Job='0', NeedDaemonReload='no')
+                  ExecStart=EXEC, Job='', NeedDaemonReload='no')
     values.update(changes)
     return ''.join(f'{key}={value}\n' for key, value in values.items()).encode()
 
@@ -57,12 +57,28 @@ def observe(service):
 
 
 def test_baseline_and_new_process(service):
+    assert b'Job=\n' in service._io.raw
+    assert parse_show(service._io.raw).settled
     baseline = observe(service)
     assert baseline.stable_milliseconds == 1000
     assert service.restart()
     service._io.raw = output(MainPID='43')
     service._io.identity = (124, 1, 2)
     service.verify(baseline, activation=True)
+
+
+def test_queued_job_is_parsed_but_not_settled(service):
+    service._io.raw = output(Job='123')
+    assert not parse_show(service._io.raw).settled
+    assert not service.settled()
+    with pytest.raises(ServiceRefused):
+        observe(service)
+
+
+@pytest.mark.parametrize('job', ['0', '-1', 'abc', ' 123', '01', '1.0'])
+def test_malformed_job_is_rejected(job):
+    with pytest.raises(ServiceRefused):
+        parse_show(output(Job=job))
 
 
 @pytest.mark.parametrize('change', [

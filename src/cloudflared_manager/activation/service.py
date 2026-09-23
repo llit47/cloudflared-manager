@@ -40,7 +40,7 @@ class Shape:
 
     @property
     def settled(self) -> bool:
-        return self.values["Job"] == "0" and (
+        return self.values["Job"] == "" and (
             self.values["ActiveState"], self.values["SubState"]
         ) in {("active", "running"), ("inactive", "dead"), ("failed", "failed")}
 
@@ -59,9 +59,11 @@ def parse_show(raw: bytes) -> Shape:
             raise ValueError
         if values["Id"] != UNIT or values["LoadState"] != "loaded":
             raise ValueError
-        for key in ("MainPID", "NRestarts", "Job"):
+        for key in ("MainPID", "NRestarts"):
             if re.fullmatch(r"0|[1-9][0-9]{0,18}", values[key]) is None:
                 raise ValueError
+        if values["Job"] and re.fullmatch(r"[1-9][0-9]{0,18}", values["Job"]) is None:
+            raise ValueError
         for key in ("ActiveState", "SubState", "Type"):
             if re.fullmatch(r"[a-z][a-z-]{0,31}", values[key]) is None:
                 raise ValueError
