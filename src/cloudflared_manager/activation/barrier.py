@@ -89,8 +89,11 @@ class ActivationRecoveryBarrier:
         expected = (record.candidate if record.phase == "COMMIT_CLEANUP_PENDING"
                     else record.restoration or record.source)
         current, _ = named_file(active, active_name)
+        ctime = (record.commit_ctimes[0] if record.phase == "COMMIT_CLEANUP_PENDING"
+                 else record.rollback_ctimes[0] if record.phase == "ROLLBACK_CLEANUP_PENDING"
+                 else None)
         if not (current.same_content_metadata(expected) if record.phase == "PRECOMMIT_ABORT"
-                else current.same_after_exchange(expected)):
+                else current.same_after_exchange(expected) and current.ctime_ns == ctime):
             raise FilesystemRefused("UNKNOWN_ACTIVE_STATE")
         candidate_name = record.restoration_name if record.restoration is not None else record.candidate_name
         names = [(active, candidate_name), (backup_dir, record.backup_name)]

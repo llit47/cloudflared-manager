@@ -160,7 +160,11 @@ class FilesystemActivation:
                         self._require_source_at(active, handle.name, source, exchanged=True)
                         os.fsync(handle.file_fd)
                         fsync_directory(active)
-                        record = journal.publish(record.successor("CONFIG_COMMITTED"),
+                        commit_ctimes = self._observed_ctimes(
+                            active, adopted.name, handle.name, candidate, source,
+                        )
+                        record = journal.publish(record.successor("CONFIG_COMMITTED",
+                                                                  commit_ctimes=commit_ctimes),
                                                  authenticate=lambda item: self._authenticate(item, active, backups))
                         # PR B must resume service activation or select rollback.
                         return FilesystemResult("SERVICE_ACTIVATION_PENDING", transaction_id)
@@ -274,7 +278,12 @@ class FilesystemActivation:
                                     os.close(fd)
                                 fsync_directory(active)
                                 self._authenticate(record, active, backups)
-                                committed = journal.publish(record.successor("CONFIG_COMMITTED"),
+                                commit_ctimes = self._observed_ctimes(
+                                    active, adopted.name, record.candidate_name,
+                                    record.candidate, record.source,
+                                )
+                                committed = journal.publish(record.successor(
+                                    "CONFIG_COMMITTED", commit_ctimes=commit_ctimes),
                                                             authenticate=lambda item: self._authenticate(item, active, backups))
                                 return FilesystemResult("SERVICE_ACTIVATION_PENDING", committed.transaction_id)
                             raise FilesystemRefused("ROLLBACK_FAILED_STATE_INDETERMINATE")
@@ -287,8 +296,7 @@ class FilesystemActivation:
                                 if record.phase == "ACTIVATION_FAILED":
                                     record = journal.publish(record.successor("ROLLBACK_CONFIG"),
                                                              authenticate=lambda item: self._authenticate(item, active, backups))
-                                self._fsync_verified_active(active, adopted.name,
-                                                            record.restoration or record.source)
+                                self._complete_rollback(record, journal, active, backups, adopted.name)
                                 return FilesystemResult("CONFIG_RESTORED_SERVICE_PENDING", record.transaction_id)
                             result = self._handle_failure(record, journal, active, backups, adopted.name)
                             return FilesystemResult(result, record.transaction_id)
@@ -368,17 +376,21 @@ class FilesystemActivation:
             raise FilesystemRefused("CANDIDATE_CONVERSION_FAILED") from None
 
     def _require_candidate(self, active: PinnedDirectory, name: str, expected: FileFacts,
-                           *, exchanged: bool = False) -> None:
+                           *, exchanged: bool = False, ctime_ns: int | None = None) -> None:
         current, _ = named_file(active, name)
         if not (current.same_after_exchange(expected) if exchanged
                 else current.same_content_metadata(expected)):
             raise FilesystemRefused("STALE_CANDIDATE")
+        if ctime_ns is not None and current.ctime_ns != ctime_ns:
+            raise FilesystemRefused("STALE_CANDIDATE")
 
     def _require_source_at(self, active: PinnedDirectory, name: str, expected: FileFacts,
-                           *, exchanged: bool = False) -> None:
+                           *, exchanged: bool = False, ctime_ns: int | None = None) -> None:
         current, _ = named_file(active, name)
         if not (current.same_after_exchange(expected) if exchanged
                 else current.same_content_metadata(expected)):
+            raise FilesystemRefused("STALE_SOURCE")
+        if ctime_ns is not None and current.ctime_ns != ctime_ns:
             raise FilesystemRefused("STALE_SOURCE")
 
     def _authenticate(self, record: JournalRecord, active: PinnedDirectory, backups: BackupStore) -> None:
@@ -388,18 +400,45 @@ class FilesystemActivation:
                                backups: BackupStore) -> None:
         authenticate_complete_cleanup(record, self.authority, active, backups)
 
-    def _fsync_verified_active(self, active: PinnedDirectory, name: str, expected: FileFacts) -> None:
+    def _fsync_verified_active(self, active: PinnedDirectory, name: str, expected: FileFacts,
+                               *, ctime_ns: int | None = None) -> None:
         active.revalidate()
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=active.fd)
         try:
             observed, _ = file_facts(fd)
             if not observed.same_after_exchange(expected):
                 raise FilesystemRefused("ARTIFACT_MISMATCH")
+            if ctime_ns is not None and observed.ctime_ns != ctime_ns:
+                raise FilesystemRefused("ARTIFACT_MISMATCH")
             os.fsync(fd)
         finally:
             os.close(fd)
-        self._require_source_at(active, name, expected, exchanged=True)
+        self._require_source_at(active, name, expected, exchanged=True, ctime_ns=ctime_ns)
         fsync_directory(active)
+
+    def _observed_ctimes(self, active: PinnedDirectory, active_name: str, other_name: str,
+                         active_expected: FileFacts, other_expected: FileFacts) -> tuple[int, int]:
+        active_facts, _ = named_file(active, active_name)
+        other_facts, _ = named_file(active, other_name)
+        if (not active_facts.same_after_exchange(active_expected)
+            or not other_facts.same_after_exchange(other_expected)):
+            raise FilesystemRefused("ARTIFACT_MISMATCH")
+        return active_facts.ctime_ns, other_facts.ctime_ns
+
+    def _complete_rollback(self, record: JournalRecord, journal: JournalStore,
+                           active: PinnedDirectory, backups: BackupStore,
+                           active_name: str) -> None:
+        expected = record.restoration or record.source
+        self._fsync_verified_active(active, active_name, expected,
+                                    ctime_ns=record.rollback_ctimes[0] if record.rollback_ctimes else None)
+        if record.rollback_ctimes is None:
+            other_name = record.restoration_name if record.restoration is not None else record.candidate_name
+            ctimes = self._observed_ctimes(active, active_name, other_name,
+                                           expected, record.candidate)
+            journal.publish(record.successor("ROLLBACK_CONFIG", rollback_ctimes=ctimes),
+                            authenticate=lambda item: self._authenticate(item, active, backups))
+        else:
+            self._authenticate(record, active, backups)
 
     def _cleanup_unpublished(self, active: PinnedDirectory, backups: BackupStore,
                              handle: CandidateCommitHandle | None, backup_name: str | None,
@@ -431,15 +470,17 @@ class FilesystemActivation:
             return "FAILED_PRECOMMIT"
         if record.phase == "ROLLBACK_CONFIG" and current.same_after_exchange(record.restoration or record.source):
             self._authenticate(record, active, backups)
-            self._fsync_verified_active(active, active_name, record.restoration or record.source)
+            self._complete_rollback(record, journal, active, backups, active_name)
             return "CONFIG_RESTORED_SERVICE_PENDING"
-        if not current.same_after_exchange(record.candidate):
+        if (not current.same_after_exchange(record.candidate)
+            or (record.commit_ctimes is not None and current.ctime_ns != record.commit_ctimes[0])):
             raise FilesystemRefused("ROLLBACK_FAILED_STATE_INDETERMINATE")
         if record.phase not in {"CONFIG_COMMITTING", "CONFIG_COMMITTED", "ACTIVATION_FAILED", "ROLLBACK_CONFIG"}:
             raise FilesystemRefused("RECOVERY_REQUIRED")
         displaced_exists = _leaf_exists(active, record.candidate_name)
         if displaced_exists:
-            self._require_source_at(active, record.candidate_name, record.source, exchanged=True)
+            self._require_source_at(active, record.candidate_name, record.source, exchanged=True,
+                                    ctime_ns=record.commit_ctimes[1] if record.commit_ctimes else None)
         elif record.restoration is None and _leaf_exists(active, record.restoration_name):
             # A pre-publication restoration file has no journaled inode. Keep
             # it and the rollback intent for explicit manual review.
@@ -458,13 +499,16 @@ class FilesystemActivation:
                                      authenticate=lambda item: self._authenticate(item, active, backups))
         self._authenticate(record, active, backups)
         target_name = record.restoration_name if record.restoration is not None else record.candidate_name
-        self._require_candidate(active, active_name, record.candidate, exchanged=True)
+        self._require_candidate(active, active_name, record.candidate, exchanged=True,
+                                ctime_ns=record.commit_ctimes[0] if record.commit_ctimes else None)
         self._require_source_at(active, target_name, record.restoration or record.source,
-                                exchanged=record.restoration is None)
+                                exchanged=record.restoration is None,
+                                ctime_ns=(record.commit_ctimes[1] if record.restoration is None
+                                          and record.commit_ctimes else None))
         exchange(active, active_name, target_name)
         self._require_source_at(active, active_name, record.restoration or record.source, exchanged=True)
         self._require_candidate(active, target_name, record.candidate, exchanged=True)
-        self._fsync_verified_active(active, active_name, record.restoration or record.source)
+        self._complete_rollback(record, journal, active, backups, active_name)
         return "CONFIG_RESTORED_SERVICE_PENDING"
 
     def _stage_backup_restoration(self, record: JournalRecord, active: PinnedDirectory,
@@ -527,8 +571,11 @@ class FilesystemActivation:
                         active: PinnedDirectory, backups: BackupStore) -> None:
         self._authenticate(record, active, backups)
         candidate_name = record.restoration_name if record.restoration is not None else record.candidate_name
+        ctimes = (record.commit_ctimes if record.phase == "COMMIT_CLEANUP_PENDING"
+                  else record.rollback_ctimes)
+        assert ctimes is not None
         unlink_known(active, candidate_name, record.cleanup["candidate"],
-                     missing_ok=True, exchanged=True)
+                     missing_ok=True, exchanged=True, ctime_ns=ctimes[1])
         unlink_known(backups.directory, record.backup_name, record.cleanup["backup"], missing_ok=True)
         fsync_directory(active)
         fsync_directory(backups.directory)

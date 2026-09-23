@@ -140,7 +140,8 @@ class BackupStore:
 
 
 def unlink_known(directory: PinnedDirectory, name: str, expected: FileFacts, *,
-                 missing_ok: bool = False, exchanged: bool = False) -> None:
+                 missing_ok: bool = False, exchanged: bool = False,
+                 ctime_ns: int | None = None) -> None:
     """Idempotent cleanup of one authenticated artifact, followed by dir fsync."""
 
     try:
@@ -155,6 +156,8 @@ def unlink_known(directory: PinnedDirectory, name: str, expected: FileFacts, *,
         raise error
     if not (current.same_after_exchange(expected) if exchanged
             else current.same_content_metadata(expected)):
+        raise FilesystemRefused("ARTIFACT_MISMATCH")
+    if ctime_ns is not None and current.ctime_ns != ctime_ns:
         raise FilesystemRefused("ARTIFACT_MISMATCH")
     directory.revalidate()
     os.unlink(name, dir_fd=directory.fd)

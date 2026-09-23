@@ -83,6 +83,8 @@ def test_commit_keeps_exact_backup_and_recovery_journal(fixture):
     assert record.source.sha256 == hashlib.sha256(_SOURCE).hexdigest()
     assert record.backup.sha256 == record.source.sha256
     assert record.candidate.sha256 == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert record.commit_ctimes is not None
+    assert record.commit_ctimes[0] == source.stat().st_ctime_ns
 
 
 def test_final_baseline_change_aborts_before_exchange(fixture):
@@ -479,6 +481,8 @@ def test_authenticated_backup_restores_missing_displaced_original(fixture):
         restored = JournalStore(directory, owner=os.getuid()).load()
     assert restored is not None and restored.phase == "ROLLBACK_CONFIG"
     assert restored.restoration is not None
+    assert restored.rollback_ctimes is not None
+    assert restored.rollback_ctimes[0] == source.stat().st_ctime_ns
     assert restored.restoration.inode == source.stat().st_ino
     assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
 
@@ -860,6 +864,40 @@ def test_post_exchange_active_mtime_touch_blocks_recovery(fixture):
     active = source.read_bytes()
     before = source.stat()
     os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+    with pytest.raises(ActivationError) as caught:
+        engine.recover()
+    assert caught.value.code == "RECOVERY_REQUIRED"
+    assert source.read_bytes() == active
+
+
+@pytest.mark.parametrize("after_rollback", [False, True])
+@pytest.mark.parametrize("interfered_name", ["active", "displaced"])
+def test_journaled_post_exchange_ctime_interference_blocks_recovery(
+    fixture, monkeypatch, after_rollback, interfered_name,
+):
+    source, paths, engine, root = fixture
+    if after_rollback:
+        _missing_displaced_original(fixture)
+        assert engine.recover().code == "CONFIG_RESTORED_SERVICE_PENDING"
+    else:
+        engine.run(insert, validator=Validator())
+    from cloudflared_manager.activation import authentication
+    with PinnedDirectory(paths.config_root / "activation-journal", anchor=root, owner=os.getuid()) as directory:
+        record = JournalStore(directory, owner=os.getuid()).load()
+    assert record is not None
+    target = (source.name if interfered_name == "active" else
+              record.restoration_name if after_rollback else record.candidate_name)
+
+    original_named = authentication.named_file
+
+    def ctime_only_touch(directory, name):
+        facts, data = original_named(directory, name)
+        if name == target:
+            facts = replace(facts, ctime_ns=facts.ctime_ns + 1)
+        return facts, data
+
+    monkeypatch.setattr(authentication, "named_file", ctime_only_touch)
+    active = source.read_bytes()
     with pytest.raises(ActivationError) as caught:
         engine.recover()
     assert caught.value.code == "RECOVERY_REQUIRED"

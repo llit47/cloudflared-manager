@@ -74,8 +74,10 @@ class FileFacts:
         """Identity after RENAME_EXCHANGE, which changes ctime on Linux.
 
         Rename preserves mtime and the remaining recorded facts. Use this
-        only for an inode whose namespace exchange may have occurred; source,
-        candidate, backup, and staging checks before exchange stay exact.
+        only while an exchange may have occurred but its resulting ctime has
+        not yet been durably journaled. Later phases compare the observed
+        post-exchange ctime as well. Source, candidate, backup, and staging
+        checks before exchange stay exact.
         """
 
         return (

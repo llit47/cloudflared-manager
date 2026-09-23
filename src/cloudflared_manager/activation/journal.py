@@ -48,6 +48,15 @@ def _object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+def _parse_ctimes(value: object) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    if (not isinstance(value, list) or len(value) != 2
+        or any(type(item) is not int or item < 0 for item in value)):
+        raise ValueError
+    return value[0], value[1]
+
+
 @dataclass(frozen=True, slots=True)
 class BaselineFacts:
     """Sanitized evidence supplied by a future independently verified service gate."""
@@ -107,6 +116,8 @@ class JournalRecord:
     baseline: BaselineFacts
     cleanup: dict[str, FileFacts]
     restoration: FileFacts | None = None
+    commit_ctimes: tuple[int, int] | None = None
+    rollback_ctimes: tuple[int, int] | None = None
 
     def __repr__(self) -> str:
         return f"JournalRecord(phase={self.phase!r}, generation={self.generation})"
@@ -138,6 +149,8 @@ class JournalRecord:
             "baseline": self.baseline.record(),
             "cleanup": {name: facts.record() for name, facts in self.cleanup.items()},
             "restoration": self.restoration.record() if self.restoration is not None else None,
+            "commit_ctimes": self.commit_ctimes,
+            "rollback_ctimes": self.rollback_ctimes,
         }
         result = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
         if len(result) > _MAX_RECORD:
@@ -213,6 +226,8 @@ class JournalRecord:
                 cleanup={name: FileFacts.parse(value) for name, value in cleanup.items()},
                 restoration=(FileFacts.parse(payload["restoration"])
                              if payload["restoration"] is not None else None),
+                commit_ctimes=_parse_ctimes(payload["commit_ctimes"]),
+                rollback_ctimes=_parse_ctimes(payload["rollback_ctimes"]),
             )
             if (
                 record.source.device != record.parent.device
@@ -240,7 +255,19 @@ class JournalRecord:
                     != (record.source.uid, record.source.gid, record.source.mode,
                         record.source.size, record.source.sha256)):
                     raise ValueError
-            if record.phase == record.predecessor_phase == "ROLLBACK_CONFIG" and record.restoration is None:
+            if (record.phase in {"CONFIG_COMMITTED", "SERVICE_ACTIVATING", "SERVICE_VERIFIED", "COMMIT_CLEANUP_PENDING"}
+                and record.commit_ctimes is None):
+                raise ValueError
+            if (record.commit_ctimes is not None and record.phase in {"BACKUP_DURABLE", "CONFIG_COMMITTING", "PRECOMMIT_ABORT"}):
+                raise ValueError
+            if (record.rollback_ctimes is not None
+                and record.phase not in {"ROLLBACK_CONFIG", "ROLLBACK_SERVICE", "ROLLBACK_VERIFIED", "ROLLBACK_CLEANUP_PENDING"}):
+                raise ValueError
+            if (record.phase in {"ROLLBACK_SERVICE", "ROLLBACK_VERIFIED", "ROLLBACK_CLEANUP_PENDING"}
+                and record.rollback_ctimes is None):
+                raise ValueError
+            if (record.phase == record.predecessor_phase == "ROLLBACK_CONFIG"
+                and record.restoration is None and record.rollback_ctimes is None):
                 raise ValueError
             if record.phase in _FINAL:
                 expected_candidate = (
@@ -256,17 +283,32 @@ class JournalRecord:
             raise FilesystemRefused("UNSAFE_JOURNAL") from None
 
     def successor(self, phase: str, *, cleanup: dict[str, FileFacts] | None = None,
-                  restoration: FileFacts | None = None) -> JournalRecord:
+                  restoration: FileFacts | None = None,
+                  commit_ctimes: tuple[int, int] | None = None,
+                  rollback_ctimes: tuple[int, int] | None = None) -> JournalRecord:
         if phase not in _TRANSITIONS.get(self.phase, set()):
             raise FilesystemRefused("INVALID_TRANSITION")
         if phase == self.phase == "ROLLBACK_CONFIG":
-            if self.restoration is not None or restoration is None:
+            staging = self.restoration is None and restoration is not None and rollback_ctimes is None
+            completing = (self.rollback_ctimes is None and rollback_ctimes is not None
+                          and (restoration is None or restoration == self.restoration))
+            if not (staging or completing):
                 raise FilesystemRefused("INVALID_TRANSITION")
         elif self.phase == "ACTIVATION_FAILED" and restoration is not None:
             raise FilesystemRefused("INVALID_TRANSITION")
         elif restoration is not None and restoration != self.restoration:
             raise FilesystemRefused("INVALID_TRANSITION")
+        if phase == "CONFIG_COMMITTED" and self.phase == "CONFIG_COMMITTING":
+            if commit_ctimes is None or self.commit_ctimes is not None:
+                raise FilesystemRefused("INVALID_TRANSITION")
+        elif commit_ctimes is not None and commit_ctimes != self.commit_ctimes:
+            raise FilesystemRefused("INVALID_TRANSITION")
+        if phase != self.phase or phase != "ROLLBACK_CONFIG":
+            if rollback_ctimes is not None and rollback_ctimes != self.rollback_ctimes:
+                raise FilesystemRefused("INVALID_TRANSITION")
         next_restoration = restoration if restoration is not None else self.restoration
+        next_commit_ctimes = commit_ctimes if commit_ctimes is not None else self.commit_ctimes
+        next_rollback_ctimes = rollback_ctimes if rollback_ctimes is not None else self.rollback_ctimes
         next_cleanup = {} if cleanup is None else cleanup
         if (phase in _FINAL) != (set(next_cleanup) == {"candidate", "backup"}):
             raise FilesystemRefused("INVALID_TRANSITION")
@@ -274,7 +316,8 @@ class JournalRecord:
                        predecessor_generation=self.generation,
                        predecessor_digest=hashlib.sha256(self.bytes()).hexdigest(),
                        predecessor_phase=self.phase,
-                       phase=phase, cleanup=next_cleanup, restoration=next_restoration)
+                       phase=phase, cleanup=next_cleanup, restoration=next_restoration,
+                       commit_ctimes=next_commit_ctimes, rollback_ctimes=next_rollback_ctimes)
 
 
 class JournalStore:
@@ -404,7 +447,9 @@ class JournalStore:
             _, current_raw, current_stat = self._read("journal", parse=True)
             authenticate(current)
             if new != current.successor(new.phase, cleanup=new.cleanup,
-                                        restoration=new.restoration):
+                                        restoration=new.restoration,
+                                        commit_ctimes=new.commit_ctimes,
+                                        rollback_ctimes=new.rollback_ctimes):
                 raise FilesystemRefused("INVALID_TRANSITION")
         first_cleanup_decision = new.phase in _FINAL
         if first_cleanup_decision:
