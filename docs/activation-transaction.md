@@ -1619,10 +1619,14 @@ The helper accepts at most 4096 bytes and a single version 1 JSON `recover`
 request, then calls the existing `FilesystemActivation.recover()` method. The
 helper does not expose `run()` or accept a mutation, path, unit, or command.
 Only a root-adopted config directly under `/etc/cloudflared` is eligible. The
-unit sandbox includes writable mounts for that location and manager transaction
-state, inherited by sudo. The bridge installer, adoption command, and web
-startup fail closed unless ownership, modes, and effective DAC access deny
-the web account direct writes while retaining root recovery authority.
+long-running web unit has no `ReadWritePaths` exceptions for privileged state:
+`/etc/cloudflared`, `/etc/cloudflared-manager`, and `/run/cloudflared-manager`
+remain read-only in its `ProtectSystem=strict` mount namespace. Sudo initially
+inherits that read-only view. The fixed privileged launcher starts the recovery
+helper in a separate transient system-manager service, which alone receives the
+fixed writable recovery paths. The bridge installer, adoption command, and web
+startup also fail closed unless ownership, modes, and effective DAC access deny
+the web account direct writes.
 Recovery retains all PR12–PR14 journal, service readiness,
 rollback, and fail-closed rules. Automated tests use fake root/service
 boundaries; a real host must verify sudo and systemd namespace behavior before
@@ -1678,7 +1682,7 @@ touches `/etc/cloudflared`, the real systemd manager, DNS, or Cloudflare.
 | `CONFIG_COMMITTING` recovery | exact original active selects precommit abort/cleanup with no service action; exact candidate plus exact displaced source can continue committed recovery; exact candidate plus unexpected displaced object requires durable failure/rollback intent before compensation or manual recovery; any other active identity is indeterminate/manual recovery; identical classification after an in-memory `PRE_EXCHANGE_REVALIDATED` crash |
 | Crash recovery | every row in the crash matrix; old/candidate/unknown active digest; malformed or impossible journal; stale release/adopted path; journal symlink/permissions/tamper; phase-sensitive required versus cleanup-optional missing artifacts; multiple artifacts; idempotent repeated recovery and retirement; no new transaction or authority change until the journal namespace is durably clean |
 | Information safety | secret-looking YAML, paths, stdout/stderr, environment and tokens never appear in exceptions, reprs, logs, journal, CLI safe output, or browser models |
-| Scope regression | web routes remain GET-only; Add/Edit/Delete remain disabled; no Cloudflare API/DNS calls; no new activation from web; PR15 sudoers remains exact helper/no arguments and the unit remains bounded to documented capabilities and write paths |
+| Scope regression | web routes remain GET-only; Add/Edit/Delete remain disabled; no Cloudflare API/DNS calls; no new activation from web; PR15 sudoers remains exact helper/no arguments; the web unit has no writable privileged-state mount exceptions and the transient recovery service has only the fixed writable recovery paths |
 
 Tests must inject short writes, `EINTR`/I/O errors where relevant, fsync and
 close failures, timeout boundaries, and failures after every durable state
