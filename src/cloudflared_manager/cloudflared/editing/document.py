@@ -18,6 +18,8 @@ from cloudflared_manager.cloudflared.editing.errors import (
     UnsupportedConfigStructureError,
 )
 from cloudflared_manager.cloudflared.editing.source import ConfigSourceSnapshot
+from cloudflared_manager.cloudflared.editing.local_ingress import LocalRoute, RouteSelector, route_fingerprint
+from cloudflared_manager.cloudflared.editing.errors import StaleMutationError
 from cloudflared_manager.cloudflared.limits import MAX_CLOUDFLARED_CONFIG_BYTES
 
 _MAX_YAML_DEPTH = 100
@@ -92,6 +94,63 @@ class EditableCloudflaredConfig:
         self._changed = True
         return MutationOutcome.CHANGED
 
+    def local_route_selector(self, position: int) -> RouteSelector:
+        """Build a selector for a hostname rule in this exact source revision."""
+        ingress = _require_safe_ingress(self._document)
+        if type(position) is not int or position < 0 or position >= len(ingress) - 1:
+            raise MutationRejectedError("The selected ingress route is unsupported.")
+        rule = ingress[position]
+        if "hostname" not in rule:
+            raise MutationRejectedError("The selected ingress route is unsupported.")
+        return RouteSelector(position, route_fingerprint(rule))
+
+    def add_local_hostname_ingress(self, route: LocalRoute) -> MutationOutcome:
+        ingress = _require_safe_ingress(self._document)
+        _require_unique_matcher(ingress, route, excluded=None)
+        rule = CommentedMap({"hostname": route.hostname})
+        if route.path is not None:
+            rule["path"] = route.path
+        rule["service"] = route.service
+        _keep_terminal_leading_comment_with_fallback(ingress, rule)
+        ingress.insert(len(ingress) - 1, rule)
+        _require_safe_ingress(self._document)
+        self._changed = True
+        return MutationOutcome.CHANGED
+
+    def edit_local_hostname_ingress(self, selector: RouteSelector, route: LocalRoute) -> MutationOutcome:
+        ingress, selected = self._selected_local_route(selector)
+        _require_unique_matcher(ingress, route, excluded=selector.position)
+        if (selected["hostname"] == route.hostname and selected.get("path") == route.path
+            and selected["service"] == route.service):
+            return MutationOutcome.NO_CHANGE
+        selected["hostname"] = route.hostname
+        if route.path is None:
+            selected.pop("path", None)
+        else:
+            selected["path"] = route.path
+        selected["service"] = route.service
+        _require_safe_ingress(self._document)
+        self._changed = True
+        return MutationOutcome.CHANGED
+
+    def delete_local_hostname_ingress(self, selector: RouteSelector) -> MutationOutcome:
+        ingress, _ = self._selected_local_route(selector)
+        del ingress[selector.position]
+        _require_safe_ingress(self._document)
+        self._changed = True
+        return MutationOutcome.CHANGED
+
+    def _selected_local_route(self, selector: RouteSelector) -> tuple[CommentedSeq, CommentedMap]:
+        ingress = _require_safe_ingress(self._document)
+        if selector.position >= len(ingress) - 1:
+            raise StaleMutationError("The selected ingress route is stale.")
+        selected = ingress[selector.position]
+        if "hostname" not in selected or route_fingerprint(selected) != selector.fingerprint:
+            raise StaleMutationError("The selected ingress route is stale.")
+        if sum(id(entry) == id(selected) for entry in ingress) != 1:
+            raise UnsupportedConfigStructureError("Aliased ingress routes are unsupported.")
+        return ingress, selected
+
     def render_changed(self) -> bytes:
         """Serialize only a document that a controlled primitive actually changed."""
 
@@ -141,6 +200,15 @@ def _require_safe_ingress(document: CommentedMap) -> CommentedSeq:
             inserted=False,
         )
     return ingress
+
+
+def _require_unique_matcher(ingress: CommentedSeq, route: LocalRoute, *, excluded: int | None) -> None:
+    for index, rule in enumerate(ingress[:-1]):
+        if index == excluded or "hostname" not in rule:
+            continue
+        hostname = rule["hostname"]
+        if isinstance(hostname, str) and hostname.lower() == route.hostname and rule.get("path") == route.path:
+            raise MutationRejectedError("A matching local ingress route already exists.")
 
 
 def _validate_rule(

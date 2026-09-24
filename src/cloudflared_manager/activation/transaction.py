@@ -104,7 +104,8 @@ class FilesystemActivation:
         if owner != 0 and anchor == Path("/"):
             raise FilesystemRefused("UNSAFE_TEST_BOUNDARY")
 
-    def run(self, mutation: ConfigMutation, *, validator: CandidateValidator) -> FilesystemResult:
+    def run(self, mutation: ConfigMutation, *, validator: CandidateValidator,
+            expected_source_revision: str | None = None) -> FilesystemResult:
         if os.geteuid() != self.owner or self.baseline is None:
             raise ActivationError("PRIVILEGED_BOUNDARY_UNAVAILABLE")
         with DeploymentLock(self.paths.lock_path, owner=(self.owner, os.getegid())):
@@ -116,7 +117,10 @@ class FilesystemActivation:
                 with PinnedDirectory(adopted.parent, anchor=self.anchor, owner=self.owner) as active:
                     _metadata_supported(active.fd)
                     _require_no_orphan_candidates(active)
-                    prepared = prepare_validated_candidate(adopted, mutation, cloudflared_validator=validator)
+                    prepared = prepare_validated_candidate(
+                        adopted, mutation, cloudflared_validator=validator,
+                        expected_source_revision=expected_source_revision,
+                    )
                     if prepared.outcome is PreparationOutcome.NO_CHANGE:
                         require_source(prepared.source, active)
                         return FilesystemResult("NO_CHANGE")

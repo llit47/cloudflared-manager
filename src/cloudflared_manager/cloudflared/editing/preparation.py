@@ -73,10 +73,15 @@ def prepare_validated_candidate(
     stager: CandidateFileStager | None = None,
     application_parser: ApplicationParser = parse_cloudflared_config,
     cloudflared_validator: CandidateValidator | None = None,
+    expected_source_revision: str | None = None,
 ) -> CandidatePreparationResult:
     """Prepare and validate a candidate, then stop without active-file mutation."""
 
     snapshot = read_config_source_snapshot(source_path)
+    if expected_source_revision is not None:
+        from cloudflared_manager.cloudflared.editing.errors import StaleMutationError
+        if snapshot.sha256 != expected_source_revision:
+            raise StaleMutationError("The observed configuration revision is stale.")
     document = EditableCloudflaredConfig.from_snapshot(snapshot)
     outcome = mutation(document)
     if outcome is MutationOutcome.NO_CHANGE:

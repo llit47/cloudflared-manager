@@ -21,8 +21,10 @@ from cloudflared_manager.cloudflared.editing.errors import (
     RoundTripYamlError,
     SourceConfigChangedError,
     SourceConfigUnreadableError,
+    StaleMutationError,
     UnsupportedConfigStructureError,
 )
+from cloudflared_manager.cloudflared.editing.local_ingress import LocalRoute, RouteSelector, require_revision, route_fingerprint
 from cloudflared_manager.cloudflared.editing.preparation import (
     CandidatePreparationResult,
     PreparationOutcome,
@@ -62,6 +64,11 @@ __all__ = [
     "RoundTripYamlError",
     "SourceConfigChangedError",
     "SourceConfigUnreadableError",
+    "StaleMutationError",
+    "LocalRoute",
+    "RouteSelector",
+    "require_revision",
+    "route_fingerprint",
     "SubprocessValidationCommandRunner",
     "UnsupportedConfigStructureError",
     "ValidationCommandResult",

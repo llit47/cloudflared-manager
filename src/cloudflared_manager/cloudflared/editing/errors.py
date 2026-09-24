@@ -25,6 +25,10 @@ class MutationRejectedError(ConfigEditingError):
     """A requested controlled mutation is unsafe or internally inconsistent."""
 
 
+class StaleMutationError(MutationRejectedError):
+    """The observed source revision or selected ingress rule is no longer current."""
+
+
 class CandidateFileError(ConfigEditingError):
     """A candidate file could not be created, verified, or cleaned safely."""
 
