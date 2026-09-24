@@ -4,6 +4,7 @@ import io
 import json
 import hashlib
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import get_args
 from types import SimpleNamespace
@@ -222,6 +223,91 @@ def test_privileged_mutation_uses_transaction_and_rejects_duplicate_request(tmp_
         req, engine=engine, allowed_adopted_parent=root,
     ))[0] is False
     assert source.read_bytes() == latest
+
+
+@pytest.mark.parametrize("replacement_at,process_change", [
+    (3, False), (4, False), (5, False), (None, False), (None, True),
+])
+def test_validation_executable_identity_survives_precommit_baselines(
+    tmp_path, monkeypatch, replacement_at, process_change,
+):
+    from contextlib import nullcontext
+    from cloudflared_manager.activation import transaction
+    from cloudflared_manager.activation.transaction import FilesystemActivation
+    from tests.deployment_support import make_paths
+    from tests.test_activation_filesystem import Authority, FakeService, Validator, _SOURCE, insert
+
+    root = tmp_path / "cloudflared"
+    root.mkdir(mode=0o700)
+    source = root / "config.yml"
+    source.write_bytes(_SOURCE)
+    paths = make_paths(tmp_path)
+    paths.config_root.mkdir(parents=True)
+    (tmp_path / "etc").chmod(0o700)
+    paths.config_root.chmod(0o700)
+    executable = Path("/opt/cloudflare/bin/cloudflared")
+
+    class ObservedService(FakeService):
+        observations = 0
+
+        def observe(self, **kwargs):
+            facts = super().observe(**kwargs)
+            if process_change and self.observations >= 3:
+                facts = replace(facts, main_pid=1235, process_start_ticks=123457)
+            return facts
+
+        def observe_with_executable(self, **kwargs):
+            self.observations += 1
+            facts = self.observe(**kwargs)
+            if replacement_at is not None and self.observations >= replacement_at:
+                facts = replace(facts, executable_inode=3)
+            return facts, executable
+
+    class CountedService(FakeService):
+        restarts = 0
+
+        def restart(self):
+            self.restarts += 1
+            return True
+
+    baseline = ObservedService()
+    service = CountedService()
+    engine = FilesystemActivation(paths, authority=Authority(source), baseline=baseline,
+                                  service=service, owner=os.getuid(), anchor=tmp_path)
+    monkeypatch.setattr(transaction, "verified_executable",
+                        lambda path: nullcontext((123, (1, 2))))
+    def validator_factory(**kwargs):
+        assert kwargs == {"executable": executable, "executable_fd": 123}
+        return Validator()
+    monkeypatch.setattr(transaction, "CloudflaredCandidateValidator",
+                        validator_factory)
+    original_exchange = transaction.exchange
+    exchanges = []
+
+    def counted_exchange(*args):
+        exchanges.append(args)
+        return original_exchange(*args)
+
+    monkeypatch.setattr(transaction, "exchange", counted_exchange)
+    if replacement_at is None:
+        assert engine.run(insert).code == "COMMITTED_SUCCESS"
+        assert b"new.example.com" in source.read_bytes()
+        assert len(exchanges) == 1
+        assert service.restarts == 1
+    else:
+        with pytest.raises(ActivationError) as caught:
+            engine.run(insert)
+        if replacement_at == 5:
+            assert caught.value.code == "FAILED_PRECOMMIT"
+            assert caught.value.original == "BASELINE_CHANGED"
+        else:
+            assert caught.value.code == "BASELINE_CHANGED"
+        assert source.read_bytes() == _SOURCE
+        assert exchanges == []
+        assert service.restarts == 0
+        assert list((paths.config_root / "activation-journal").iterdir()) == []
+        assert list((paths.config_root / "activation-backups").iterdir()) == []
+    assert baseline.observations == (replacement_at if replacement_at is not None else 5)
 
 
 def test_operator_edit_after_validation_maps_stale_without_activation(tmp_path, monkeypatch):
