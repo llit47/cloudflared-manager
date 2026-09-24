@@ -27,6 +27,9 @@ from cloudflared_manager.deployment.errors import HostOperationError, Validation
 from cloudflared_manager.deployment.identity import SERVICE_IDENTITY
 from cloudflared_manager.deployment.settings import ManagerSettings
 from cloudflared_manager.deployment.validation import validate_cloudflared_config_path
+from cloudflared_manager.deployment.write_boundary import (
+    require_adopted_write_boundary, require_nonprivate_adoption,
+)
 
 ConfigParser = Callable[[Path], CloudflaredConfig]
 IdentityProvider = Callable[[], tuple[int, int]]
@@ -117,6 +120,8 @@ class CloudflaredConfigAdopter:
         candidate = validate_cloudflared_config_path(runtime.explicit_config_path)
         self.sandbox_path_validator(candidate)
         service_uid, service_gid = self.identity_provider()
+        require_nonprivate_adoption(candidate, self.configurator.paths)
+        require_adopted_write_boundary(candidate, service_uid=service_uid)
         _require_service_readable_regular_file(candidate, service_uid, service_gid)
         try:
             self.config_parser(candidate)

@@ -9,14 +9,16 @@ PR12 implemented the internal filesystem transaction foundation and persistent
 recovery barrier on `main`: validated candidate transfer, durable backup and
 journal publication, race-aware same-directory exchange, authenticated
 filesystem rollback, idempotent cleanup, and the authority-mutation barrier.
-That foundation is intentionally **unwired**. Cloudflared Manager remains
-operationally **READ-ONLY**: no current web or supported CLI path can activate a
-candidate, change DNS, or control `cloudflared.service`.
+That foundation was intentionally unwired in PR12. The current web and
+supported CLI surfaces cannot activate a new candidate or change DNS. PR15's
+recovery-only helper may control `cloudflared.service` solely while completing
+an authenticated activation journal.
 
 PR14 adds an internal, fixed `cloudflared.service` lifecycle controller,
 post-restart readiness verification, service-aware rollback, and crash recovery.
-It remains unwired: no web mutation route or supported activation CLI exposes
-the transaction.
+PR15 adds an explicitly installed sudo bridge for `recover()` only. It has no
+web route or supported activation CLI for new mutations. The helper receives a
+versioned, bounded JSON request and runs PR14 recovery inside the root boundary.
 
 The transaction still builds on PR10's candidate-only foundation: snapshot an
 adopted source, perform a narrow round-trip YAML mutation, stage a separate
@@ -38,8 +40,9 @@ This design covers:
 - an adversarial test contract for the internal transaction and later integrations.
 
 PR12's filesystem transaction and PR14's fixed service-control and verification
-layer exist as an internal foundation. Neither exposes sudoers policy, a generic
-privileged helper, HTTP mutation routes, enabled Add/Edit/Delete operations,
+layer exist as an internal foundation. PR15 exposes only recovery through one
+fixed helper and exact sudoers rule. It does not expose HTTP mutation routes,
+enabled Add/Edit/Delete operations,
 Cloudflare API access, DNS mutation, systemd unit editing, or a supported
 user-facing activation command.
 
@@ -278,17 +281,15 @@ properties or command lines would recreate a generic privileged interface.
 This remains an alternative if a static template/service plus root-owned spool
 is demonstrably smaller than a direct helper.
 
-**Small root-owned helper with an exact interface.** Preferred for the first
-implementation, initially invoked only by a root administrator. It fits the
-existing root-owned immutable-release and `cfm-config` architecture, can reuse
-the existing release-identity check, and need not add a daemon or any web
-surface. A later web-to-helper authorization mechanism is a separate review.
+**Small root-owned helper with an exact interface.** PR15 implements this
+choice for recovery only, installed by an explicit root administrator command.
+It fits the existing root-owned immutable-release and `cfm-config`
+architecture. HTTP mutation authorization remains a separate review.
 
 ### Proposed helper contract
 
-The first helper MUST be installed from an immutable, root-owned manager
-release and invoked by the existing root administrative boundary. It performs
-one verb: prepare/commit or recover one adopted-config transaction. It MUST NOT
+The helper MUST be installed from an immutable, root-owned manager release.
+PR15 admits one verb, `recover`, via the exact sudo boundary. It MUST NOT
 accept the active path, backup path, journal path, executable path, service
 unit, shell text, or arbitrary YAML path as command-line arguments.
 
@@ -299,20 +300,20 @@ matches the root-owned `current` release before any mutation, using the same
 stale-process principle as existing `cfm-config` operations. The executable
 and stable launcher are root-owned and not writable by the service identity.
 
-For the filesystem-foundation PR, the exact caller is a root administrator and
-there is no sudoers grant to the web service. A future web integration MUST add
-a separately reviewed authorization/transport design. It may invoke one exact
-helper command, but MUST NOT rely on wildcard command-line matching. The helper
-must independently verify the active manager release and adopted path.
+PR12's filesystem-foundation implementation had no sudoers grant. PR15 adds the
+recovery-only grant without a web route. Any future web mutation integration
+MUST add a separately reviewed authorization and domain transport design and
+MUST NOT rely on wildcard command-line matching. The helper independently
+verifies the active manager release and adopted path.
 
-Only a versioned, size-bounded, strict domain request may eventually cross the
-boundary. It may contain an operation discriminator and validated domain fields
-needed by a narrow mutation. It must reject unknown keys, unknown versions,
+Only a versioned, size-bounded, strict domain request may cross the boundary.
+PR15 carries only the `recover` discriminator. Any future mutation fields need
+their own review. The protocol rejects unknown keys, unknown versions,
 duplicate fields, NULs, oversized values, and trailing data. It does not carry
 paths, raw YAML, command names, environment assignments, backup names, service
-names, or serialized Python objects. The privileged side reruns snapshot,
-round-trip mutation, candidate staging, application validation, and FD-bound
-cloudflared validation rather than trusting a caller-created candidate.
+names, or serialized Python objects. A future activation operation must rerun
+snapshot, round-trip mutation, candidate staging, application validation, and
+FD-bound cloudflared validation inside the privileged side.
 
 The helper environment is constructed from an allowlist, with a fixed safe
 `PATH` or absolute executable paths, fixed locale, restrictive umask, and no
@@ -321,10 +322,27 @@ variables. Standard input/output are bounded. Results use stable sanitized
 codes; diagnostics with sensitive subprocess output are retained only if a
 future root-only logging policy explicitly permits it.
 
-No sudoers syntax is specified here; the internal implementation has no sudoers
-grant. Before a later web bridge is enabled, review must settle the exact request
-transport, invocation path, caller authentication, rate/concurrency control,
-and how the active web process/release is bound to the request.
+PR15's recovery-only grant is specified in
+`deploy/cloudflared-manager-bridge.sudoers`. It permits no arguments to the
+fixed `/opt/cloudflared-manager/privileged-helper`. The protocol currently
+admits only `{ "version": 1, "operation": "recover" }`; there is no
+serialized mutation request. The helper runs from the active root-owned
+release, independently verifies that release and the root-owned adopted path,
+and permits recovery only for a config directly under `/etc/cloudflared`.
+The manager unit keeps `/etc/cloudflared`, `/etc/cloudflared-manager`, and
+`/run/cloudflared-manager` read-only in its mount namespace.
+The fixed sudo launcher starts recovery through a transient system-manager
+service in a separate `ProtectSystem=strict` namespace with only fixed recovery
+paths writable. Because a setuid sudo transition is
+required, PR15 sets `NoNewPrivileges=false` and bounds potential capabilities
+to `CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_SETGID`, `CAP_SETUID`, and
+`CAP_SYS_PTRACE`. The last capability is required for PR14's
+`/proc/<MainPID>/environ` and executable identity checks when cloudflared runs
+under a different non-root UID; DAC override does not satisfy Linux's ptrace
+read check. The launcher enters Bash privileged mode and resolves the sole
+pre-sanitization external command through fixed `/usr/bin/readlink`.
+Manual host verification of sudo, systemd namespace, and service
+control remains required.
 
 ## Transaction inputs and derived authority
 
@@ -1583,6 +1601,46 @@ PR14's implemented scope includes:
 - no web mutation route, API/DNS behavior, sudoers policy, general root
   command proxy, or production activation command.
 
+### PR15: recovery-only sudo bridge
+
+PR15 installs no privilege grant during an ordinary install or update. A root
+administrator runs `sudo cfm-config install-bridge` explicitly. That command
+requires the current release, validates the fixed sudoers text with `visudo`,
+and installs one root-owned helper and one root-owned policy file. The policy
+allows the dedicated service account only the no-argument helper path. The
+unprivileged client uses `sudo -n` with fixed argv and a 300-second deadline.
+The longest service path (recovery from `CONFIG_COMMITTED`, failed activation,
+then verified rollback) permits 230 seconds of show, restart, and stability
+checks, plus up to five seconds of failed-command cleanup and five seconds of
+request input. The remaining 60 seconds allow for startup, local filesystem
+work, and scheduling. Filesystem latency has no strict wall-clock bound;
+an actual client timeout remains a fail-closed recovery case.
+The helper accepts at most 4096 bytes and a single version 1 JSON `recover`
+request, then calls the existing `FilesystemActivation.recover()` method. The
+helper does not expose `run()` or accept a mutation, path, unit, or command.
+Only a root-adopted config directly under `/etc/cloudflared` is eligible. The
+long-running web unit has no `ReadWritePaths` exceptions for privileged state:
+`/etc/cloudflared`, `/etc/cloudflared-manager`, and `/run/cloudflared-manager`
+remain read-only in its `ProtectSystem=strict` mount namespace. Sudo initially
+inherits that read-only view. The fixed privileged launcher starts the recovery
+helper in a separate transient system-manager service, which alone receives the
+fixed writable recovery paths. The bridge installer, adoption command, and web
+startup also fail closed unless ownership, modes, and effective DAC access deny
+the web account direct writes.
+During the first PR14-to-PR15 update, PR14's updater installs the PR15 unit
+before the new updater code can run. The candidate unit's fixed pre-start
+command invokes a separate, bounded root transient bootstrap to install and
+apply the root-owned runtime tmpfiles rule before the PR15 web process starts.
+The pre-start client retains the web unit's read-only mount view; its transient
+service alone receives the fixed bootstrap write paths. Bootstrap failure
+fails service start and lets PR14 restore its prior unit and release. The
+fixed boot rule may remain after a later health-check rollback; it is safe for
+PR14 and grants no web write authority.
+Recovery retains all PR12–PR14 journal, service readiness,
+rollback, and fail-closed rules. Automated tests use fake root/service
+boundaries; a real host must verify sudo and systemd namespace behavior before
+relying on recovery.
+
 Both foundations remain internal. Any future journal/baseline schema change
 must remain strictly parsed and tested; no production migration may be assumed
 to exist. Later, separately reviewed PRs may address:
@@ -1633,7 +1691,7 @@ touches `/etc/cloudflared`, the real systemd manager, DNS, or Cloudflare.
 | `CONFIG_COMMITTING` recovery | exact original active selects precommit abort/cleanup with no service action; exact candidate plus exact displaced source can continue committed recovery; exact candidate plus unexpected displaced object requires durable failure/rollback intent before compensation or manual recovery; any other active identity is indeterminate/manual recovery; identical classification after an in-memory `PRE_EXCHANGE_REVALIDATED` crash |
 | Crash recovery | every row in the crash matrix; old/candidate/unknown active digest; malformed or impossible journal; stale release/adopted path; journal symlink/permissions/tamper; phase-sensitive required versus cleanup-optional missing artifacts; multiple artifacts; idempotent repeated recovery and retirement; no new transaction or authority change until the journal namespace is durably clean |
 | Information safety | secret-looking YAML, paths, stdout/stderr, environment and tokens never appear in exceptions, reprs, logs, journal, CLI safe output, or browser models |
-| Scope regression | web routes remain GET-only; Add/Edit/Delete remain disabled; no Cloudflare API/DNS calls; no production config writes or cloudflared service calls from web; no sudoers/unit privilege broadening |
+| Scope regression | web routes remain GET-only; Add/Edit/Delete remain disabled; no Cloudflare API/DNS calls; no new activation from web; PR15 sudoers remains exact helper/no arguments; the web unit has no writable privileged-state mount exceptions and the transient recovery service has only the fixed writable recovery paths |
 
 Tests must inject short writes, `EINTR`/I/O errors where relevant, fsync and
 close failures, timeout boundaries, and failures after every durable state
@@ -1697,4 +1755,3 @@ No implementation PR may silently resolve a remaining gate by weakening these
 invariants. Its description must list the decisions made, evidence/tests
 supporting them, deployment implications, and unsupported host/service state
 that fails closed.
-

@@ -103,12 +103,16 @@ class Installer:
         settings = settings_from_document(document)
 
         unit_snapshot = self.filesystem.snapshot(self.paths.unit_path)
+        tmpfiles_snapshot = self.filesystem.snapshot(self.paths.tmpfiles_path)
         current_target: str | None = None
         unit_install_completed = False
         environment_attempted = False
         service_start_attempted = False
         enable_attempted = False
+        tmpfiles_attempted = False
         try:
+            tmpfiles_attempted = True
+            self.filesystem.install_runtime_tmpfiles(release)
             environment_attempted = True
             atomic_write_environment(
                 self.paths.environment_file,
@@ -163,6 +167,11 @@ class Installer:
                             previous_environment,
                             owner=self.environment_owner,
                         )
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+            if tmpfiles_attempted:
+                try:
+                    self.filesystem.restore_snapshot(self.paths.tmpfiles_path, tmpfiles_snapshot)
                 except Exception as rollback_error:
                     rollback_errors.append(rollback_error)
             if rollback_errors:

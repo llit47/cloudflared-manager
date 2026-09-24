@@ -44,6 +44,21 @@ ingress:
 """
 
 
+def test_adoption_rejects_unsafe_writable_cloudflared_tree_before_persist(tmp_path, monkeypatch):
+    from cloudflared_manager.deployment import adoption
+    candidate = _config_file(tmp_path)
+    _, service, adopter = _adopter(tmp_path, candidate)
+
+    def reject(path, *, service_uid):
+        assert path == candidate
+        raise HostOperationError("unsafe cloudflared tree")
+
+    monkeypatch.setattr(adoption, "require_adopted_write_boundary", reject)
+    with pytest.raises(HostOperationError, match="unsafe cloudflared tree"):
+        adopter.adopt_detected()
+    assert service.calls == []
+
+
 def _runtime(
     path: Path | None,
     *,

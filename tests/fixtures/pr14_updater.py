@@ -1,4 +1,4 @@
-"""Exact-release update transaction with unit and health rollback."""
+"""PR14 commit 49f8c41a updater; only fixture imports and type changed."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from cloudflared_manager.deployment.errors import (
 from cloudflared_manager.deployment.health import verify_managed_health
 from cloudflared_manager.deployment.paths import DeploymentPaths
 from cloudflared_manager.deployment.protocols import HealthVerifier, ManagerService
-from cloudflared_manager.deployment.reconciliation import DeploymentReconciler
-from cloudflared_manager.deployment.release import ReleaseFilesystem
+from tests.fixtures.pr14_reconciliation import DeploymentReconciler
+from tests.fixtures.pr14_release import PR14ReleaseFilesystem
 from cloudflared_manager.deployment.settings import settings_from_document
 from cloudflared_manager.deployment.validation import validate_sha
 
@@ -32,7 +32,7 @@ class Updater:
     def __init__(
         self,
         paths: DeploymentPaths,
-        filesystem: ReleaseFilesystem,
+        filesystem: PR14ReleaseFilesystem,
         service: ManagerService,
         health: HealthVerifier,
     ) -> None:
@@ -56,26 +56,16 @@ class Updater:
         if source is None:
             raise HostOperationError("The candidate source is required for an update.")
 
-        # Include a successful pre-update reconciliation in the tmpfiles rollback.
-        tmpfiles_snapshot = self.filesystem.snapshot(self.paths.tmpfiles_path)
-        try:
-            DeploymentReconciler(
-                self.filesystem,
-                self.service,
-                self.health,
-            ).reconcile(self.paths.release(previous_sha), settings)
-            release = self.filesystem.prepare_release(source, revision, python)
-            self.filesystem.validate_deployment_assets(release)
-        except Exception as error:
-            try:
-                self.filesystem.restore_snapshot(self.paths.tmpfiles_path, tmpfiles_snapshot)
-            except Exception:
-                raise RollbackError("The previous runtime rule could not be restored.") from error
-            raise
+        DeploymentReconciler(
+            self.filesystem,
+            self.service,
+            self.health,
+        ).reconcile(self.paths.release(previous_sha), settings)
+        release = self.filesystem.prepare_release(source, revision, python)
+        self.filesystem.validate_deployment_assets(release)
         previous_target = f"releases/{previous_sha}"
         unit_snapshot = self.filesystem.snapshot(self.paths.unit_path)
         try:
-            self.filesystem.install_runtime_tmpfiles(release)
             self.filesystem.install_unit(release)
             # The unit may already match on disk after an interrupted update while
             # systemd still has its prior definition loaded.
@@ -99,10 +89,6 @@ class Updater:
                     self.service, self.health, settings.bind_host, settings.bind_port,
                     settings.config_id, previous_sha,
                 )
-            except Exception as rollback_error:
-                rollback_errors.append(rollback_error)
-            try:
-                self.filesystem.restore_snapshot(self.paths.tmpfiles_path, tmpfiles_snapshot)
             except Exception as rollback_error:
                 rollback_errors.append(rollback_error)
             if rollback_errors:

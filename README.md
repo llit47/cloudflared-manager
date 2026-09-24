@@ -30,10 +30,11 @@ candidate beside the source, and validate that candidate. Nothing in the web
 application or deployment workflow invokes this foundation yet.
 
 Detected routes are existing configuration, not routes owned or managed by
-Cloudflared Manager. This version does **not** modify cloudflared configuration,
-contact the Cloudflare API, change DNS, control `cloudflared.service`, configure
-sudo, persist ownership, or implement Add, Edit, Enable, Disable, or Delete.
-Deployment scripts control only `cloudflared-manager.service`.
+Cloudflared Manager. The web application remains read-only. PR15 provides an
+explicitly installed, recovery-only sudo bridge for resuming a PR12–PR14
+activation journal. This version does **not** initiate new config mutations,
+contact the Cloudflare API, change DNS, persist route ownership, or implement
+Add, Edit, Enable, Disable, or Delete.
 
 ## Architecture
 
@@ -162,10 +163,50 @@ those unknown values.
 
 `cloudflared-manager.service` starts the console entry point from
 `/opt/cloudflared-manager/current/.venv/` as the dedicated service user. The
-unit enables automatic restart on failure, removes all capabilities, and uses
-systemd protections including `NoNewPrivileges`, `PrivateTmp`,
+unit enables automatic restart on failure and uses protections including `PrivateTmp`,
 `PrivateDevices`, `ProtectHome`, `ProtectSystem=strict`, kernel/control-group
-protections, and a restricted address-family set.
+protections, and a restricted address-family set. To permit the explicit
+`sudo -n` bridge, `NoNewPrivileges=false`; the capability bounding set contains
+only `CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_SETGID`,
+`CAP_SETUID`, and `CAP_SYS_PTRACE`. PR14 checks
+`/proc/<MainPID>/environ` and `/proc/<MainPID>/exe`; Linux applies a ptrace
+read check when `cloudflared.service` runs under another UID, so recovery needs
+`CAP_SYS_PTRACE` in the bounding set. The web unit has no writable mount
+exceptions for cloudflared or manager state under `ProtectSystem=strict`. The
+sudo launcher starts a fixed transient
+root service through `/usr/bin/systemd-run`; that service has its own restricted
+mount namespace with only `/etc/cloudflared`, `/etc/cloudflared-manager`, and
+`/run/cloudflared-manager` writable for recovery. Before installing the bridge, root
+checks that these locations are not writable by the web account. Adoption
+checks the cloudflared tree; the production web entry point checks again at
+startup. The adopted file cannot be owned or writable by the manager account.
+The cloudflared directory and its contents cannot grant manager write access.
+Manager-private directories must be root-owned `0750` and `0700`, with a
+root-owned `0600` environment file. Unsafe or unverifiable permissions fail
+closed. The non-root process receives no ambient capabilities.
+
+Installation places `/etc/tmpfiles.d/cloudflared-manager.conf` with the fixed
+`d /run/cloudflared-manager 0700 root root -` rule. The system
+`systemd-tmpfiles-setup.service` applies it after `/run` is cleared at boot.
+Install, update, reconciliation, and explicit bridge installation also run
+`/usr/bin/systemd-tmpfiles --create` for this one file immediately, then
+verify the root-owned `0700` directory. An unsafe existing directory is
+rejected before tmpfiles can change it; the web startup check stays strict.
+
+The first PR14-to-PR15 update still runs PR14's updater. That updater installs
+the PR15 candidate unit, switches `current`, and restarts before it installs
+the new administration scripts. The candidate unit therefore has a fixed
+pre-start bootstrap: systemd starts a short-lived root transient service from
+the root-owned current release, which calls the same validated tmpfiles
+installer. It installs the rule before the first PR15 web process starts, so
+boot can recreate `/run/cloudflared-manager` without a second update. The
+pre-start command remains in the web unit's read-only mount namespace; only
+the transient service may write `/etc/tmpfiles.d` and `/run` while applying
+the fixed rule. It has a 30-second service lifetime limit and only `CAP_CHOWN`.
+If bootstrap fails, service start fails and PR14 restores its prior unit and
+release. If later health verification fails, the exact root-owned boot rule
+may remain; it is compatible with PR14 and grants no service-account write
+authority. Subsequent PR15 reconciliation applies the rule idempotently.
 
 `GET /healthz` is the minimal public monitoring endpoint. Its response contract
 remains exactly:
@@ -481,10 +522,10 @@ requests do not create or validate candidates, and the installed service stays
 unprivileged. `cloudflared.service` is never restarted, reloaded, started, or
 stopped by this foundation.
 
-PR12 and PR14 provide a separate **internal, unwired** activation transaction.
-There is no supported activation CLI, web mutation route, or web-to-root
-transport. Deployment does not grant the web service config or service-control
-permissions.
+PR12 and PR14 provide the activation transaction. PR15 exposes only its
+`recover()` method through a versioned, recovery-only sudo bridge. No web route
+or supported CLI calls `run()` to activate a new candidate. The application
+does not gain direct config or service-control permissions.
 
 The internal transaction extends PR12's authenticated atomic config exchange,
 exact backup, durable journal, rollback, and recovery barrier with PR14's strict
@@ -518,6 +559,80 @@ activation tests use temporary configs and fake service/process boundaries.
 Host systemd/cloudflared integration has not been exercised by these tests.
 Cloudflare API/DNS mutations and application mutation authorization remain
 separate future work.
+
+### Privileged recovery bridge
+
+The root administrator enables this boundary explicitly after installing the
+PR15 release:
+
+```bash
+sudo cfm-config install-bridge
+```
+
+This checks the active release identity, root-owned release assets and target
+directories, validates the policy with `/usr/sbin/visudo -cf`, installs and
+applies the fixed runtime tmpfiles rule, then checks the privileged write
+boundary before atomically installing
+`/opt/cloudflared-manager/privileged-helper` as root `0755` and
+`/etc/sudoers.d/cloudflared-manager-bridge` as root `0440`. An ordinary install
+or update does not grant sudo. A missing `visudo`, unsafe collision, or stale
+release fails before installing the policy. Repeating the command with matching
+assets is idempotent.
+
+The policy permits the `cloudflared-manager` account to execute **only** that
+helper as root with **no arguments** and no password. The unprivileged client
+uses fixed argv `/usr/bin/sudo -n /opt/cloudflared-manager/privileged-helper`.
+The helper launcher uses Bash privileged mode to ignore caller-supplied shell
+startup settings, invokes `/usr/bin/readlink` by absolute path before clearing
+the environment, then launches only the active root-owned release's Python module
+with `-I` through fixed `/usr/bin/systemd-run --system --pipe --wait` arguments
+and a fixed minimal environment. The request is one UTF-8 JSON
+document of at most 4096 bytes on stdin, currently exactly
+`{"version":1,"operation":"recover"}`. Unknown versions, operations, fields,
+duplicate keys, trailing data, oversized input, and non-root execution fail
+closed. Output is one sanitized JSON object with `version`, `ok`, and `code`;
+exit status is 0 only for a verified successful outcome. No paths, YAML,
+command text, unit names, or subprocess output cross the protocol.
+
+Recovery derives the active release and adopted path again as root, accepts
+only an adopted config directly under `/etc/cloudflared`, and invokes the
+existing PR14 `FilesystemActivation.recover()` under its shared lock. It may
+restart only `cloudflared.service` after PR14's durable journal and readiness
+checks. A compromised web process can request repeated recovery attempts; it
+cannot supply a config mutation, destination, executable, service verb, or unit.
+The root administrator, root-owned installed release, sudoers policy, and
+existing cloudflared unit are trusted. The web service account must not own or
+write the installed helper, release, sudoers file, adopted config, its parent,
+or journal. Sudo inherits the web service's read-only `/etc/cloudflared` mount;
+the transient root service gets a separate, fixed writable recovery mount view.
+The web process cannot gain direct config write authority through later DAC or
+ACL drift. If permissions change after installation, startup fails closed;
+rerun bridge installation after correcting host ownership or modes.
+
+For privileged host verification, run
+`sudo visudo -cf /etc/sudoers.d/cloudflared-manager-bridge`, inspect ownership
+and modes with `stat`, confirm the tmpfiles rule with
+`cat /etc/tmpfiles.d/cloudflared-manager.conf`, and verify
+`stat -c '%U:%G %a' /run/cloudflared-manager` reports `root:root 700`.
+Confirm the web process sees `/etc/cloudflared`, `/etc/cloudflared-manager`,
+and `/run/cloudflared-manager` read-only in its mount namespace,
+and a recovery request starts a transient system service able to complete the
+fixed PR14 transaction. Verify failed PR15 install/update leaves the prior
+tmpfiles rule bytes and mode intact. On a PR14-to-PR15 migration host, verify
+the candidate unit's pre-start bootstrap installed the fixed rule before the
+first successful upgrade is reported, then reboot and confirm the `0700`
+runtime directory is recreated before web startup.
+Then send the version 1 recovery JSON through
+`sudo -n -u cloudflared-manager /usr/bin/sudo -n /opt/cloudflared-manager/privileged-helper`
+on a clean, adopted test host. A successful result has code
+`NO_RECOVERY_REQUIRED`. Verify that adding an argument is denied and malformed
+JSON returns `INVALID_REQUEST`. Before any real recovery, inspect the journal
+as root and ensure the adopted `/etc/cloudflared/*.yml` path and
+`cloudflared.service` match the PR14 contract. A `RECOVERY_REQUIRED` or
+`ACTIVATION_FAILED` code means the operation did not establish success; retain
+the journal and investigate. Automated tests use temporary config and fake
+service boundaries and do not prove host sudo, systemd namespace, or
+cloudflared integration.
 
 ## Run the development server
 

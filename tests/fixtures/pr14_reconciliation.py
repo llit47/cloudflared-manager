@@ -1,4 +1,4 @@
-"""Crash recovery for one recognized active manager deployment."""
+"""PR14 commit 49f8c41a reconciler; only fixture import and type changed."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 from cloudflared_manager.deployment.errors import RollbackError, TransactionFailedError
 from cloudflared_manager.deployment.health import verify_managed_health
 from cloudflared_manager.deployment.protocols import HealthVerifier, ManagerService
-from cloudflared_manager.deployment.release import ReleaseFilesystem
+from tests.fixtures.pr14_release import PR14ReleaseFilesystem
 from cloudflared_manager.deployment.settings import ManagerSettings
 
 
@@ -22,7 +22,7 @@ class DeploymentReconciler:
 
     def __init__(
         self,
-        filesystem: ReleaseFilesystem,
+        filesystem: PR14ReleaseFilesystem,
         service: ManagerService,
         health: HealthVerifier,
     ) -> None:
@@ -32,7 +32,6 @@ class DeploymentReconciler:
 
     def reconcile(self, release: Path, settings: ManagerSettings) -> ReconcileResult:
         self.filesystem.validate_deployment_assets(release)
-        tmpfiles_snapshot = self.filesystem.snapshot(self.filesystem.paths.tmpfiles_path)
         unit_snapshot = self.filesystem.snapshot(self.filesystem.paths.unit_path)
         initial_runtime = self.service.runtime_state()
         was_active = initial_runtime.active
@@ -45,9 +44,7 @@ class DeploymentReconciler:
         service_changed = False
         service_operation_attempted = False
         enable_attempted = False
-        runtime_changed = False
         try:
-            runtime_changed = self.filesystem.install_runtime_tmpfiles(release)
             unit_install_attempted = True
             unit_changed = self.filesystem.install_unit(release)
             unit_install_completed = True
@@ -83,7 +80,7 @@ class DeploymentReconciler:
                 service_changed = True
             administration_changed = self.filesystem.install_stable_administration(release)
             return ReconcileResult(
-                changed=runtime_changed or unit_changed or service_changed or administration_changed
+                changed=unit_changed or service_changed or administration_changed
             )
         except Exception as error:
             rollback_errors: list[Exception] = [error] if isinstance(error, RollbackError) else []
@@ -112,13 +109,6 @@ class DeploymentReconciler:
                         self._verify_health(settings, release.name)
                     else:
                         self.service.stop()
-                except Exception as rollback_error:
-                    rollback_errors.append(rollback_error)
-            if runtime_changed:
-                try:
-                    self.filesystem.restore_snapshot(
-                        self.filesystem.paths.tmpfiles_path, tmpfiles_snapshot
-                    )
                 except Exception as rollback_error:
                     rollback_errors.append(rollback_error)
             if rollback_errors:
