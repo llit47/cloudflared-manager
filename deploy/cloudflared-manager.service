@@ -12,6 +12,9 @@ EnvironmentFile=/etc/cloudflared-manager/cloudflared-manager.env
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
 WorkingDirectory=/opt/cloudflared-manager/current
+# PR14's updater installs this unit before its first PR15 restart. The fixed
+# root bootstrap runs in a separate transient service, never in the web mount.
+ExecStartPre=!/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C /usr/bin/systemd-run --system --pipe --wait --quiet --collect --service-type=exec --property=ProtectSystem=strict "--property=ReadWritePaths=/etc/tmpfiles.d /run" --property=NoNewPrivileges=yes --property=UMask=0077 --property=CapabilityBoundingSet=CAP_CHOWN --property=RuntimeMaxSec=30s --property=Environment=PYTHONDONTWRITEBYTECODE=1 /opt/cloudflared-manager/current/.venv/bin/python -I -m cloudflared_manager.deployment.runtime_bootstrap
 ExecStart=/opt/cloudflared-manager/current/.venv/bin/cloudflared-manager
 Restart=on-failure
 RestartSec=5s

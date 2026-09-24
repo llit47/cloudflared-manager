@@ -1627,6 +1627,15 @@ helper in a separate transient system-manager service, which alone receives the
 fixed writable recovery paths. The bridge installer, adoption command, and web
 startup also fail closed unless ownership, modes, and effective DAC access deny
 the web account direct writes.
+During the first PR14-to-PR15 update, PR14's updater installs the PR15 unit
+before the new updater code can run. The candidate unit's fixed pre-start
+command invokes a separate, bounded root transient bootstrap to install and
+apply the root-owned runtime tmpfiles rule before the PR15 web process starts.
+The pre-start client retains the web unit's read-only mount view; its transient
+service alone receives the fixed bootstrap write paths. Bootstrap failure
+fails service start and lets PR14 restore its prior unit and release. The
+fixed boot rule may remain after a later health-check rollback; it is safe for
+PR14 and grants no web write authority.
 Recovery retains all PR12–PR14 journal, service readiness,
 rollback, and fail-closed rules. Automated tests use fake root/service
 boundaries; a real host must verify sudo and systemd namespace behavior before

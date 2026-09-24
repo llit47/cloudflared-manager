@@ -78,5 +78,17 @@ or select another privileged action.
   prior rule bytes and mode as well. Bridge installation restores the helper,
   sudoers rule, and tmpfiles rule to their prior bytes, modes, or absence if a
   later asset write fails; incomplete rollback is reported explicitly.
+- The PR14 updater at `49f8c41a` installs the candidate unit and restarts it
+  before any PR15 updater runs. The PR15 unit's fixed `ExecStartPre=!` command
+  starts a bounded root transient service, which executes
+  `deployment.runtime_bootstrap` from the root-owned current release. That
+  module calls `install_runtime_tmpfiles()` and fails service start if the
+  rule or runtime metadata cannot be validated or applied. `!` retains the
+  web unit's read-only mount restrictions for the pre-start client; only the
+  transient bootstrap service can write `/etc/tmpfiles.d` and `/run` to create
+  the fixed rule and directory. The long-running web process retains no
+  writable privileged mount. A later PR14 rollback can leave only the safe,
+  root-owned fixed boot rule; the old unit and release are restored and remain
+  usable. Later PR15 reconciliation is idempotent.
 - Deterministic tests use fake service boundaries and temporary paths. Manual
   host verification is described in the README.

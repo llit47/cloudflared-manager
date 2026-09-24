@@ -193,6 +193,21 @@ Install, update, reconciliation, and explicit bridge installation also run
 verify the root-owned `0700` directory. An unsafe existing directory is
 rejected before tmpfiles can change it; the web startup check stays strict.
 
+The first PR14-to-PR15 update still runs PR14's updater. That updater installs
+the PR15 candidate unit, switches `current`, and restarts before it installs
+the new administration scripts. The candidate unit therefore has a fixed
+pre-start bootstrap: systemd starts a short-lived root transient service from
+the root-owned current release, which calls the same validated tmpfiles
+installer. It installs the rule before the first PR15 web process starts, so
+boot can recreate `/run/cloudflared-manager` without a second update. The
+pre-start command remains in the web unit's read-only mount namespace; only
+the transient service may write `/etc/tmpfiles.d` and `/run` while applying
+the fixed rule. It has a 30-second service lifetime limit and only `CAP_CHOWN`.
+If bootstrap fails, service start fails and PR14 restores its prior unit and
+release. If later health verification fails, the exact root-owned boot rule
+may remain; it is compatible with PR14 and grants no service-account write
+authority. Subsequent PR15 reconciliation applies the rule idempotently.
+
 `GET /healthz` is the minimal public monitoring endpoint. Its response contract
 remains exactly:
 
@@ -602,8 +617,11 @@ and modes with `stat`, confirm the tmpfiles rule with
 Confirm the web process sees `/etc/cloudflared`, `/etc/cloudflared-manager`,
 and `/run/cloudflared-manager` read-only in its mount namespace,
 and a recovery request starts a transient system service able to complete the
-fixed PR14 transaction. Verify failed install/update leaves the prior tmpfiles
-rule bytes and mode intact.
+fixed PR14 transaction. Verify failed PR15 install/update leaves the prior
+tmpfiles rule bytes and mode intact. On a PR14-to-PR15 migration host, verify
+the candidate unit's pre-start bootstrap installed the fixed rule before the
+first successful upgrade is reported, then reboot and confirm the `0700`
+runtime directory is recreated before web startup.
 Then send the version 1 recovery JSON through
 `sudo -n -u cloudflared-manager /usr/bin/sudo -n /opt/cloudflared-manager/privileged-helper`
 on a clean, adopted test host. A successful result has code
