@@ -419,6 +419,24 @@ class ReleaseFilesystem:
             candidates.append((self.paths.tmpfiles_path, tmpfiles_source, _TMPFILES_ASSET))
         elif b"/run/cloudflared-manager" in (release / "deploy/cloudflared-manager.service").read_bytes():
             raise HostOperationError("The release lacks its required runtime directory rule.")
+        mutation_assets = (
+            (self.paths.mutation_helper_path, release / "deploy/privileged-mutation-helper.sh",
+             "deploy/privileged-mutation-helper.sh"),
+            (self.paths.mutation_sudoers_path, release / "deploy/cloudflared-manager-mutation-bridge.sudoers",
+             "deploy/cloudflared-manager-mutation-bridge.sudoers"),
+        )
+        present = [asset.exists() or asset.is_symlink() for _, asset, _ in mutation_assets]
+        if (release / "src/cloudflared_manager/activation/mutation_helper.py").exists() and not all(present):
+            raise HostOperationError("The release lacks its required mutation bridge assets.")
+        if any(present) and not all(present):
+            raise HostOperationError("The release has an incomplete mutation bridge asset pair.")
+        if all(present):
+            for target, asset, relative in mutation_assets:
+                metadata = asset.lstat()
+                if (not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o022
+                    or (self.owner is not None and (metadata.st_uid, metadata.st_gid) != self.owner)):
+                    raise HostOperationError("The release has an unsafe mutation bridge asset.")
+                candidates.append((target, asset, relative))
         for target, candidate, relative in candidates:
             self._validate_regular_asset(target, candidate.read_bytes(), relative)
         self._validate_command_link(self.paths.update_link, self.paths.stable_update)
