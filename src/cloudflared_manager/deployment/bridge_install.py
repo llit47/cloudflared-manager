@@ -43,17 +43,34 @@ class BridgeInstaller:
         helper_changed = not self.filesystem._regular_asset_matches(self.paths.helper_path, helper, 0o755)
         sudoers_changed = not self.filesystem._regular_asset_matches(self.paths.sudoers_path, sudoers, 0o440)
         tmpfiles_snapshot = self.filesystem.snapshot(self.paths.tmpfiles_path)
+        helper_snapshot = self.filesystem.snapshot(self.paths.helper_path)
+        sudoers_snapshot = self.filesystem.snapshot(self.paths.sudoers_path)
+        tmpfiles_attempted = False
+        helper_attempted = False
+        sudoers_attempted = False
         try:
+            tmpfiles_attempted = True
             runtime_changed = self.filesystem.install_runtime_tmpfiles(release)
             if helper_changed:
+                helper_attempted = True
                 self.filesystem.atomic_write(self.paths.helper_path, helper, 0o755)
             if sudoers_changed:
+                sudoers_attempted = True
                 self.filesystem.atomic_write(self.paths.sudoers_path, sudoers, 0o440)
         except Exception as error:
-            try:
-                self.filesystem.restore_snapshot(self.paths.tmpfiles_path, tmpfiles_snapshot)
-            except Exception:
-                raise RollbackError("The runtime rule could not be restored.") from error
+            rollback_failed = False
+            for attempted, target, previous in (
+                (sudoers_attempted, self.paths.sudoers_path, sudoers_snapshot),
+                (helper_attempted, self.paths.helper_path, helper_snapshot),
+                (tmpfiles_attempted, self.paths.tmpfiles_path, tmpfiles_snapshot),
+            ):
+                if attempted:
+                    try:
+                        self.filesystem.restore_snapshot(target, previous)
+                    except Exception:
+                        rollback_failed = True
+            if rollback_failed:
+                raise RollbackError("Bridge installation rollback was incomplete.") from error
             raise
         return runtime_changed or helper_changed or sudoers_changed
 

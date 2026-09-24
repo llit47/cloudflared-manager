@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from cloudflared_manager.deployment.bridge_install import BridgeInstaller
-from cloudflared_manager.deployment.errors import HostOperationError
+from cloudflared_manager.deployment.errors import HostOperationError, RollbackError
 from cloudflared_manager.deployment.release import PathSnapshot
 from tests.deployment_support import make_paths
 
@@ -26,8 +26,7 @@ class Filesystem:
         if previous.kind == "missing":
             target.unlink(missing_ok=True)
         else:
-            target.write_bytes(previous.content)
-            target.chmod(previous.mode)
+            self._replace(target, previous.content, previous.mode)
     def install_runtime_tmpfiles(self, release):
         target = self.paths.tmpfiles_path
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -44,8 +43,13 @@ class Filesystem:
     def _regular_asset_matches(self, target, content, mode):
         return target.exists() and target.read_bytes() == content and target.stat().st_mode & 0o777 == mode
     def atomic_write(self, target, content, mode):
-        target.write_bytes(content)
-        target.chmod(mode)
+        self._replace(target, content, mode)
+    @staticmethod
+    def _replace(target, content, mode):
+        temporary = target.with_name(target.name + ".test-write")
+        temporary.write_bytes(content)
+        temporary.chmod(mode)
+        temporary.replace(target)
 
 
 @pytest.fixture
@@ -128,6 +132,66 @@ def test_failed_bridge_install_restores_prior_tmpfiles_rule(setup):
                         boundary_check=lambda paths: None).install(release)
     assert paths.tmpfiles_path.read_bytes() == prior
     assert paths.tmpfiles_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("failure", ["helper-after", "sudoers-before", "sudoers-after"])
+@pytest.mark.parametrize("existing", [False, True])
+def test_bridge_write_failure_restores_all_attempted_assets(setup, failure, existing):
+    paths, release, visudo = setup
+    prior = {
+        paths.tmpfiles_path: (b"d /run/cloudflared-manager 0700 root root -\n", 0o600),
+        paths.helper_path: (b"#!/bin/bash\nexit 7\n", 0o700),
+        paths.sudoers_path: (b"# recognized prior policy\n", 0o400),
+    }
+    if existing:
+        paths.tmpfiles_path.parent.mkdir(parents=True)
+        for target, (content, mode) in prior.items():
+            target.write_bytes(content)
+            target.chmod(mode)
+
+    class FailingFilesystem(Filesystem):
+        def atomic_write(self, target, content, mode):
+            if failure == "sudoers-before" and target == paths.sudoers_path:
+                raise HostOperationError("injected sudoers write failure")
+            super().atomic_write(target, content, mode)
+            if failure == "helper-after" and target == paths.helper_path:
+                raise HostOperationError("injected helper write failure")
+            if failure == "sudoers-after" and target == paths.sudoers_path:
+                raise HostOperationError("injected sudoers write failure")
+
+    with pytest.raises(HostOperationError, match="injected"):
+        BridgeInstaller(paths, FailingFilesystem(paths), visudo=visudo,
+                        boundary_check=lambda paths: None).install(release)
+
+    for target, (content, mode) in prior.items():
+        if existing:
+            assert target.read_bytes() == content
+            assert target.stat().st_mode & 0o777 == mode
+        else:
+            assert not target.exists()
+
+
+def test_bridge_rollback_failure_is_reported_and_other_assets_are_restored(setup):
+    paths, release, visudo = setup
+    restored = []
+
+    class FailedRollback(Filesystem):
+        def atomic_write(self, target, content, mode):
+            super().atomic_write(target, content, mode)
+            if target == paths.sudoers_path:
+                raise HostOperationError("injected sudoers write failure")
+        def restore_snapshot(self, target, previous):
+            restored.append(target)
+            if target == paths.helper_path:
+                raise HostOperationError("injected rollback failure")
+            super().restore_snapshot(target, previous)
+
+    with pytest.raises(RollbackError, match="rollback was incomplete"):
+        BridgeInstaller(paths, FailedRollback(paths), visudo=visudo,
+                        boundary_check=lambda paths: None).install(release)
+    assert restored == [paths.sudoers_path, paths.helper_path, paths.tmpfiles_path]
+    assert not paths.sudoers_path.exists()
+    assert not paths.tmpfiles_path.exists()
 
 
 def test_sudoers_grants_exact_helper_with_no_arguments():

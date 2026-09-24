@@ -74,6 +74,8 @@ or select another privileged action.
   reconciliation, and bridge installation apply the fixed rule immediately
   and reject unsafe pre-existing runtime metadata before applying it. A failed
   application restores the prior rule; failed deployment rollback restores the
-  prior rule bytes and mode as well.
+  prior rule bytes and mode as well. Bridge installation restores the helper,
+  sudoers rule, and tmpfiles rule to their prior bytes, modes, or absence if a
+  later asset write fails; incomplete rollback is reported explicitly.
 - Deterministic tests use fake service boundaries and temporary paths. Manual
   host verification is described in the README.
