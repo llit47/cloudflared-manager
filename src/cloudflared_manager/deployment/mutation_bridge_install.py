@@ -59,11 +59,15 @@ class MutationBridgeInstaller(BridgeInstaller):
             if helper_changed:
                 attempted.append((self.paths.mutation_helper_path, helper_snapshot))
                 self.filesystem.atomic_write(self.paths.mutation_helper_path, helper, 0o755)
+            if not self.filesystem._regular_asset_matches(self.paths.mutation_helper_path, helper, 0o755):
+                raise HostOperationError("The mutation helper could not be verified before granting sudo.")
             if self.filesystem.read_current_sha() != release.name:
                 raise HostOperationError("The active manager release changed during bridge installation.")
             if sudoers_changed:
                 attempted.append((self.paths.mutation_sudoers_path, sudoers_snapshot))
                 self.filesystem.atomic_write(self.paths.mutation_sudoers_path, sudoers, 0o440)
+            if not self.filesystem._regular_asset_matches(self.paths.mutation_sudoers_path, sudoers, 0o440):
+                raise HostOperationError("The mutation sudoers policy could not be verified.")
             if self.filesystem.read_current_sha() != release.name:
                 raise HostOperationError("The active manager release changed during bridge installation.")
         except Exception as error:

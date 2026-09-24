@@ -18,8 +18,9 @@ from cloudflared_manager.activation.filesystem import FilesystemRefused
 from cloudflared_manager.cloudflared.editing import (
     ApplicationValidationError, CloudflaredValidationExecutionError,
     CloudflaredValidationRejectedError, CloudflaredValidationTimeoutError,
-    CloudflaredValidatorUnavailableError, MutationRejectedError, RoundTripYamlError,
-    SourceConfigChangedError, StaleMutationError, UnsupportedConfigStructureError,
+    CloudflaredValidatorUnavailableError, CandidateFileError, MutationRejectedError,
+    RoundTripYamlError, SourceConfigChangedError, SourceConfigUnreadableError,
+    StaleMutationError, UnsupportedConfigStructureError,
 )
 from cloudflared_manager.cloudflared.editing.validation import CloudflaredCandidateValidator
 from cloudflared_manager.deployment.errors import UpdateLockedError
@@ -73,6 +74,10 @@ def dispatch(request: MutationRequest, operation: Callable[[MutationRequest], ob
         return False, "STALE_CONFLICT"
     except SourceConfigChangedError:
         return False, "STALE_CONFLICT"
+    except CandidateFileError:
+        return False, "RECOVERY_REQUIRED"
+    except SourceConfigUnreadableError:
+        return False, "UNSUPPORTED_CONFIG"
     except MutationRejectedError:
         return False, "INVALID_DOMAIN_DATA"
     except (UnsupportedConfigStructureError, RoundTripYamlError):

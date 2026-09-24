@@ -20,7 +20,7 @@ from cloudflared_manager.activation.transaction import ActivationError
 from cloudflared_manager.cloudflared.editing.local_ingress import LocalRoute, RouteSelector
 from cloudflared_manager.cloudflared.editing.errors import (
     ApplicationValidationError, CloudflaredValidationRejectedError,
-    UnsupportedConfigStructureError,
+    CandidateFileError, UnsupportedConfigStructureError,
 )
 
 REV = "a" * 64
@@ -90,6 +90,7 @@ def test_helper_sanitizes_activation_error():
     (ApplicationValidationError("secret"), "VALIDATION_FAILED"),
     (CloudflaredValidationRejectedError("secret"), "VALIDATION_FAILED"),
     (UnsupportedConfigStructureError("secret"), "UNSUPPORTED_CONFIG"),
+    (CandidateFileError("secret"), "RECOVERY_REQUIRED"),
     (ActivationError("FAILED_ROLLED_BACK", original="secret"), "ACTIVATION_FAILED_ROLLED_BACK"),
     (ActivationError("RECOVERY_REQUIRED", original="secret"), "RECOVERY_REQUIRED"),
 ])

@@ -5,7 +5,7 @@ import yaml
 
 from cloudflared_manager.cloudflared.editing import (
     EditableCloudflaredConfig, MutationOutcome, MutationRejectedError,
-    StaleMutationError, read_config_source_snapshot,
+    StaleMutationError, UnsupportedConfigStructureError, read_config_source_snapshot,
 )
 from cloudflared_manager.cloudflared.editing.local_ingress import LocalRoute, RouteSelector
 from cloudflared_manager.cloudflared.editing.preparation import prepare_validated_candidate
@@ -111,3 +111,18 @@ def test_manual_source_edit_rejected_before_mutation_or_staging(tmp_path):
         prepare_validated_candidate(path, forbidden_mutation, cloudflared_validator=Validator(),
                                     expected_source_revision=observed.sha256)
     assert list(tmp_path.glob(".cfm-candidate-*")) == []
+
+
+def test_edit_rejects_route_mapping_aliased_elsewhere(tmp_path):
+    source = """ingress:
+  - &shared
+    hostname: one.example.com
+    service: http://127.0.0.1:8000
+  - service: http_status:404
+unrelated: *shared
+"""
+    document = editor(tmp_path, source)
+    selected = document.local_route_selector(0)
+    with pytest.raises(UnsupportedConfigStructureError):
+        document.edit_local_hostname_ingress(
+            selected, LocalRoute("new.example.com", None, "http://127.0.0.1:9000"))

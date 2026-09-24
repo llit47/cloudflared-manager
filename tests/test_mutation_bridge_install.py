@@ -102,6 +102,17 @@ def test_incomplete_rollback_is_distinguished(setup):
     assert not paths.mutation_sudoers_path.exists()
 
 
+def test_helper_identity_is_rechecked_before_sudoers_grant(setup):
+    paths, release, _ = setup
+    class CorruptHelper(FakeFilesystem):
+        def atomic_write(self, target, content, mode):
+            super().atomic_write(target, b"wrong helper" if target == paths.mutation_helper_path else content, mode)
+    with pytest.raises(HostOperationError, match="verified before granting"):
+        installer(setup, CorruptHelper(paths, release)).install(release)
+    assert not paths.mutation_helper_path.exists()
+    assert not paths.mutation_sudoers_path.exists()
+
+
 @pytest.mark.parametrize("target", ["helper", "sudoers"])
 def test_unsafe_existing_target_is_rejected(setup, target):
     paths, release, _ = setup
@@ -123,6 +134,12 @@ def test_unsafe_asset_parent_or_sudoers_syntax_rejected(setup):
     bad_visudo.write_text("#!/bin/sh\nexit 1\n")
     bad_visudo.chmod(0o755)
     with pytest.raises(HostOperationError):
+        MutationBridgeInstaller(paths, FakeFilesystem(paths, release), visudo=bad_visudo,
+                                boundary_check=lambda paths: None,
+                                barrier_check=lambda: None).install(release)
+    bad.write_bytes((ROOT / "deploy/cloudflared-manager-mutation-bridge.sudoers").read_bytes())
+    bad.chmod(0o644)
+    with pytest.raises(HostOperationError, match="syntax validation"):
         MutationBridgeInstaller(paths, FakeFilesystem(paths, release), visudo=bad_visudo,
                                 boundary_check=lambda paths: None,
                                 barrier_check=lambda: None).install(release)

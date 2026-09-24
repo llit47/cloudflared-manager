@@ -30,6 +30,36 @@ def test_bridge_install_is_explicit_root_admin_action(monkeypatch, capsys):
     assert "installed" in capsys.readouterr().out
 
 
+def test_mutation_bridge_requires_explicit_command_and_recovery_barrier(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(cli, "_require_root", lambda: None)
+    monkeypatch.setattr(cli, "DeploymentLock", lambda path: nullcontext())
+    monkeypatch.setattr(cli, "PROCESS_RELEASE_ID", "a" * 40)
+    class Barrier:
+        def __init__(self, paths):
+            pass
+        def require_clean(self):
+            calls.append("barrier")
+    class Filesystem:
+        def __init__(self, paths):
+            pass
+        def read_current_sha(self):
+            calls.append("current")
+            return "a" * 40
+    class Installer:
+        def __init__(self, paths, filesystem):
+            pass
+        def install(self, release):
+            calls.append("install")
+            return True
+    monkeypatch.setattr(cli, "ActivationRecoveryBarrier", Barrier)
+    monkeypatch.setattr(cli, "ReleaseFilesystem", Filesystem)
+    monkeypatch.setattr(cli, "MutationBridgeInstaller", Installer)
+    assert cli.configure(["install-mutation-bridge"]) == 0
+    assert calls == ["barrier", "current", "install"]
+    assert "mutation bridge installed" in capsys.readouterr().out
+
+
 class _LocalAddresses:
     def __init__(self, output: str) -> None:
         self.output = output

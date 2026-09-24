@@ -24,17 +24,20 @@ whether a local config candidate is detected, explicitly adopted, matched to
 the running service, unverified, or different from the service configuration.
 A production deployment foundation installs immutable release-specific
 environments and runs the application as a dedicated unprivileged system user.
-An internal candidate-generation foundation can securely snapshot an explicitly
-selected config, apply a narrow in-memory ingress insertion, stage a separate
-candidate beside the source, and validate that candidate. Nothing in the web
-application or deployment workflow invokes this foundation yet.
+An internal candidate-generation foundation securely snapshots an adopted
+config, applies narrow local ingress operations, stages a separate candidate,
+and validates it. The explicitly installed PR16 root helper invokes this
+foundation; the web application does not.
 
 Detected routes are existing configuration, not routes owned or managed by
 Cloudflared Manager. The web application remains read-only. PR15 provides an
 explicitly installed, recovery-only sudo bridge for resuming a PR12–PR14
-activation journal. This version does **not** initiate new config mutations,
-contact the Cloudflare API, change DNS, persist route ownership, or implement
-Add, Edit, Enable, Disable, or Delete.
+activation journal. PR16 adds a [separately installed local ingress mutation
+foundation](docs/pr16-local-mutation-core.md) for internal Add/Edit/Delete
+activation. An ordinary upgrade does not install its distinct sudo grant.
+Product-level Add/Edit/Delete still lack managed DNS ownership; Enable/Disable,
+Cloudflare API, DNS, and route persistence remain unsupported. Future browser
+mutation requires separate authentication and CSRF review.
 
 ## Architecture
 
@@ -78,8 +81,8 @@ are not required for development installation or tests.
 ## Production deployment
 
 Production deployment targets Linux hosts using systemd and Python 3.12 or
-newer. It creates one Cloudflared Manager installation. This release exposes
-only **READ-ONLY** capability; there is no hidden read/write switch and no
+newer. It creates one Cloudflared Manager installation. The browser exposes
+only **READ-ONLY** capability; there is no hidden browser read/write switch and no
 Cloudflare API token is accepted or required.
 
 Install the current `main` revision non-interactively:
@@ -350,10 +353,11 @@ systemctl status cloudflared-manager.service
 journalctl -u cloudflared-manager.service
 ```
 
-The deployment scripts never start, stop, restart, reload, enable, disable, or
-edit the existing `cloudflared.service`. They never modify anything under
-`/etc/cloudflared`, install cloudflared, call the Cloudflare API, modify DNS, or
-read tunnel tokens, token files, credential JSON, or `cert.pem`.
+Ordinary install, update, and configuration commands do not control or edit
+`cloudflared.service` or modify `/etc/cloudflared`. Only the explicitly
+installed privileged bridges can perform their reviewed recovery or local
+activation actions. Deployment does not install cloudflared, call the
+Cloudflare API, modify DNS, or read tunnel credentials.
 
 An automated uninstaller is not included in this release.
 
@@ -480,21 +484,22 @@ the dashboard uses that file to show the tunnel declaration and sanitized
 hostname routes; it never reads or dereferences `credentials-file`, token files,
 credentials JSON, or `cert.pem`.
 
-### Internal candidate foundation (not active configuration support)
+### Internal candidate and local mutation foundation
 
-This release remains operationally **READ-ONLY**. The internal editing package
-is candidate-generation infrastructure for later privileged work; it is not
-wired to HTTP, dashboard requests, `cfm-config`, installation, or deployment.
-There is no Add, Edit, Enable, Disable, Delete, DNS, or Cloudflare API workflow.
+The browser remains **READ-ONLY**. The internal editing package supports
+candidate generation and narrow local hostname ingress Add/Edit/Delete. The
+separate privileged mutation bridge must be explicitly installed by root; it
+is not wired to HTTP or dashboard requests. There is no product-level
+Add/Edit/Delete, Enable/Disable, DNS, or Cloudflare API workflow.
 
 Candidate preparation follows this bounded sequence:
 
 1. Open a canonical regular source without following symlinks, read at most the
    shared one-MiB limit, and retain immutable bytes, SHA-256, file identity,
    timestamps, ownership/mode, and parent-directory identity.
-2. Load those bytes as UTF-8 round-trip YAML and allow only the narrow primitive
-   that inserts a supplied ingress mapping immediately before a valid terminal
-   catch-all. Unknown existing data is not projected into a smaller model.
+2. Load those bytes as UTF-8 round-trip YAML and allow only narrow ingress
+   insertion, selected hostname route edit, and selected hostname route delete.
+   The terminal catch-all remains final. Unknown existing data is retained.
 3. For a real change only, exclusively create a random `0600` candidate in the
    source directory, write it completely, and `fsync` it. Retained read-only
    file and directory descriptors pin its identity until discard. The adopted
@@ -519,13 +524,15 @@ Candidate preparation follows this bounded sequence:
 Raw YAML, local config paths, validator output, and credential-bearing values
 are not added to browser models or safe exception messages. Normal dashboard
 requests do not create or validate candidates, and the installed service stays
-unprivileged. `cloudflared.service` is never restarted, reloaded, started, or
-stopped by this foundation.
+unprivileged. Candidate preparation alone never controls `cloudflared.service`;
+only the separate root activation transaction can restart its fixed unit.
 
 PR12 and PR14 provide the activation transaction. PR15 exposes only its
-`recover()` method through a versioned, recovery-only sudo bridge. No web route
-or supported CLI calls `run()` to activate a new candidate. The application
-does not gain direct config or service-control permissions.
+`recover()` method through a versioned, recovery-only sudo bridge. PR16 adds a
+distinct, explicitly installed root helper for three local ingress actions;
+that helper calls `run()` with a fixed validator. No web route or normal
+configuration command activates a candidate. The application does not gain
+direct config or service-control permissions.
 
 The internal transaction extends PR12's authenticated atomic config exchange,
 exact backup, durable journal, rollback, and recovery barrier with PR14's strict
