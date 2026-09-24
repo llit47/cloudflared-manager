@@ -1,4 +1,4 @@
-"""Exact-release update transaction with unit and health rollback."""
+"""PR14 commit 49f8c41a updater; only fixture imports and type changed."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from cloudflared_manager.deployment.errors import (
 from cloudflared_manager.deployment.health import verify_managed_health
 from cloudflared_manager.deployment.paths import DeploymentPaths
 from cloudflared_manager.deployment.protocols import HealthVerifier, ManagerService
-from cloudflared_manager.deployment.reconciliation import DeploymentReconciler
-from cloudflared_manager.deployment.release import ReleaseFilesystem
+from tests.fixtures.pr14_reconciliation import DeploymentReconciler
+from tests.fixtures.pr14_release import PR14ReleaseFilesystem
 from cloudflared_manager.deployment.settings import settings_from_document
 from cloudflared_manager.deployment.validation import validate_sha
 
@@ -32,7 +32,7 @@ class Updater:
     def __init__(
         self,
         paths: DeploymentPaths,
-        filesystem: ReleaseFilesystem,
+        filesystem: PR14ReleaseFilesystem,
         service: ManagerService,
         health: HealthVerifier,
     ) -> None:

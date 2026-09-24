@@ -20,6 +20,7 @@ from tests.deployment_support import (
     FakePreparationRunner, FakeService, fake_readiness, make_paths, make_source,
 )
 from tests.fixtures.pr14_updater import Updater as PR14Updater
+from tests.fixtures.pr14_release import PR14ReleaseFilesystem
 
 ROOT = Path(__file__).parents[1]
 OLD = "3" * 40
@@ -28,29 +29,37 @@ RULE = b"d /run/cloudflared-manager 0700 root root -\n"
 
 
 class LegacyService(FakeService):
-    def __init__(self, paths, filesystem):
+    def __init__(self, paths, candidate_filesystem):
         super().__init__()
         self.paths = paths
-        self.filesystem = filesystem
+        self.candidate_filesystem = candidate_filesystem
+        self.bootstrap_calls = 0
 
     def restart(self):
         self.calls.append("restart")
         if b"cloudflared_manager.deployment.runtime_bootstrap" in self.paths.unit_path.read_bytes():
-            # systemd runs the candidate unit's fixed pre-start transient service.
-            install_current_runtime_rule(self.paths, self.filesystem)
+            # Only after PR14 switches current and restarts does systemd run
+            # the PR15 candidate unit's fixed pre-start transient service.
+            assert self.candidate_filesystem.read_current_sha() == NEW
+            if self.bootstrap_calls == 0:
+                assert not self.paths.tmpfiles_path.exists()
+            self.bootstrap_calls += 1
+            install_current_runtime_rule(self.paths, self.candidate_filesystem)
         self.active = True
         self.main_pid = 1234
 
 
 def _setup(tmp_path):
     paths = make_paths(tmp_path)
-    filesystem = ReleaseFilesystem(paths, owner=None, process_runner=FakePreparationRunner())
+    filesystem = PR14ReleaseFilesystem(paths, owner=None, process_runner=FakePreparationRunner())
+    candidate_filesystem = ReleaseFilesystem(paths, owner=None,
+                                             process_runner=FakePreparationRunner())
     filesystem.ensure_layout()
     paths.config_root.parent.chmod(0o755)
     old_source = make_source(tmp_path / "old", unit=b"[Service]\nType=simple\n# PR14\n",
                              administration_version="pr14")
+    (old_source / "deploy/cloudflared-manager.tmpfiles.conf").unlink()
     old_release = filesystem.prepare_release(old_source, OLD, Path("/usr/bin/python3"))
-    (old_release / "deploy/cloudflared-manager.tmpfiles.conf").unlink()
     filesystem.switch_current(OLD)
     filesystem.install_unit(old_release)
     filesystem.install_stable_administration(old_release)
@@ -62,7 +71,7 @@ def _setup(tmp_path):
         unit=(ROOT / "deploy/cloudflared-manager.service").read_bytes(),
         administration_version="pr15",
     )
-    return paths, filesystem, candidate_source
+    return paths, filesystem, candidate_filesystem, candidate_source
 
 
 def _health(filesystem):
@@ -85,12 +94,13 @@ def _boot_and_check(paths, tmp_path):
 
 
 def test_pr14_updater_first_upgrade_installs_boot_rule_before_restart(tmp_path):
-    paths, filesystem, source = _setup(tmp_path)
-    service = LegacyService(paths, filesystem)
+    paths, filesystem, candidate_filesystem, source = _setup(tmp_path)
+    service = LegacyService(paths, candidate_filesystem)
     PR14Updater(paths, filesystem, service, _health(filesystem)).update(
         source, NEW, Path("/usr/bin/python3")
     )
     assert filesystem.read_current_sha() == NEW
+    assert service.bootstrap_calls == 1
     assert paths.tmpfiles_path.read_bytes() == RULE
     assert paths.tmpfiles_path.stat().st_mode & 0o777 == 0o644
     assert paths.runtime_root.stat().st_mode & 0o777 == 0o700
@@ -100,16 +110,17 @@ def test_pr14_updater_first_upgrade_installs_boot_rule_before_restart(tmp_path):
     shutil.rmtree(paths.runtime_root.parent)
     _boot_and_check(paths, tmp_path)
     service.restart()
+    assert service.bootstrap_calls == 2
     assert paths.tmpfiles_path.read_bytes() == RULE
-    assert not Updater(paths, filesystem, service, _health(filesystem)).update(
+    assert not Updater(paths, candidate_filesystem, service, _health(filesystem)).update(
         None, NEW, Path("/usr/bin/python3")
     ).changed
 
 
 def test_pr14_updater_rolls_back_when_bootstrap_fails(tmp_path):
-    paths, filesystem, source = _setup(tmp_path)
+    paths, filesystem, candidate_filesystem, source = _setup(tmp_path)
     paths.tmpfiles_executable.write_text("#!/bin/sh\nexit 1\n")
-    service = LegacyService(paths, filesystem)
+    service = LegacyService(paths, candidate_filesystem)
     with pytest.raises(TransactionFailedError, match="restored"):
         PR14Updater(paths, filesystem, service, _health(filesystem)).update(
             source, NEW, Path("/usr/bin/python3")
@@ -120,8 +131,8 @@ def test_pr14_updater_rolls_back_when_bootstrap_fails(tmp_path):
 
 
 def test_pr14_health_failure_restores_old_release_with_safe_boot_rule(tmp_path):
-    paths, filesystem, source = _setup(tmp_path)
-    service = LegacyService(paths, filesystem)
+    paths, filesystem, candidate_filesystem, source = _setup(tmp_path)
+    service = LegacyService(paths, candidate_filesystem)
     def fail_new(host, port):
         if filesystem.read_current_sha() == NEW:
             raise HostOperationError("candidate health failed")
@@ -140,10 +151,10 @@ def test_pr14_health_failure_restores_old_release_with_safe_boot_rule(tmp_path):
 
 
 def test_pr14_upgrade_rejects_unsafe_existing_runtime_directory(tmp_path):
-    paths, filesystem, source = _setup(tmp_path)
+    paths, filesystem, candidate_filesystem, source = _setup(tmp_path)
     paths.runtime_root.mkdir(parents=True)
     paths.runtime_root.chmod(0o777)
-    service = LegacyService(paths, filesystem)
+    service = LegacyService(paths, candidate_filesystem)
     with pytest.raises(TransactionFailedError, match="restored"):
         PR14Updater(paths, filesystem, service, _health(filesystem)).update(
             source, NEW, Path("/usr/bin/python3")
