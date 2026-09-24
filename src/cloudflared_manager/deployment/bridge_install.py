@@ -10,7 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from cloudflared_manager.deployment.environment import read_environment, require_safe_environment
-from cloudflared_manager.deployment.errors import HostOperationError
+from cloudflared_manager.deployment.errors import HostOperationError, RollbackError
 from cloudflared_manager.deployment.paths import DeploymentPaths
 from cloudflared_manager.deployment.release import ReleaseFilesystem
 from cloudflared_manager.deployment.settings import settings_from_document
@@ -32,7 +32,6 @@ class BridgeInstaller:
 
     def install(self, release: Path) -> bool:
         self.filesystem.validate_deployment_assets(release)
-        runtime_changed = self.filesystem.install_runtime_tmpfiles(release)
         self.boundary_check(self.paths)
         self._require_parent(self.paths.helper_path.parent)
         self._require_parent(self.paths.sudoers_path.parent)
@@ -43,10 +42,19 @@ class BridgeInstaller:
         self._validate_sudoers(sudoers)
         helper_changed = not self.filesystem._regular_asset_matches(self.paths.helper_path, helper, 0o755)
         sudoers_changed = not self.filesystem._regular_asset_matches(self.paths.sudoers_path, sudoers, 0o440)
-        if helper_changed:
-            self.filesystem.atomic_write(self.paths.helper_path, helper, 0o755)
-        if sudoers_changed:
-            self.filesystem.atomic_write(self.paths.sudoers_path, sudoers, 0o440)
+        tmpfiles_snapshot = self.filesystem.snapshot(self.paths.tmpfiles_path)
+        try:
+            runtime_changed = self.filesystem.install_runtime_tmpfiles(release)
+            if helper_changed:
+                self.filesystem.atomic_write(self.paths.helper_path, helper, 0o755)
+            if sudoers_changed:
+                self.filesystem.atomic_write(self.paths.sudoers_path, sudoers, 0o440)
+        except Exception as error:
+            try:
+                self.filesystem.restore_snapshot(self.paths.tmpfiles_path, tmpfiles_snapshot)
+            except Exception:
+                raise RollbackError("The runtime rule could not be restored.") from error
+            raise
         return runtime_changed or helper_changed or sudoers_changed
 
     def _source(self, path: Path) -> bytes:

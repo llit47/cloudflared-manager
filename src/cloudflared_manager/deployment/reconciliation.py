@@ -32,7 +32,7 @@ class DeploymentReconciler:
 
     def reconcile(self, release: Path, settings: ManagerSettings) -> ReconcileResult:
         self.filesystem.validate_deployment_assets(release)
-        runtime_changed = self.filesystem.install_runtime_tmpfiles(release)
+        tmpfiles_snapshot = self.filesystem.snapshot(self.filesystem.paths.tmpfiles_path)
         unit_snapshot = self.filesystem.snapshot(self.filesystem.paths.unit_path)
         initial_runtime = self.service.runtime_state()
         was_active = initial_runtime.active
@@ -45,7 +45,9 @@ class DeploymentReconciler:
         service_changed = False
         service_operation_attempted = False
         enable_attempted = False
+        runtime_changed = False
         try:
+            runtime_changed = self.filesystem.install_runtime_tmpfiles(release)
             unit_install_attempted = True
             unit_changed = self.filesystem.install_unit(release)
             unit_install_completed = True
@@ -110,6 +112,13 @@ class DeploymentReconciler:
                         self._verify_health(settings, release.name)
                     else:
                         self.service.stop()
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+            if runtime_changed:
+                try:
+                    self.filesystem.restore_snapshot(
+                        self.filesystem.paths.tmpfiles_path, tmpfiles_snapshot
+                    )
                 except Exception as rollback_error:
                     rollback_errors.append(rollback_error)
             if rollback_errors:

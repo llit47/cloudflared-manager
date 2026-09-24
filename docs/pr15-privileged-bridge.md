@@ -25,7 +25,10 @@ release switching are root administrator operations. The manager service is
 previously configured `NoNewPrivileges=true`, which prevented a setuid sudo
 transition. PR15 sets it to `false`, keeps `RestrictSUIDSGID=true`, and limits
 the capability bounding set and writable mount paths to those needed by the
-bridge. Sudo inherits those mount paths, so root recovery needs them writable.
+bridge. The web unit keeps `/etc/cloudflared` read-only even if host DAC or ACLs
+later drift. Sudo inherits that read-only mount; the fixed launcher starts a
+transient system-manager service in a separate `ProtectSystem=strict` mount
+namespace with only the fixed recovery directories writable.
 Before bridge installation, root checks the complete bounded
 `/etc/cloudflared` tree for unsafe ownership, modes, ACLs, and objects. The
 check rejects every visible `system.*` xattr, including POSIX default ACLs
@@ -59,14 +62,18 @@ or select another privileged action.
   results.
 - `deploy/privileged-helper.sh` enters Bash privileged mode, invokes the sole
   pre-sanitization external command as `/usr/bin/readlink`, and launches the
-  active root-owned release with `python -I` and a fixed minimal environment.
+  active root-owned release with `python -I` through fixed `/usr/bin/systemd-run`
+  arguments and a fixed minimal environment. The transient root service carries
+  the recovery transaction and its writable mount exceptions.
 - `deploy/cloudflared-manager-bridge.sudoers` grants the exact helper path;
   `cfm-config install-bridge` validates and installs both assets explicitly.
 - `deploy/cloudflared-manager.service` permits the sudo transition within a
-  bounded capability and mount namespace.
+  bounded capability namespace while keeping `/etc/cloudflared` read-only.
 - `deploy/cloudflared-manager.tmpfiles.conf` recreates root-owned `0700`
   `/run/cloudflared-manager` through systemd-tmpfiles at boot. Install, update,
   reconciliation, and bridge installation apply the fixed rule immediately
-  and reject unsafe pre-existing runtime metadata before applying it.
+  and reject unsafe pre-existing runtime metadata before applying it. A failed
+  application restores the prior rule; failed deployment rollback restores the
+  prior rule bytes and mode as well.
 - Deterministic tests use fake service boundaries and temporary paths. Manual
   host verification is described in the README.

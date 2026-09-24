@@ -23,5 +23,14 @@ if [[ ! -x ${manager_python} ]]; then
     exit 1
 fi
 
+# A system-manager service starts outside the web unit's read-only mount
+# namespace. The only writable exceptions there are the recovery paths.
 exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+    /usr/bin/systemd-run --system --pipe --wait --quiet --collect \
+    --service-type=exec \
+    --property=ProtectSystem=strict \
+    '--property=ReadWritePaths=/etc/cloudflared /etc/cloudflared-manager /run/cloudflared-manager' \
+    --property=NoNewPrivileges=yes --property=UMask=0077 \
+    '--property=CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETGID CAP_SETUID CAP_SYS_PTRACE' \
+    --property=Environment=PYTHONDONTWRITEBYTECODE=1 \
     "${manager_python}" -I -m cloudflared_manager.activation.bridge_helper

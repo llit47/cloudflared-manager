@@ -171,9 +171,11 @@ only `CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_SETGID`,
 `CAP_SETUID`, and `CAP_SYS_PTRACE`. PR14 checks
 `/proc/<MainPID>/environ` and `/proc/<MainPID>/exe`; Linux applies a ptrace
 read check when `cloudflared.service` runs under another UID, so recovery needs
-`CAP_SYS_PTRACE` in the bounding set. The unit makes `/etc/cloudflared`,
-`/etc/cloudflared-manager`, and `/run/cloudflared-manager` writable in its mount
-namespace so the sudo child can recover. Before installing the bridge, root
+`CAP_SYS_PTRACE` in the bounding set. The web unit keeps `/etc/cloudflared`
+read-only in its mount namespace. The sudo launcher starts a fixed transient
+root service through `/usr/bin/systemd-run`; that service has its own restricted
+mount namespace with only `/etc/cloudflared`, `/etc/cloudflared-manager`, and
+`/run/cloudflared-manager` writable for recovery. Before installing the bridge, root
 checks that these locations are not writable by the web account. Adoption
 checks the cloudflared tree; the production web entry point checks again at
 startup. The adopted file cannot be owned or writable by the manager account.
@@ -566,8 +568,9 @@ helper as root with **no arguments** and no password. The unprivileged client
 uses fixed argv `/usr/bin/sudo -n /opt/cloudflared-manager/privileged-helper`.
 The helper launcher uses Bash privileged mode to ignore caller-supplied shell
 startup settings, invokes `/usr/bin/readlink` by absolute path before clearing
-the environment, then runs only the active root-owned release's Python module
-with `-I` and a fixed minimal environment. The request is one UTF-8 JSON
+the environment, then launches only the active root-owned release's Python module
+with `-I` through fixed `/usr/bin/systemd-run --system --pipe --wait` arguments
+and a fixed minimal environment. The request is one UTF-8 JSON
 document of at most 4096 bytes on stdin, currently exactly
 `{"version":1,"operation":"recover"}`. Unknown versions, operations, fields,
 duplicate keys, trailing data, oversized input, and non-root execution fail
@@ -584,9 +587,10 @@ cannot supply a config mutation, destination, executable, service verb, or unit.
 The root administrator, root-owned installed release, sudoers policy, and
 existing cloudflared unit are trusted. The web service account must not own or
 write the installed helper, release, sudoers file, adopted config, its parent,
-or journal. Sudo inherits the service mount namespace, so the root helper
-uses the same writable mounts. DAC denies direct web writes while retaining
-root recovery. If permissions change after installation, startup fails closed;
+or journal. Sudo inherits the web service's read-only `/etc/cloudflared` mount;
+the transient root service gets a separate, fixed writable recovery mount view.
+The web process cannot gain direct config write authority through later DAC or
+ACL drift. If permissions change after installation, startup fails closed;
 rerun bridge installation after correcting host ownership or modes.
 
 For privileged host verification, run
@@ -594,6 +598,10 @@ For privileged host verification, run
 and modes with `stat`, confirm the tmpfiles rule with
 `cat /etc/tmpfiles.d/cloudflared-manager.conf`, and verify
 `stat -c '%U:%G %a' /run/cloudflared-manager` reports `root:root 700`.
+Confirm the web process sees `/etc/cloudflared` read-only in its mount namespace,
+and a recovery request starts a transient system service able to complete the
+fixed PR14 transaction. Verify failed install/update leaves the prior tmpfiles
+rule bytes and mode intact.
 Then send the version 1 recovery JSON through
 `sudo -n -u cloudflared-manager /usr/bin/sudo -n /opt/cloudflared-manager/privileged-helper`
 on a clean, adopted test host. A successful result has code

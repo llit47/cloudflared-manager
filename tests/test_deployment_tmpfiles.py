@@ -92,6 +92,23 @@ def test_tmpfiles_application_failure_is_reported(prepared, monkeypatch):
     with pytest.raises(HostOperationError, match="could not be created"):
         filesystem.install_runtime_tmpfiles(candidate)
     assert not paths.runtime_root.exists()
+    assert not paths.tmpfiles_path.exists()
+
+
+def test_tmpfiles_application_failure_restores_recognized_prior_mode(prepared, monkeypatch):
+    from cloudflared_manager.deployment import release as release_module
+
+    paths, filesystem, candidate = prepared
+    paths.tmpfiles_path.parent.mkdir(parents=True)
+    paths.tmpfiles_path.parent.chmod(0o755)
+    paths.tmpfiles_path.write_bytes(RULE)
+    paths.tmpfiles_path.chmod(0o600)
+    monkeypatch.setattr(release_module.subprocess, "run",
+                        lambda *args, **kwargs: SimpleNamespace(returncode=1))
+    with pytest.raises(HostOperationError, match="could not be created"):
+        filesystem.install_runtime_tmpfiles(candidate)
+    assert paths.tmpfiles_path.read_bytes() == RULE
+    assert paths.tmpfiles_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_release_rejects_altered_tmpfiles_rule(prepared):

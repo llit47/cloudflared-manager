@@ -354,20 +354,28 @@ class ReleaseFilesystem:
         self._ensure_system_directory(self.paths.runtime_root.parent)
         existed = self._require_safe_runtime_root(required=False)
         changed = not self._regular_asset_matches(target, _TMPFILES_RULE, 0o644)
-        if changed:
-            self.atomic_write(target, _TMPFILES_RULE, 0o644)
+        previous = self.snapshot(target) if changed else None
         try:
+            if changed:
+                self.atomic_write(target, _TMPFILES_RULE, 0o644)
             result = subprocess.run(
                 [str(self.paths.tmpfiles_executable), "--create", str(target)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, timeout=10, check=False, shell=False,
                 env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
             )
-        except (OSError, subprocess.TimeoutExpired):
-            raise HostOperationError("The runtime directory could not be created.") from None
-        if result.returncode != 0:
-            raise HostOperationError("The runtime directory could not be created.")
-        self._require_safe_runtime_root(required=True)
+            if result.returncode != 0:
+                raise HostOperationError("The runtime directory could not be created.")
+            self._require_safe_runtime_root(required=True)
+        except Exception as error:
+            if changed and previous is not None:
+                try:
+                    self.restore_snapshot(target, previous)
+                except Exception:
+                    raise RollbackError("The runtime rule could not be restored.") from error
+            if isinstance(error, (OSError, subprocess.TimeoutExpired)):
+                raise HostOperationError("The runtime directory could not be created.") from None
+            raise
         return changed or not existed
 
     def _require_safe_runtime_root(self, *, required: bool) -> bool:

@@ -56,17 +56,26 @@ class Updater:
         if source is None:
             raise HostOperationError("The candidate source is required for an update.")
 
-        DeploymentReconciler(
-            self.filesystem,
-            self.service,
-            self.health,
-        ).reconcile(self.paths.release(previous_sha), settings)
-        release = self.filesystem.prepare_release(source, revision, python)
-        self.filesystem.validate_deployment_assets(release)
-        self.filesystem.install_runtime_tmpfiles(release)
+        # Include a successful pre-update reconciliation in the tmpfiles rollback.
+        tmpfiles_snapshot = self.filesystem.snapshot(self.paths.tmpfiles_path)
+        try:
+            DeploymentReconciler(
+                self.filesystem,
+                self.service,
+                self.health,
+            ).reconcile(self.paths.release(previous_sha), settings)
+            release = self.filesystem.prepare_release(source, revision, python)
+            self.filesystem.validate_deployment_assets(release)
+        except Exception as error:
+            try:
+                self.filesystem.restore_snapshot(self.paths.tmpfiles_path, tmpfiles_snapshot)
+            except Exception:
+                raise RollbackError("The previous runtime rule could not be restored.") from error
+            raise
         previous_target = f"releases/{previous_sha}"
         unit_snapshot = self.filesystem.snapshot(self.paths.unit_path)
         try:
+            self.filesystem.install_runtime_tmpfiles(release)
             self.filesystem.install_unit(release)
             # The unit may already match on disk after an interrupted update while
             # systemd still has its prior definition loaded.
@@ -90,6 +99,10 @@ class Updater:
                     self.service, self.health, settings.bind_host, settings.bind_port,
                     settings.config_id, previous_sha,
                 )
+            except Exception as rollback_error:
+                rollback_errors.append(rollback_error)
+            try:
+                self.filesystem.restore_snapshot(self.paths.tmpfiles_path, tmpfiles_snapshot)
             except Exception as rollback_error:
                 rollback_errors.append(rollback_error)
             if rollback_errors:

@@ -8,6 +8,7 @@ import pytest
 
 from cloudflared_manager.deployment.bridge_install import BridgeInstaller
 from cloudflared_manager.deployment.errors import HostOperationError
+from cloudflared_manager.deployment.release import PathSnapshot
 from tests.deployment_support import make_paths
 
 
@@ -17,6 +18,16 @@ class Filesystem:
         self.paths = paths
     def validate_deployment_assets(self, release):
         pass
+    def snapshot(self, target):
+        return (PathSnapshot(kind="file", content=target.read_bytes(),
+                             mode=target.stat().st_mode & 0o777)
+                if target.exists() else PathSnapshot(kind="missing"))
+    def restore_snapshot(self, target, previous):
+        if previous.kind == "missing":
+            target.unlink(missing_ok=True)
+        else:
+            target.write_bytes(previous.content)
+            target.chmod(previous.mode)
     def install_runtime_tmpfiles(self, release):
         target = self.paths.tmpfiles_path
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -99,6 +110,26 @@ def test_bridge_install_rejects_unsafe_write_boundary_before_grant(setup):
     assert not paths.sudoers_path.exists()
 
 
+def test_failed_bridge_install_restores_prior_tmpfiles_rule(setup):
+    paths, release, visudo = setup
+    paths.tmpfiles_path.parent.mkdir(parents=True)
+    prior = (release / "deploy/cloudflared-manager.tmpfiles.conf").read_bytes()
+    paths.tmpfiles_path.write_bytes(prior)
+    paths.tmpfiles_path.chmod(0o600)
+
+    class FailedHelperWrite(Filesystem):
+        def atomic_write(self, target, content, mode):
+            if target == paths.helper_path:
+                raise HostOperationError("helper installation failed")
+            super().atomic_write(target, content, mode)
+
+    with pytest.raises(HostOperationError, match="helper installation failed"):
+        BridgeInstaller(paths, FailedHelperWrite(paths), visudo=visudo,
+                        boundary_check=lambda paths: None).install(release)
+    assert paths.tmpfiles_path.read_bytes() == prior
+    assert paths.tmpfiles_path.stat().st_mode & 0o777 == 0o600
+
+
 def test_sudoers_grants_exact_helper_with_no_arguments():
     policy = (Path(__file__).parents[1] / "deploy/cloudflared-manager-bridge.sudoers").read_text()
     assert 'NOPASSWD: /opt/cloudflared-manager/privileged-helper ""' in policy
@@ -129,6 +160,16 @@ def test_privileged_launcher_ignores_hostile_path_and_bash_startup(tmp_path):
         "readonly install_root='/opt/cloudflared-manager'",
         f"readonly install_root={shlex.quote(str(root))}", 1,
     )
+    runner = tmp_path / "systemd-run"
+    runner.write_text(
+        "#!/bin/bash\n"
+        "[[ \" $* \" == *' --system --pipe --wait --quiet --collect '* ]] || exit 91\n"
+        "[[ \" $* \" == *' --property=ProtectSystem=strict '* ]] || exit 92\n"
+        "[[ \" $* \" == *' --property=ReadWritePaths=/etc/cloudflared /etc/cloudflared-manager /run/cloudflared-manager '* ]] || exit 93\n"
+        "exec \"${@: -4}\"\n"
+    )
+    runner.chmod(0o755)
+    test_source = test_source.replace("/usr/bin/systemd-run", str(runner), 1)
     assert test_source != source and "${EUID}" not in test_source
     launcher = tmp_path / "privileged-helper"
     launcher.write_text(test_source)
@@ -150,3 +191,18 @@ def test_privileged_launcher_ignores_hostile_path_and_bash_startup(tmp_path):
     assert completed.returncode == 0
     assert completed.stdout == b"SAFE\n"
     assert not marker.exists()
+
+
+def test_recovery_uses_isolated_system_manager_mount_with_fixed_authority():
+    root = Path(__file__).parents[1]
+    web = (root / "deploy/cloudflared-manager.service").read_text()
+    helper = (root / "deploy/privileged-helper.sh").read_text()
+    assert "ProtectSystem=strict" in web
+    assert "ReadWritePaths=/etc/cloudflared-manager /run/cloudflared-manager" in web
+    assert not any("/etc/cloudflared" in line.split("=", 1)[1].split()
+                   for line in web.splitlines() if line.startswith("ReadWritePaths="))
+    assert "/usr/bin/systemd-run --system --pipe --wait --quiet --collect" in helper
+    assert "--property=ProtectSystem=strict" in helper
+    assert "--property=ReadWritePaths=/etc/cloudflared /etc/cloudflared-manager /run/cloudflared-manager" in helper
+    assert '"${manager_python}" -I -m cloudflared_manager.activation.bridge_helper' in helper
+    assert "CAP_SYS_ADMIN" not in web + helper

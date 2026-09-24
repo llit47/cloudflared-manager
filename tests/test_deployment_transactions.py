@@ -637,7 +637,28 @@ def test_failed_first_install_health_rolls_back_manager_owned_state(tmp_path: Pa
     assert not paths.current.exists()
     assert not paths.environment_file.exists()
     assert not paths.unit_path.exists()
+    assert not paths.tmpfiles_path.exists()
     assert service.calls == ["daemon-reload", "start", "daemon-reload", "stop"]
+
+
+def test_failed_first_install_restores_recognized_tmpfiles_bytes_and_mode(tmp_path: Path) -> None:
+    paths, filesystem = _filesystem(tmp_path)
+    paths.tmpfiles_path.parent.mkdir(parents=True)
+    paths.tmpfiles_path.parent.chmod(0o755)
+    prior = b"d /run/cloudflared-manager 0700 root root -\n"
+    paths.tmpfiles_path.write_bytes(prior)
+    paths.tmpfiles_path.chmod(0o600)
+    installer = Installer(
+        paths, filesystem, FakeService(),
+        lambda host, port: (_ for _ in ()).throw(HealthCheckError("failed")),
+        lambda: None, environment_owner=None,
+    )
+
+    with pytest.raises(TransactionFailedError, match="rolled back"):
+        installer.install(make_source(tmp_path / "candidate"), NEW_SHA,
+                          Path("/usr/bin/python3"), "192.168.1.30", 8000)
+    assert paths.tmpfiles_path.read_bytes() == prior
+    assert paths.tmpfiles_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_failed_first_install_start_attempt_restores_inactive_service_and_files(
@@ -974,10 +995,29 @@ def test_failed_candidate_health_restores_release_and_systemd_unit(tmp_path: Pat
 
     assert filesystem.read_current_sha() == OLD_SHA
     assert paths.unit_path.read_bytes() == b"old unit\n"
+    assert paths.tmpfiles_path.read_bytes() == b"d /run/cloudflared-manager 0700 root root -\n"
     assert service.calls == [
         "is-enabled", "daemon-reload", "restart", "daemon-reload", "restart",
     ]
     assert health_calls == 3
+
+
+def test_failed_update_restores_exact_prior_tmpfiles_mode(tmp_path: Path) -> None:
+    paths, filesystem = _installed(tmp_path)
+    paths.tmpfiles_path.chmod(0o600)
+
+    def health(host: str, port: int):
+        if filesystem.read_current_sha() == NEW_SHA:
+            raise HealthCheckError("candidate failed")
+        return fake_readiness(host, port)
+
+    with pytest.raises(TransactionFailedError, match="restored"):
+        Updater(paths, filesystem, FakeService(), health).update(
+            make_source(tmp_path / "new", unit=b"new unit\n"),
+            NEW_SHA, Path("/usr/bin/python3"),
+        )
+    assert paths.tmpfiles_path.read_bytes() == b"d /run/cloudflared-manager 0700 root root -\n"
+    assert paths.tmpfiles_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_failed_candidate_and_failed_rollback_health_are_distinct(tmp_path: Path) -> None:
