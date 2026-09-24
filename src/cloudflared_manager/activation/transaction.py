@@ -27,6 +27,7 @@ from cloudflared_manager.cloudflared.editing.preparation import (
     ConfigMutation, PreparationOutcome, prepare_validated_candidate,
 )
 from cloudflared_manager.cloudflared.editing.source import ConfigSourceSnapshot
+from cloudflared_manager.cloudflared.editing.errors import SourceConfigChangedError
 from cloudflared_manager.cloudflared.editing.validation import CandidateValidator
 from cloudflared_manager.deployment.environment import read_environment, require_safe_environment
 from cloudflared_manager.deployment.paths import DeploymentPaths
@@ -105,7 +106,8 @@ class FilesystemActivation:
             raise FilesystemRefused("UNSAFE_TEST_BOUNDARY")
 
     def run(self, mutation: ConfigMutation, *, validator: CandidateValidator,
-            expected_source_revision: str | None = None) -> FilesystemResult:
+            expected_source_revision: str | None = None,
+            allowed_adopted_parent: Path | None = None) -> FilesystemResult:
         if os.geteuid() != self.owner or self.baseline is None:
             raise ActivationError("PRIVILEGED_BOUNDARY_UNAVAILABLE")
         with DeploymentLock(self.paths.lock_path, owner=(self.owner, os.getegid())):
@@ -114,6 +116,8 @@ class FilesystemActivation:
                 journal.require_clean()
                 backups.require_empty()
                 release, adopted = self.authority.current()
+                if allowed_adopted_parent is not None and adopted.parent != allowed_adopted_parent:
+                    raise ActivationError("PRIVILEGED_BOUNDARY_UNAVAILABLE")
                 with PinnedDirectory(adopted.parent, anchor=self.anchor, owner=self.owner) as active:
                     _metadata_supported(active.fd)
                     _require_no_orphan_candidates(active)
@@ -123,6 +127,7 @@ class FilesystemActivation:
                     )
                     if prepared.outcome is PreparationOutcome.NO_CHANGE:
                         require_source(prepared.source, active)
+                        self._require_authority(release, adopted)
                         return FilesystemResult("NO_CHANGE")
                     if prepared.candidate is None:
                         raise ActivationError("VALIDATION_FAILED")
@@ -640,6 +645,8 @@ def _require_no_orphan_candidates(active: PinnedDirectory) -> None:
 
 
 def _failure_code(error: Exception) -> str:
+    if isinstance(error, SourceConfigChangedError):
+        return "STALE_SOURCE"
     if isinstance(error, ServiceRefused):
         return "SERVICE_BASELINE_UNAVAILABLE"
     if isinstance(error, FilesystemRefused):

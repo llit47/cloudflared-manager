@@ -8,6 +8,7 @@ from cloudflared_manager.cloudflared.editing import (
     StaleMutationError, read_config_source_snapshot,
 )
 from cloudflared_manager.cloudflared.editing.local_ingress import LocalRoute, RouteSelector
+from cloudflared_manager.cloudflared.editing.preparation import prepare_validated_candidate
 
 SOURCE = """# retained
 other: value
@@ -87,3 +88,26 @@ def test_identical_routes_are_disambiguated_by_position(tmp_path):
 def test_hostile_domain_values_rejected(route):
     with pytest.raises(MutationRejectedError):
         LocalRoute(*route)
+
+
+def test_supported_regex_path_and_no_disable_or_filesystem_service():
+    assert LocalRoute("one.example.com", "^/admin/.*", "http://127.0.0.1:8000").path == "^/admin/.*"
+    for service in ("http_status:404", "file:///etc/passwd", "unix:///run/service.sock"):
+        with pytest.raises(MutationRejectedError):
+            LocalRoute("one.example.com", None, service)
+
+
+def test_manual_source_edit_rejected_before_mutation_or_staging(tmp_path):
+    path = tmp_path / "config.yml"
+    path.write_text(SOURCE)
+    observed = read_config_source_snapshot(path)
+    path.write_text(SOURCE.replace("other: value", "other: manually-edited"))
+    def forbidden_mutation(document):
+        pytest.fail("stale request reached editor")
+    class Validator:
+        def validate(self, candidate):
+            pytest.fail("stale request reached validator")
+    with pytest.raises(StaleMutationError):
+        prepare_validated_candidate(path, forbidden_mutation, cloudflared_validator=Validator(),
+                                    expected_source_revision=observed.sha256)
+    assert list(tmp_path.glob(".cfm-candidate-*")) == []

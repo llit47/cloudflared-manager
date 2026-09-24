@@ -149,6 +149,8 @@ class EditableCloudflaredConfig:
             raise StaleMutationError("The selected ingress route is stale.")
         if sum(id(entry) == id(selected) for entry in ingress) != 1:
             raise UnsupportedConfigStructureError("Aliased ingress routes are unsupported.")
+        if _reference_count(self._document, selected, set()) != 1:
+            raise UnsupportedConfigStructureError("Aliased ingress routes are unsupported.")
         return ingress, selected
 
     def render_changed(self) -> bytes:
@@ -209,6 +211,19 @@ def _require_unique_matcher(ingress: CommentedSeq, route: LocalRoute, *, exclude
         hostname = rule["hostname"]
         if isinstance(hostname, str) and hostname.lower() == route.hostname and rule.get("path") == route.path:
             raise MutationRejectedError("A matching local ingress route already exists.")
+
+
+def _reference_count(value: Any, selected: CommentedMap, visited: set[int]) -> int:
+    if value is selected:
+        return 1
+    if not isinstance(value, (Mapping, CommentedSeq)):
+        return 0
+    identity = id(value)
+    if identity in visited:
+        return 0
+    visited.add(identity)
+    children = value.values() if isinstance(value, Mapping) else value
+    return sum(_reference_count(child, selected, visited) for child in children)
 
 
 def _validate_rule(
