@@ -101,7 +101,8 @@ def dispatch(request: MutationRequest, operation: Callable[[MutationRequest], ob
             return False, "RECOVERY_REQUIRED"
         if error.code == "PRIVILEGED_BOUNDARY_UNAVAILABLE":
             return False, "PRIVILEGED_BOUNDARY_UNAVAILABLE"
-        if error.code == "FAILED_PRECOMMIT" and error.original == "STALE_SOURCE":
+        if (error.code == "STALE_SOURCE"
+            or (error.code == "FAILED_PRECOMMIT" and error.original == "STALE_SOURCE")):
             return False, "STALE_CONFLICT"
         return False, "ACTIVATION_FAILED"
     except Exception:

@@ -104,6 +104,12 @@ def test_helper_sanitizes_activation_error():
     (CloudflaredValidationRejectedError("secret"), "VALIDATION_FAILED"),
     (UnsupportedConfigStructureError("secret"), "UNSUPPORTED_CONFIG"),
     (CandidateFileError("secret"), "RECOVERY_REQUIRED"),
+    (ActivationError("STALE_SOURCE"), "STALE_CONFLICT"),
+    (ActivationError("FAILED_PRECOMMIT", original="STALE_SOURCE"), "STALE_CONFLICT"),
+    (ActivationError("BASELINE_CHANGED"), "ACTIVATION_FAILED"),
+    (ActivationError("STALE_CANDIDATE"), "ACTIVATION_FAILED"),
+    (ActivationError("STALE_AUTHORITY"), "ACTIVATION_FAILED"),
+    (ActivationError("SERVICE_BASELINE_UNAVAILABLE"), "ACTIVATION_FAILED"),
     (ActivationError("FAILED_ROLLED_BACK", original="secret"), "ACTIVATION_FAILED_ROLLED_BACK"),
     (ActivationError("RECOVERY_REQUIRED", original="secret"), "RECOVERY_REQUIRED"),
 ])
@@ -216,3 +222,60 @@ def test_privileged_mutation_uses_transaction_and_rejects_duplicate_request(tmp_
         req, engine=engine, allowed_adopted_parent=root,
     ))[0] is False
     assert source.read_bytes() == latest
+
+
+def test_operator_edit_after_validation_maps_stale_without_activation(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    from cloudflared_manager.activation import mutation_helper, transaction
+    from cloudflared_manager.activation.transaction import FilesystemActivation
+    from cloudflared_manager.cloudflared.editing.preparation import PreparationOutcome
+    from tests.deployment_support import make_paths
+    from tests.test_activation_filesystem import Authority, FakeService, Validator
+
+    root = tmp_path / "cloudflared"
+    root.mkdir(mode=0o700)
+    source = root / "config.yml"
+    original = (b"ingress:\n  - hostname: app.example.com\n"
+                b"    service: http://127.0.0.1:8000\n"
+                b"  - service: http_status:404\n")
+    source.write_bytes(original)
+    operator_contents = original.replace(b"8000", b"8001")
+    paths = make_paths(tmp_path)
+    paths.config_root.mkdir(parents=True)
+    (tmp_path / "etc").chmod(0o700)
+    paths.config_root.chmod(0o700)
+
+    class NoRestart(FakeService):
+        def restart(self):
+            pytest.fail("stale source must not restart the service")
+
+    baseline = FakeService()
+    baseline.observe_with_executable = lambda **kwargs: (
+        baseline.observe(**kwargs), Path("/opt/cloudflare/bin/cloudflared"),
+    )
+    engine = FilesystemActivation(paths, authority=Authority(source), baseline=baseline,
+                                  service=NoRestart(), owner=os.getuid(), anchor=tmp_path)
+    monkeypatch.setattr(transaction, "verified_executable",
+                        lambda path: nullcontext((123, (1, 2))))
+    monkeypatch.setattr(transaction, "CloudflaredCandidateValidator", lambda **kwargs: Validator())
+    monkeypatch.setattr(transaction, "exchange",
+                        lambda *_args: pytest.fail("stale source must not be exchanged"))
+    original_prepare = transaction.prepare_validated_candidate
+    def prepare_then_operator_edit(*args, **kwargs):
+        prepared = original_prepare(*args, **kwargs)
+        assert prepared.outcome is PreparationOutcome.VALIDATED_CANDIDATE
+        replacement = root / "operator.new"
+        replacement.write_bytes(operator_contents)
+        os.replace(replacement, source)
+        return prepared
+    monkeypatch.setattr(transaction, "prepare_validated_candidate", prepare_then_operator_edit)
+
+    request = MutationRequest("local_ingress_add", hashlib.sha256(original).hexdigest(),
+                              LocalRoute("new.example.com", None, "http://127.0.0.1:9000"))
+    assert mutation_helper.dispatch(request, lambda req: mutation_helper.execute(
+        req, engine=engine, allowed_adopted_parent=root,
+    )) == (False, "STALE_CONFLICT")
+    assert source.read_bytes() == operator_contents
+    assert list((paths.config_root / "activation-journal").iterdir()) == []
+    assert list((paths.config_root / "activation-backups").iterdir()) == []
+    assert list(root.glob(".cfm-candidate-*")) == []
