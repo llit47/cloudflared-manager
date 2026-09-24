@@ -4,6 +4,7 @@ import io
 import json
 import hashlib
 import os
+from typing import get_args
 from types import SimpleNamespace
 
 import pytest
@@ -13,7 +14,7 @@ from cloudflared_manager.activation.mutation_client import (
 )
 from cloudflared_manager.activation.mutation_helper import dispatch, serve
 from cloudflared_manager.activation.mutation_protocol import (
-    MutationProtocolRefused, MutationRequest, encode_request, parse_request,
+    Action, MutationProtocolRefused, MutationRequest, encode_request, parse_request,
     parse_response,
 )
 from cloudflared_manager.activation.transaction import ActivationError
@@ -50,6 +51,17 @@ def test_round_trip_all_allowlisted_operations():
         MutationRequest("local_ingress_delete", REV, target=RouteSelector(2, FP)),
     ):
         assert parse_request(encode_request(request)) == request
+
+
+def test_protocol_v1_grant_is_exactly_three_local_ingress_actions():
+    assert set(get_args(Action)) == {
+        "local_ingress_add", "local_ingress_edit", "local_ingress_delete",
+    }
+    for action in ("local_ingress_enable", "local_ingress_disable", "dns_create",
+                   "generic_yaml_set", "execute_command"):
+        raw = json.dumps({"version": 1, "action": action, "source_revision": REV}).encode()
+        with pytest.raises(MutationProtocolRefused):
+            parse_request(raw)
 
 
 def test_helper_refuses_nonroot_and_does_not_dispatch_invalid_request():

@@ -126,3 +126,152 @@ unrelated: *shared
     with pytest.raises(UnsupportedConfigStructureError):
         document.edit_local_hostname_ingress(
             selected, LocalRoute("new.example.com", None, "http://127.0.0.1:9000"))
+
+
+MERGED_ROUTE = """ingress:
+  - &base
+    hostname: one.example.com
+    service: http://127.0.0.1:8000
+  - <<: *base
+    hostname: two.example.com
+  - service: http_status:404
+"""
+
+
+@pytest.mark.parametrize("source,operation", [
+    (MERGED_ROUTE, "add"),
+    (MERGED_ROUTE, "edit"),
+    (MERGED_ROUTE, "delete"),
+    ("""ingress: &routes
+  - hostname: one.example.com
+    service: http://127.0.0.1:8000
+  - service: http_status:404
+copy: *routes
+""", "edit"),
+    ("""ingress:
+  - &first
+    hostname: one.example.com
+    service: http://127.0.0.1:8000
+  - *first
+  - service: http_status:404
+""", "delete"),
+    ("""ingress:
+  - hostname: one.example.com
+    service: http://127.0.0.1:8000
+    originRequest: &options
+      connectTimeout: 30s
+  - hostname: two.example.com
+    service: http://127.0.0.1:8001
+    originRequest: *options
+  - service: http_status:404
+""", "delete"),
+    ("""base: &base
+  service: http://127.0.0.1:8000
+ingress:
+  - <<: *base
+    hostname: one.example.com
+  - service: http_status:404
+""", "edit"),
+])
+def test_local_operations_reject_anchors_aliases_and_merges(tmp_path, source, operation):
+    document = editor(tmp_path, source)
+    route = LocalRoute("new.example.com", None, "http://127.0.0.1:9000")
+    selector = document.local_route_selector(0) if operation != "add" else None
+    with pytest.raises(UnsupportedConfigStructureError):
+        if operation == "add":
+            document.add_local_hostname_ingress(route)
+        elif operation == "edit":
+            document.edit_local_hostname_ingress(selector, route)
+        else:
+            document.delete_local_hostname_ingress(selector)
+    assert not document.changed
+
+
+def test_merge_dependency_rejected_before_candidate_staging_or_activation(tmp_path):
+    path = tmp_path / "config.yml"
+    path.write_text(MERGED_ROUTE)
+    observed = read_config_source_snapshot(path)
+    class ForbiddenStager:
+        def stage(self, snapshot, contents):
+            pytest.fail("merge dependency reached candidate staging")
+    class ForbiddenValidator:
+        def validate(self, candidate):
+            pytest.fail("merge dependency reached cloudflared validation")
+    def edit(document):
+        return document.edit_local_hostname_ingress(
+            document.local_route_selector(0),
+            LocalRoute("one.example.com", None, "http://127.0.0.1:9000"),
+        )
+    with pytest.raises(UnsupportedConfigStructureError):
+        prepare_validated_candidate(path, edit, stager=ForbiddenStager(),
+                                    cloudflared_validator=ForbiddenValidator(),
+                                    expected_source_revision=observed.sha256)
+    assert path.read_bytes() == observed.original_bytes
+    assert list(tmp_path.glob(".cfm-candidate-*")) == []
+
+
+@pytest.mark.parametrize("source,removed,following_comment", [
+    ("""ingress:
+  - hostname: one.example.com
+    service: http://1
+  # route two
+  - hostname: two.example.com
+    service: http://2
+  - service: http_status:404
+""", 0, "# route two"),
+    ("""ingress:
+  - hostname: zero.example.com
+    service: http://0
+  - hostname: one.example.com
+    service: http://1 # deleted route
+  # route two
+  - hostname: two.example.com
+    service: http://2
+  - service: http_status:404
+""", 1, "# route two"),
+    ("""ingress:
+  - hostname: one.example.com
+    service: http://1
+  # fallback
+  - service: http_status:404
+""", 0, "# fallback"),
+    ("""ingress:
+  - hostname: one.example.com
+    service: http://1
+    originRequest:
+      connectTimeout: 30s
+  # fallback
+  - service: http_status:404
+""", 0, "# fallback"),
+    ("""ingress:
+  - hostname: one.example.com
+    service: http://1
+    originRequest:
+      headers:
+        - foo
+  # fallback
+  - service: http_status:404
+""", 0, "# fallback"),
+    ("""ingress:
+  - hostname: one.example.com
+    service: http://1
+    note: |
+      some text
+  # fallback
+  - service: http_status:404
+""", 0, "# fallback"),
+])
+def test_delete_preserves_comment_before_unchanged_following_route(
+    tmp_path, source, removed, following_comment,
+):
+    document = editor(tmp_path, source)
+    document.delete_local_hostname_ingress(document.local_route_selector(removed))
+    rendered = document.render_changed().decode()
+    assert rendered.count(following_comment) == 1
+    assert rendered.index(following_comment) < rendered.index(
+        "two.example.com" if following_comment == "# route two" else "http_status:404"
+    )
+    if "# deleted route" in source:
+        assert "# deleted route" not in rendered
+    parsed = yaml.safe_load(rendered)
+    assert parsed["ingress"][-1] == {"service": "http_status:404"}

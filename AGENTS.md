@@ -186,6 +186,14 @@ changes, configuration validation, and service restarts.
   identities, strict bounded inputs, fixed argv, bounded timeouts,
   `shell=False`, minimal environment, and sanitized errors. Never create a
   generic root command, file-copy, YAML-path, or systemctl proxy.
+- The separately installed PR16 mutation bridge grant is permanently limited
+  to local ingress Add/Edit/Delete. Ordinary releases may fix the security or
+  implementation of those three operations, but MUST NOT add Enable/Disable,
+  DNS/API work, generic config or YAML/path/file mutation, command execution,
+  or any other new privileged capability to that existing helper/protocol or
+  sudoers grant. A materially broader capability requires a separate review
+  and a distinct explicit administrator grant/re-consent. Protocol version 1
+  remains limited to exactly the three local ingress actions.
 - Do not combine local config activation with DNS/API ownership or expose a web
   mutation surface until each boundary has its own reviewed design and tests.
 

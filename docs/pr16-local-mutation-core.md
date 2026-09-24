@@ -55,6 +55,15 @@ tmpfiles runtime state, and installs the helper and policy with reverse-order
 rollback on failure. Incomplete rollback is reported separately. It is
 idempotent.
 
+This PR16 grant is permanently scoped to the three local ingress actions.
+Ordinary releases may repair those actions, but protocol v1 and the existing
+helper/sudoers grant must never gain Enable/Disable, DNS/API, generic YAML or
+file editing, arbitrary paths, command execution, or another privileged
+operation. Broader authority requires a separately reviewed capability and a
+distinct explicit administrator grant/re-consent. Local Add/Edit/Delete reject
+YAML anchors, aliases, and merge keys anywhere in the document because a
+mutation could otherwise affect another location through ruamel references.
+
 An ordinary install, update, or reconciliation does not call this installer
 or write the mutation sudoers rule. During an upgrade from PR15, the old
 active updater runs until the release switch; that updater has no mutation

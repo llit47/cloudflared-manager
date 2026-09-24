@@ -3,6 +3,7 @@
 from pathlib import Path
 import subprocess
 import os
+import shlex
 
 import pytest
 
@@ -175,6 +176,54 @@ def test_launcher_is_fixed_root_only_and_web_unit_remains_read_only():
         result = subprocess.run(["/bin/bash", "-p", str(ROOT / "deploy/privileged-mutation-helper.sh")],
                                 capture_output=True, timeout=5, check=False, shell=False)
         assert result.returncode == 1
+
+
+def test_mutation_launcher_ignores_hostile_path_and_bash_startup(tmp_path):
+    """Exercise the real launcher below its root guard on disposable paths."""
+    source = (ROOT / "deploy/privileged-mutation-helper.sh").read_text()
+    root = tmp_path / "install"
+    release = root / "releases" / ("a" * 40)
+    python = release / ".venv/bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_text("#!/bin/sh\nprintf 'SAFE\\n'\n")
+    python.chmod(0o755)
+    (root / "current").symlink_to(f"releases/{release.name}")
+
+    test_source = source.replace("[[ ${EUID} -ne 0 || $# -ne 0 ]]", "[[ $# -ne 0 ]]", 1)
+    test_source = test_source.replace(
+        "readonly install_root='/opt/cloudflared-manager'",
+        f"readonly install_root={shlex.quote(str(root))}", 1,
+    )
+    runner = tmp_path / "systemd-run"
+    runner.write_text(
+        "#!/bin/bash\n"
+        "[[ \" $* \" == *' --system --pipe --wait --quiet --collect '* ]] || exit 91\n"
+        "[[ \" $* \" == *' --property=ProtectSystem=strict '* ]] || exit 92\n"
+        "[[ \" $* \" == *' --property=RuntimeMaxSec=300s '* ]] || exit 93\n"
+        "exec \"${@: -4}\"\n"
+    )
+    runner.chmod(0o755)
+    test_source = test_source.replace("/usr/bin/systemd-run", str(runner), 1)
+    launcher = tmp_path / "mutation-helper"
+    launcher.write_text(test_source)
+    launcher.chmod(0o755)
+
+    marker = tmp_path / "injected"
+    startup = tmp_path / "startup.sh"
+    startup.write_text('printf "startup" > "$ATTACK_MARKER"\n')
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_readlink = fake_bin / "readlink"
+    fake_readlink.write_text('#!/bin/sh\nprintf "path" > "$ATTACK_MARKER"\nexit 98\n')
+    fake_readlink.chmod(0o755)
+    completed = subprocess.run(
+        [str(launcher)],
+        env={"PATH": str(fake_bin), "BASH_ENV": str(startup), "ATTACK_MARKER": str(marker)},
+        capture_output=True, timeout=5, check=False, shell=False,
+    )
+    assert completed.returncode == 0
+    assert completed.stdout == b"SAFE\n"
+    assert not marker.exists()
 
 
 def test_current_release_change_before_grant_rolls_back(setup):

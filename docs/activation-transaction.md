@@ -1767,4 +1767,10 @@ and calls the existing activation transaction. The PR15 recovery helper and
 sudoers grant remain recovery-only. Ordinary upgrade/reconciliation does not
 install the mutation sudoers grant. The browser remains read-only; DNS/API,
 Enable/Disable, and product-level route ownership remain future review gates.
+The existing PR16 grant is permanently confined to exactly those three local
+ingress actions. Security or implementation fixes to them may ship through
+ordinary releases; any materially broader privileged capability requires a
+separately reviewed bridge and explicit administrator grant/re-consent. Do not
+add Enable/Disable, DNS/API, generic config/YAML/path/file mutation, commands,
+or other new operations to the PR16 helper, protocol v1, or sudoers grant.
 See [PR16 local mutation core](pr16-local-mutation-core.md).
