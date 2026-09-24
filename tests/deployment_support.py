@@ -45,6 +45,7 @@ def make_paths(root: Path) -> DeploymentPaths:
         config_link=root / "usr" / "local" / "sbin" / "cfm-config",
         runtime_root=runtime_root,
         sudoers_path=root / "etc" / "sudoers.d" / "cloudflared-manager-bridge",
+        mutation_sudoers_path=root / "etc" / "sudoers.d" / "cloudflared-manager-mutation-bridge",
         tmpfiles_path=root / "etc" / "tmpfiles.d" / "cloudflared-manager.conf",
         tmpfiles_executable=tmpfiles_executable,
     )

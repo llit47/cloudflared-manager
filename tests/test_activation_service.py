@@ -70,6 +70,31 @@ def test_baseline_and_new_process(service):
     service.verify(baseline, witness, activation=True)
 
 
+def test_verified_executable_path_comes_from_stable_loaded_service(service):
+    executable = '/opt/cloudflare/bin/cloudflared'
+    service._io.raw = output(ExecStart=EXEC.replace('/usr/bin/cloudflared', executable))
+    facts, path = service.observe_with_executable(
+        adopted_fingerprint=hashlib.sha256(b'/private/config.yml').hexdigest(),
+        source_digest='a' * 64,
+    )
+    assert path == Path(executable)
+    assert (facts.executable_device, facts.executable_inode) == (1, 2)
+
+
+def test_loaded_executable_change_during_stable_observation_fails(service):
+    original_show = service._io.show
+    calls = [0]
+    def changed_show():
+        calls[0] += 1
+        if calls[0] > 2:
+            return output(ExecStart=EXEC.replace('/usr/bin/cloudflared',
+                                                '/opt/cloudflare/bin/cloudflared'))
+        return original_show()
+    service._io.show = changed_show
+    with pytest.raises(ServiceRefused):
+        observe(service)
+
+
 def test_queued_job_is_parsed_but_not_settled(service):
     service._io.raw = output(Job='123')
     assert not parse_show(service._io.raw).settled

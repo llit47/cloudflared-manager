@@ -41,8 +41,9 @@ This design covers:
 
 PR12's filesystem transaction and PR14's fixed service-control and verification
 layer exist as an internal foundation. PR15 exposes only recovery through one
-fixed helper and exact sudoers rule. It does not expose HTTP mutation routes,
-enabled Add/Edit/Delete operations,
+fixed helper and exact sudoers rule. PR16 separately exposes three internal
+local ingress mutations after an explicit root installation command. There
+are no HTTP mutation routes, product-level Add/Edit/Delete operations,
 Cloudflare API access, DNS mutation, systemd unit editing, or a supported
 user-facing activation command.
 
@@ -1755,3 +1756,21 @@ No implementation PR may silently resolve a remaining gate by weakening these
 invariants. Its description must list the decisions made, evidence/tests
 supporting them, deployment implications, and unsupported host/service state
 that fails closed.
+
+## PR16 local ingress bridge scope
+
+PR16 adds a separate explicitly installed mutation bridge for local hostname
+ingress Add/Edit/Delete only. Its protocol carries a source-byte revision and
+selected route fingerprint, never raw YAML or privileged paths. The privileged
+side verifies these against its own bounded snapshot, prepares the candidate,
+and calls the existing activation transaction. The PR15 recovery helper and
+sudoers grant remain recovery-only. Ordinary upgrade/reconciliation does not
+install the mutation sudoers grant. The browser remains read-only; DNS/API,
+Enable/Disable, and product-level route ownership remain future review gates.
+The existing PR16 grant is permanently confined to exactly those three local
+ingress actions. Security or implementation fixes to them may ship through
+ordinary releases; any materially broader privileged capability requires a
+separately reviewed bridge and explicit administrator grant/re-consent. Do not
+add Enable/Disable, DNS/API, generic config/YAML/path/file mutation, commands,
+or other new operations to the PR16 helper, protocol v1, or sudoers grant.
+See [PR16 local mutation core](pr16-local-mutation-core.md).

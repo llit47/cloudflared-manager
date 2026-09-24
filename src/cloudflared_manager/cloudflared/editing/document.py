@@ -18,6 +18,10 @@ from cloudflared_manager.cloudflared.editing.errors import (
     UnsupportedConfigStructureError,
 )
 from cloudflared_manager.cloudflared.editing.source import ConfigSourceSnapshot
+from cloudflared_manager.cloudflared.editing.local_ingress import (
+    MAX_ROUTE_POSITION, LocalRoute, RouteSelector, route_fingerprint,
+)
+from cloudflared_manager.cloudflared.editing.errors import StaleMutationError
 from cloudflared_manager.cloudflared.limits import MAX_CLOUDFLARED_CONFIG_BYTES
 
 _MAX_YAML_DEPTH = 100
@@ -92,6 +96,75 @@ class EditableCloudflaredConfig:
         self._changed = True
         return MutationOutcome.CHANGED
 
+    def local_route_selector(self, position: int) -> RouteSelector:
+        """Build a selector for a hostname rule in this exact source revision."""
+        ingress = _require_safe_ingress(self._document)
+        if type(position) is not int or position < 0 or position >= len(ingress) - 1:
+            raise MutationRejectedError("The selected ingress route is unsupported.")
+        rule = ingress[position]
+        if "hostname" not in rule:
+            raise MutationRejectedError("The selected ingress route is unsupported.")
+        return RouteSelector(position, route_fingerprint(rule))
+
+    def add_local_hostname_ingress(self, route: LocalRoute) -> MutationOutcome:
+        _require_alias_free_local_document(self._document, set())
+        ingress = _require_safe_ingress(self._document)
+        if len(ingress) - 1 > MAX_ROUTE_POSITION:
+            raise MutationRejectedError("The new local ingress position is unsupported.")
+        _require_unique_matcher(ingress, route, excluded=None)
+        rule = CommentedMap({"hostname": route.hostname})
+        if route.path is not None:
+            rule["path"] = route.path
+        rule["service"] = route.service
+        _keep_terminal_leading_comment_with_fallback(ingress, rule)
+        ingress.insert(len(ingress) - 1, rule)
+        _require_safe_ingress(self._document)
+        self._changed = True
+        return MutationOutcome.CHANGED
+
+    def edit_local_hostname_ingress(self, selector: RouteSelector, route: LocalRoute) -> MutationOutcome:
+        _require_alias_free_local_document(self._document, set())
+        ingress, selected = self._selected_local_route(selector)
+        _require_unique_matcher(ingress, route, excluded=selector.position)
+        if (selected["hostname"] == route.hostname and selected.get("path") == route.path
+            and selected["service"] == route.service):
+            return MutationOutcome.NO_CHANGE
+        selected["hostname"] = route.hostname
+        if route.path is None:
+            selected.pop("path", None)
+        else:
+            selected["path"] = route.path
+        selected["service"] = route.service
+        _require_safe_ingress(self._document)
+        self._changed = True
+        return MutationOutcome.CHANGED
+
+    def delete_local_hostname_ingress(self, selector: RouteSelector) -> MutationOutcome:
+        _require_alias_free_local_document(self._document, set())
+        ingress, selected = self._selected_local_route(selector)
+        following_comment = _following_route_comment(selected)
+        del ingress[selector.position]
+        if following_comment is not None:
+            ingress.yaml_set_comment_before_after_key(
+                selector.position, before=following_comment, indent=2,
+            )
+        _require_safe_ingress(self._document)
+        self._changed = True
+        return MutationOutcome.CHANGED
+
+    def _selected_local_route(self, selector: RouteSelector) -> tuple[CommentedSeq, CommentedMap]:
+        ingress = _require_safe_ingress(self._document)
+        if selector.position >= len(ingress) - 1:
+            raise StaleMutationError("The selected ingress route is stale.")
+        selected = ingress[selector.position]
+        if "hostname" not in selected or route_fingerprint(selected) != selector.fingerprint:
+            raise StaleMutationError("The selected ingress route is stale.")
+        if sum(id(entry) == id(selected) for entry in ingress) != 1:
+            raise UnsupportedConfigStructureError("Aliased ingress routes are unsupported.")
+        if _reference_count(self._document, selected, set()) != 1:
+            raise UnsupportedConfigStructureError("Aliased ingress routes are unsupported.")
+        return ingress, selected
+
     def render_changed(self) -> bytes:
         """Serialize only a document that a controlled primitive actually changed."""
 
@@ -141,6 +214,146 @@ def _require_safe_ingress(document: CommentedMap) -> CommentedSeq:
             inserted=False,
         )
     return ingress
+
+
+def _require_unique_matcher(ingress: CommentedSeq, route: LocalRoute, *, excluded: int | None) -> None:
+    for index, rule in enumerate(ingress[:-1]):
+        if index == excluded or "hostname" not in rule:
+            continue
+        hostname = rule["hostname"]
+        if isinstance(hostname, str) and hostname.lower() == route.hostname and rule.get("path") == route.path:
+            raise MutationRejectedError("A matching local ingress route already exists.")
+
+
+def _reference_count(value: Any, selected: CommentedMap, visited: set[int]) -> int:
+    if value is selected:
+        return 1
+    if not isinstance(value, (Mapping, CommentedSeq)):
+        return 0
+    identity = id(value)
+    if identity in visited:
+        return 0
+    visited.add(identity)
+    children = value.values() if isinstance(value, Mapping) else value
+    return sum(_reference_count(child, selected, visited) for child in children)
+
+
+def _require_alias_free_local_document(value: Any, visited: set[int]) -> None:
+    """Fail closed: ruamel merge metadata is not an ordinary mapping child.
+
+    An anchor anywhere can be consumed by an alias or merge at another YAML
+    location, including outside ingress. Local mutations therefore accept only
+    documents whose entire round-trip graph has no anchors, merges, or shared
+    container identities. The older candidate-only insertion API is separate.
+    """
+
+    anchor = getattr(value, "anchor", None)
+    if anchor is not None and getattr(anchor, "value", None) is not None:
+        raise UnsupportedConfigStructureError(
+            "Local ingress mutation does not support YAML anchors or aliases."
+        )
+    if isinstance(value, CommentedMap) and value.merge:
+        raise UnsupportedConfigStructureError(
+            "Local ingress mutation does not support YAML merge keys."
+        )
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in visited:
+            raise UnsupportedConfigStructureError(
+                "Local ingress mutation does not support shared YAML mappings."
+            )
+        visited.add(identity)
+        for key, child in value.items():
+            _require_alias_free_local_document(key, visited)
+            _require_alias_free_local_document(child, visited)
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        identity = id(value)
+        if identity in visited:
+            raise UnsupportedConfigStructureError(
+                "Local ingress mutation does not support shared YAML sequences."
+            )
+        visited.add(identity)
+        for child in value:
+            _require_alias_free_local_document(child, visited)
+
+
+def _following_route_comment(selected: CommentedMap) -> str | None:
+    """Extract standalone lines before the next rule from ruamel's trailing slot."""
+
+    found = _last_value_comment(selected)
+    if found is None:
+        return None
+    token, value_line = found
+    raw = getattr(token, "value", None)
+    if not isinstance(raw, str):
+        raise UnsupportedConfigStructureError(
+            "The following ingress comment cannot be preserved safely."
+        )
+    if not raw.startswith(("\n", "#")):
+        raise UnsupportedConfigStructureError(
+            "The following ingress comment cannot be preserved safely."
+        )
+    # A block scalar can put the next rule's standalone comment in a token
+    # beginning with '#', without the leading newline used for plain scalars.
+    # Its source line distinguishes that from an inline comment on the value.
+    if raw.startswith("#"):
+        mark = getattr(token, "start_mark", None)
+        comment_line = getattr(mark, "line", None)
+        if type(value_line) is not int or type(comment_line) is not int:
+            raise UnsupportedConfigStructureError(
+                "The following ingress comment cannot be preserved safely."
+            )
+        lines = raw.splitlines() if comment_line > value_line else raw.splitlines()[1:]
+    else:
+        lines = raw.splitlines()[1:]
+    if not lines:
+        return None
+    normalized: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            normalized.append("")
+        elif stripped.startswith("#"):
+            normalized.append(stripped[1:].lstrip(" "))
+        else:
+            raise UnsupportedConfigStructureError(
+                "The following ingress comment cannot be preserved safely."
+            )
+    return "\n".join(normalized)
+
+
+def _last_value_comment(value: Any) -> tuple[Any, int | None] | None:
+    """Follow the final YAML value where ruamel stores the next rule's comment."""
+
+    if isinstance(value, CommentedMap) and value:
+        key = next(reversed(value))
+        child = _last_value_comment(value[key])
+        if child is not None:
+            return child
+        slots = value.ca.items.get(key)
+        if not slots or len(slots) <= 2 or slots[2] is None:
+            return None
+        location = value.lc.value(key)
+        return slots[2], location[0] if location else None
+    elif isinstance(value, CommentedSeq) and value:
+        index = len(value) - 1
+        child = _last_value_comment(value[index])
+        if child is not None:
+            return child
+        slots = value.ca.items.get(index)
+        if not slots:
+            return None
+        tokens = [slots[slot] for slot in (0, 2) if len(slots) > slot and slots[slot] is not None]
+        if len(tokens) > 1:
+            raise UnsupportedConfigStructureError(
+                "The following ingress comment cannot be preserved safely."
+            )
+        if not tokens:
+            return None
+        location = value.lc.item(index)
+        return tokens[0], location[0] if location else None
+    else:
+        return None
 
 
 def _validate_rule(

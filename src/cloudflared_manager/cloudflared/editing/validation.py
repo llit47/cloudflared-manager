@@ -45,6 +45,7 @@ class ValidationCommandRunner(Protocol):
         *,
         timeout_seconds: float,
         pass_fds: tuple[int, ...],
+        executable_fd: int | None = None,
     ) -> ValidationCommandResult:
         """Execute a command without a shell and return sanitized process state."""
 
@@ -59,16 +60,29 @@ class SubprocessValidationCommandRunner:
         *,
         timeout_seconds: float,
         pass_fds: tuple[int, ...],
+        executable_fd: int | None = None,
     ) -> ValidationCommandResult:
         _require_single_directory_fd(pass_fds)
+        if executable_fd is not None:
+            try:
+                info = os.fstat(executable_fd)
+            except OSError as error:
+                raise CloudflaredValidationExecutionError(
+                    "The verified cloudflared executable is unavailable."
+                ) from error
+            if not stat.S_ISREG(info.st_mode) or executable_fd == pass_fds[0]:
+                raise CloudflaredValidationExecutionError(
+                    "The verified cloudflared executable is unsafe."
+                )
         try:
             completed = subprocess.run(
                 list(argv),
+                executable=f"/proc/self/fd/{executable_fd}" if executable_fd is not None else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
                 close_fds=True,
-                pass_fds=pass_fds,
+                pass_fds=pass_fds + ((executable_fd,) if executable_fd is not None else ()),
                 shell=False,
                 timeout=timeout_seconds,
             )
@@ -107,6 +121,8 @@ class CloudflaredCandidateValidator:
         *,
         runner: ValidationCommandRunner | None = None,
         executable_finder: Callable[[str], str | None] = shutil.which,
+        executable: Path | None = None,
+        executable_fd: int | None = None,
         timeout_seconds: float = DEFAULT_VALIDATION_TIMEOUT_SECONDS,
     ) -> None:
         if (
@@ -116,11 +132,17 @@ class CloudflaredCandidateValidator:
             raise ValueError("cloudflared validation timeout is outside safe bounds")
         self._runner = runner or SubprocessValidationCommandRunner()
         self._executable_finder = executable_finder
+        if (executable is None) != (executable_fd is None):
+            raise ValueError("A verified executable path and descriptor are required together")
+        if executable is not None and (not executable.is_absolute() or executable.name != "cloudflared"):
+            raise ValueError("Invalid verified cloudflared executable")
+        self._executable = executable
+        self._executable_fd = executable_fd
         self._timeout_seconds = timeout_seconds
 
     def validate(self, candidate: CandidateFile) -> CloudflaredValidationReport:
         candidate.require_intact()
-        found = self._executable_finder("cloudflared")
+        found = str(self._executable) if self._executable is not None else self._executable_finder("cloudflared")
         if found is None:
             raise CloudflaredValidatorUnavailableError(
                 "The cloudflared executable is unavailable for candidate validation."
@@ -140,11 +162,10 @@ class CloudflaredCandidateValidator:
             "ingress",
             "validate",
         )
-        result = self._runner.run(
-            argv,
-            timeout_seconds=self._timeout_seconds,
-            pass_fds=binding.pass_fds,
-        )
+        kwargs = {"timeout_seconds": self._timeout_seconds, "pass_fds": binding.pass_fds}
+        if self._executable_fd is not None:
+            kwargs["executable_fd"] = self._executable_fd
+        result = self._runner.run(argv, **kwargs)
         candidate.require_intact()
         if result.returncode != 0:
             raise CloudflaredValidationRejectedError(

@@ -93,6 +93,51 @@ def test_validator_uses_exact_argv_and_bounded_timeout(staged_candidate) -> None
     assert os.get_inheritable(binding.pass_fds[0]) is False
 
 
+def test_service_bound_validator_uses_pinned_executable_not_path_lookup(
+    staged_candidate, tmp_path, monkeypatch,
+) -> None:
+    observed = {}
+    executable_file = tmp_path / "cloudflared"
+    executable_file.write_bytes(b"binary placeholder")
+    executable_fd = os.open(executable_file, os.O_RDONLY | os.O_CLOEXEC)
+    service_path = Path("/opt/cloudflare/bin/cloudflared")
+    def forbidden_lookup(_name):
+        pytest.fail("service-bound validation must not search PATH")
+    def fake_run(argv, **kwargs):
+        observed.update(argv=argv, **kwargs)
+        return subprocess.CompletedProcess(argv, 0, b"ok", b"")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    try:
+        validator = CloudflaredCandidateValidator(
+            executable=service_path, executable_fd=executable_fd,
+            executable_finder=forbidden_lookup,
+        )
+        assert validator.validate(staged_candidate).accepted
+        assert observed["argv"][0] == str(service_path)
+        assert observed["executable"] == f"/proc/self/fd/{executable_fd}"
+        assert executable_fd in observed["pass_fds"]
+        assert observed["shell"] is False
+        assert observed["argv"][3] == str(staged_candidate.validation_binding().path)
+    finally:
+        os.close(executable_fd)
+
+
+def test_runner_executes_pinned_binary_when_visible_path_is_different(tmp_path) -> None:
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    executable_fd = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        result = SubprocessValidationCommandRunner().run(
+            [str(tmp_path / "cloudflared"), "-c", "import sys; sys.exit(0)"],
+            timeout_seconds=3,
+            pass_fds=(directory_fd,),
+            executable_fd=executable_fd,
+        )
+        assert result.returncode == 0
+    finally:
+        os.close(executable_fd)
+        os.close(directory_fd)
+
+
 def test_nonzero_result_is_safe_hard_failure(staged_candidate) -> None:
     validator = CloudflaredCandidateValidator(
         runner=RecordingRunner(returncode=1),
