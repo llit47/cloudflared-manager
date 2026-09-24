@@ -20,6 +20,7 @@ from cloudflared_manager.activation.filesystem import (
 )
 from cloudflared_manager.activation.journal import BaselineFacts, JournalRecord, JournalStore
 from cloudflared_manager.activation.service import StrictService, ServiceRefused
+from cloudflared_manager.activation.service_io import verified_executable
 from cloudflared_manager.activation.service_transaction import ServiceController, resume_service
 from cloudflared_manager.activation.state import BackupStore, open_fixed_state_child, unlink_known
 from cloudflared_manager.cloudflared.editing.candidate import CandidateCommitHandle
@@ -28,7 +29,7 @@ from cloudflared_manager.cloudflared.editing.preparation import (
 )
 from cloudflared_manager.cloudflared.editing.source import ConfigSourceSnapshot
 from cloudflared_manager.cloudflared.editing.errors import SourceConfigChangedError
-from cloudflared_manager.cloudflared.editing.validation import CandidateValidator
+from cloudflared_manager.cloudflared.editing.validation import CandidateValidator, CloudflaredCandidateValidator
 from cloudflared_manager.deployment.environment import read_environment, require_safe_environment
 from cloudflared_manager.deployment.paths import DeploymentPaths
 from cloudflared_manager.deployment.release import DeploymentLock, ReleaseFilesystem
@@ -105,7 +106,7 @@ class FilesystemActivation:
         if owner != 0 and anchor == Path("/"):
             raise FilesystemRefused("UNSAFE_TEST_BOUNDARY")
 
-    def run(self, mutation: ConfigMutation, *, validator: CandidateValidator,
+    def run(self, mutation: ConfigMutation, *, validator: CandidateValidator | None = None,
             expected_source_revision: str | None = None,
             allowed_adopted_parent: Path | None = None) -> FilesystemResult:
         if os.geteuid() != self.owner or self.baseline is None:
@@ -121,10 +122,34 @@ class FilesystemActivation:
                 with PinnedDirectory(adopted.parent, anchor=self.anchor, owner=self.owner) as active:
                     _metadata_supported(active.fd)
                     _require_no_orphan_candidates(active)
-                    prepared = prepare_validated_candidate(
-                        adopted, mutation, cloudflared_validator=validator,
-                        expected_source_revision=expected_source_revision,
-                    )
+                    trusted_executable: Path | None = None
+                    if validator is None:
+                        # Production PR16 derives the executable only from the
+                        # verified fixed service, never from PATH or the request.
+                        source_facts, _ = named_file(active, adopted.name)
+                        observed, executable = self.baseline.observe_with_executable(
+                            adopted_fingerprint=_fingerprint(adopted),
+                            source_digest=source_facts.sha256,
+                        )
+                        trusted_executable = executable
+                        if observed != self._baseline(adopted, source_facts,
+                                                      executable_path=trusted_executable):
+                            raise ServiceRefused()
+                        with verified_executable(executable) as (executable_fd, identity):
+                            if identity != (observed.executable_device, observed.executable_inode):
+                                raise ServiceRefused()
+                            prepared = prepare_validated_candidate(
+                                adopted, mutation,
+                                cloudflared_validator=CloudflaredCandidateValidator(
+                                    executable=executable, executable_fd=executable_fd,
+                                ),
+                                expected_source_revision=expected_source_revision,
+                            )
+                    else:
+                        prepared = prepare_validated_candidate(
+                            adopted, mutation, cloudflared_validator=validator,
+                            expected_source_revision=expected_source_revision,
+                        )
                     if prepared.outcome is PreparationOutcome.NO_CHANGE:
                         require_source(prepared.source, active)
                         self._require_authority(release, adopted)
@@ -142,14 +167,14 @@ class FilesystemActivation:
                         snapshot = prepared.source
                         source = require_source(snapshot, active)
                         self._require_authority(release, adopted)
-                        self._baseline(adopted, source)
+                        self._baseline(adopted, source, executable_path=trusted_executable)
                         handle = prepared.candidate.consume_for_activation()
                         if DirectoryFacts.from_stat(os.fstat(handle.directory_fd)) != active.facts:
                             raise FilesystemRefused("STALE_CANDIDATE")
                         candidate = self._convert_candidate(handle, source, active)
                         source = require_source(snapshot, active)
                         self._require_authority(release, adopted)
-                        baseline = self._baseline(adopted, source)
+                        baseline = self._baseline(adopted, source, executable_path=trusted_executable)
                         backup_name = f"backup-{transaction_id}"
                         backup_facts = backups.create(backup_name, snapshot.original_bytes, source)
                         backups.require(backup_name, backup_facts)
@@ -163,7 +188,7 @@ class FilesystemActivation:
                                                  authenticate=lambda item: self._authenticate(item, active, backups))
                         # Observe the service first: that check may take time, so
                         # source, candidate, and authority must be checked after it.
-                        if self._baseline(adopted, source) != baseline:
+                        if self._baseline(adopted, source, executable_path=trusted_executable) != baseline:
                             raise FilesystemRefused("BASELINE_CHANGED")
                         # No journal write or filesystem preparation intervenes
                         # between these final identity checks and exchange.
@@ -370,10 +395,18 @@ class FilesystemActivation:
         with PinnedDirectory(adopted.parent, anchor=self.anchor, owner=self.owner) as active:
             self._authenticate(record, active, backups)
 
-    def _baseline(self, adopted: Path, source: FileFacts) -> BaselineFacts:
+    def _baseline(self, adopted: Path, source: FileFacts, *,
+                  executable_path: Path | None = None) -> BaselineFacts:
         assert self.baseline is not None
         fingerprint = _fingerprint(adopted)
-        result = self.baseline.observe(adopted_fingerprint=fingerprint, source_digest=source.sha256)
+        if executable_path is None:
+            result = self.baseline.observe(adopted_fingerprint=fingerprint, source_digest=source.sha256)
+        else:
+            result, observed_path = self.baseline.observe_with_executable(
+                adopted_fingerprint=fingerprint, source_digest=source.sha256,
+            )
+            if observed_path != executable_path:
+                raise FilesystemRefused("BASELINE_CHANGED")
         result = BaselineFacts.parse(result.record())
         if result.adopted_fingerprint != fingerprint or result.source_digest != source.sha256:
             raise FilesystemRefused("BASELINE_CHANGED")

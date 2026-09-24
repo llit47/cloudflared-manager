@@ -22,7 +22,6 @@ from cloudflared_manager.cloudflared.editing import (
     RoundTripYamlError, SourceConfigChangedError, SourceConfigUnreadableError,
     StaleMutationError, UnsupportedConfigStructureError,
 )
-from cloudflared_manager.cloudflared.editing.validation import CloudflaredCandidateValidator
 from cloudflared_manager.deployment.errors import UpdateLockedError
 from cloudflared_manager.deployment.paths import DeploymentPaths
 
@@ -49,7 +48,7 @@ def execute(request: MutationRequest, *, engine: FilesystemActivation | None = N
         if adopted.parent != allowed_adopted_parent:
             raise MutationProtocolRefused("PRIVILEGED_BOUNDARY_UNAVAILABLE")
         engine = FilesystemActivation(paths)
-    return engine.run(_operation(request), validator=CloudflaredCandidateValidator(),
+    return engine.run(_operation(request),
                       expected_source_revision=request.source_revision,
                       allowed_adopted_parent=allowed_adopted_parent)
 

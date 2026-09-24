@@ -18,6 +18,9 @@ process safely snapshots the root-adopted source, checks its digest, and
 verifies the selected hostname rule's fingerprint. Duplicate-looking routes
 are distinguishable by position in that same source revision. Mismatches fail
 closed; there is no route search or rebase.
+Selector positions are limited to 0 through 4095. Add refuses an insertion
+that would put the new hostname route beyond that range, before changing the
+document or staging a candidate.
 
 The request cannot supply YAML, a configuration or artifact path, a command,
 an executable, a service unit, or an environment. The privileged process
@@ -25,10 +28,13 @@ derives the active target from the root-owned adopted setting and confines it
 to `/etc/cloudflared`. It converts the validated request to an internal
 document mutation, preserving unrelated YAML fields where round-trip editing
 supports them. It then calls the existing `FilesystemActivation.run(...)`
-with the fixed cloudflared validator. PR12–PR14 candidate, backup, journal,
-exchange, restart, readiness, rollback, and recovery checks remain in that
-transaction. A second identical request fails the source revision check after
-the first commit.
+with a validator bound to the exact executable observed for the verified
+`cloudflared.service` baseline. Production validation pins that trusted
+executable by descriptor and never searches `PATH`; the service path and
+device/inode identity are rechecked before exchange. PR12–PR14 candidate,
+backup, journal, exchange, restart, readiness, rollback, and recovery checks
+remain in that transaction. A second identical request fails the source
+revision check after the first commit.
 
 The response contains only a bounded code. It distinguishes changed, no
 change, stale conflict, invalid input, busy lock, unsupported structure,

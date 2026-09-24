@@ -7,7 +7,9 @@ from cloudflared_manager.cloudflared.editing import (
     EditableCloudflaredConfig, MutationOutcome, MutationRejectedError,
     StaleMutationError, UnsupportedConfigStructureError, read_config_source_snapshot,
 )
-from cloudflared_manager.cloudflared.editing.local_ingress import LocalRoute, RouteSelector
+from cloudflared_manager.cloudflared.editing.local_ingress import (
+    MAX_ROUTE_POSITION, LocalRoute, RouteSelector,
+)
 from cloudflared_manager.cloudflared.editing.preparation import prepare_validated_candidate
 
 SOURCE = """# retained
@@ -38,6 +40,37 @@ def test_add_before_catch_all_and_duplicate_matcher_rejected(tmp_path):
     assert yaml.safe_load(rendered)["ingress"][-1] == {"service": "http_status:404"}
     with pytest.raises(MutationRejectedError):
         editor(tmp_path).add_local_hostname_ingress(LocalRoute("one.example.com", None, "http://127.0.0.1:9000"))
+
+
+def test_add_position_is_always_addressable_and_rejects_next_position(tmp_path):
+    route = LocalRoute("new.example.com", None, "http://127.0.0.1:9000")
+    def source(count):
+        return ("ingress:\n" + "".join(
+            f"  - hostname: route{i}.example.com\n    service: http://127.0.0.1:8000\n"
+            for i in range(count)
+        ) + "  - service: http_status:404\n")
+
+    supported = editor(tmp_path, source(MAX_ROUTE_POSITION))
+    assert supported.add_local_hostname_ingress(route) == MutationOutcome.CHANGED
+    assert supported.local_route_selector(MAX_ROUTE_POSITION).position == MAX_ROUTE_POSITION
+    assert RouteSelector(MAX_ROUTE_POSITION, "a" * 64).position == MAX_ROUTE_POSITION
+
+    unsupported = editor(tmp_path, source(MAX_ROUTE_POSITION + 1))
+    with pytest.raises(MutationRejectedError):
+        unsupported.add_local_hostname_ingress(route)
+    assert unsupported.changed is False
+    with pytest.raises(MutationRejectedError):
+        RouteSelector(MAX_ROUTE_POSITION + 1, "a" * 64)
+
+    class ForbiddenStager:
+        def stage(self, *_args):
+            pytest.fail("an unaddressable Add must not stage a candidate")
+
+    with pytest.raises(MutationRejectedError):
+        prepare_validated_candidate(
+            tmp_path / "config.yml", lambda document: document.add_local_hostname_ingress(route),
+            stager=ForbiddenStager(),
+        )
 
 
 def test_edit_preserves_unrelated_yaml_and_noop(tmp_path):

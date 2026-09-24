@@ -167,19 +167,27 @@ class StrictService:
         self._clock = clock
 
     def observe(self, *, adopted_fingerprint: str, source_digest: str) -> BaselineFacts:
+        return self.observe_with_executable(
+            adopted_fingerprint=adopted_fingerprint, source_digest=source_digest,
+        )[0]
+
+    def observe_with_executable(self, *, adopted_fingerprint: str,
+                                source_digest: str) -> tuple[BaselineFacts, Path]:
+        """Return the executable from the same stable, verified service observation."""
         try:
             start = self._clock()
-            first, shape = self._once(adopted_fingerprint, source_digest)
+            first, shape, executable = self._once(adopted_fingerprint, source_digest)
             self._sleep(STABILITY_SECONDS)
-            second, repeated = self._once(adopted_fingerprint, source_digest)
+            second, repeated, repeated_executable = self._once(adopted_fingerprint, source_digest)
             elapsed = self._clock() - start
-            if first != second or shape != repeated or not STABILITY_SECONDS <= elapsed <= 15:
+            if (first != second or shape != repeated or executable != repeated_executable
+                or not STABILITY_SECONDS <= elapsed <= 15):
                 raise ServiceRefused()
-            return first
+            return first, executable
         except Exception:
             raise ServiceRefused() from None
 
-    def _once(self, fingerprint: str, digest: str) -> tuple[BaselineFacts, Shape]:
+    def _once(self, fingerprint: str, digest: str) -> tuple[BaselineFacts, Shape, Path]:
         _, adopted = self._authority.current()
         if hashlib.sha256(os.fsencode(adopted)).hexdigest() != fingerprint:
             raise ServiceRefused()
@@ -199,7 +207,7 @@ class StrictService:
             raise ServiceRefused()
         result = BaselineFacts(UNIT, "loaded", "active", "running", pid, ticks, device, inode,
                                fingerprint, digest, int(STABILITY_SECONDS * 1000), int(values["NRestarts"]))
-        return BaselineFacts.parse(result.record()), shape
+        return BaselineFacts.parse(result.record()), shape, command.executable
 
     def settled(self) -> bool:
         try:

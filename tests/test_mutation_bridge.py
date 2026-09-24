@@ -4,6 +4,7 @@ import io
 import json
 import hashlib
 import os
+from pathlib import Path
 from typing import get_args
 from types import SimpleNamespace
 
@@ -162,16 +163,56 @@ def test_privileged_mutation_uses_transaction_and_rejects_duplicate_request(tmp_
     paths.config_root.mkdir(parents=True)
     (tmp_path / "etc").chmod(0o700)
     paths.config_root.chmod(0o700)
-    engine = FilesystemActivation(paths, authority=Authority(source), baseline=FakeService(),
+    from contextlib import nullcontext
+    from cloudflared_manager.activation import transaction
+    baseline = FakeService()
+    baseline.observe_with_executable = lambda **kwargs: (
+        baseline.observe(**kwargs), Path("/opt/cloudflare/bin/cloudflared"),
+    )
+    engine = FilesystemActivation(paths, authority=Authority(source), baseline=baseline,
                                   service=FakeService(), owner=os.getuid(), anchor=tmp_path)
-    monkeypatch.setattr(mutation_helper, "CloudflaredCandidateValidator", Validator)
+    selected = []
+    def pinned(path):
+        selected.append(path)
+        return nullcontext((123, (1, 2)))
+    def validator_factory(**kwargs):
+        assert kwargs == {"executable": Path("/opt/cloudflare/bin/cloudflared"), "executable_fd": 123}
+        return Validator()
+    monkeypatch.setattr(transaction, "verified_executable", pinned)
+    monkeypatch.setattr(transaction, "CloudflaredCandidateValidator", validator_factory)
     snapshot = read_config_source_snapshot(source)
     selector = EditableCloudflaredConfig.from_snapshot(snapshot).local_route_selector(0)
     request = MutationRequest("local_ingress_edit", snapshot.sha256,
                               LocalRoute("new.example.com", None, "http://127.0.0.1:9000"), selector)
     assert mutation_helper.dispatch(request, lambda req: mutation_helper.execute(req, engine=engine, allowed_adopted_parent=root)) == (True, "CHANGED")
     assert b"new.example.com" in source.read_bytes()
+    assert selected == [Path("/opt/cloudflare/bin/cloudflared")]
     with DeploymentLock(paths.lock_path, owner=(os.getuid(), os.getegid())):
         assert mutation_helper.dispatch(request, lambda req: mutation_helper.execute(req, engine=engine, allowed_adopted_parent=root)) == (False, "BUSY")
     assert mutation_helper.dispatch(request, lambda req: mutation_helper.execute(req, engine=engine, allowed_adopted_parent=root)) == (False, "STALE_CONFLICT")
     assert hashlib.sha256(source.read_bytes()).hexdigest() != snapshot.sha256
+
+    # A changed loaded executable is rejected before mutation preparation.
+    latest = source.read_bytes()
+    observations = iter((Path("/opt/cloudflare/bin/cloudflared"), Path("/usr/bin/cloudflared")))
+    baseline.observe_with_executable = lambda **kwargs: (
+        baseline.observe(**kwargs), next(observations),
+    )
+    monkeypatch.setattr(transaction, "prepare_validated_candidate",
+                        lambda *_args, **_kwargs: pytest.fail("must not stage a candidate"))
+    fresh = MutationRequest("local_ingress_add", hashlib.sha256(latest).hexdigest(),
+                            LocalRoute("another.example.com", None, "http://127.0.0.1:9100"))
+    assert mutation_helper.dispatch(fresh, lambda req: mutation_helper.execute(
+        req, engine=engine, allowed_adopted_parent=root,
+    ))[0] is False
+    assert source.read_bytes() == latest
+
+    baseline.observe_with_executable = lambda **kwargs: (
+        baseline.observe(**kwargs), Path("/opt/cloudflare/bin/cloudflared"),
+    )
+    monkeypatch.setattr(transaction, "verified_executable",
+                        lambda path: nullcontext((123, (99, 100))))
+    assert mutation_helper.dispatch(fresh, lambda req: mutation_helper.execute(
+        req, engine=engine, allowed_adopted_parent=root,
+    ))[0] is False
+    assert source.read_bytes() == latest

@@ -28,21 +28,24 @@ def verified_executable(path: Path):
     """Pin a canonical regular root-owned executable under trusted ancestry."""
     fd = None
     try:
-        if not path.is_absolute() or path.resolve(strict=True) != path:
-            raise ServiceRefused()
-        with PinnedDirectory(path.parent) as parent:
-            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent.fd)
-            info = os.fstat(fd)
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o6022
-                or not info.st_mode & 0o111 or info.st_nlink != 1):
+        try:
+            if not path.is_absolute() or path.resolve(strict=True) != path:
                 raise ServiceRefused()
-            parent.revalidate()
-            visible = os.stat(path.name, dir_fd=parent.fd, follow_symlinks=False)
-            if visible != info:
-                raise ServiceRefused()
-            yield fd, (info.st_dev, info.st_ino)
-    except Exception:
-        raise ServiceRefused() from None
+            with PinnedDirectory(path.parent) as parent:
+                fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent.fd)
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o6022
+                    or not info.st_mode & 0o111 or info.st_nlink != 1):
+                    raise ServiceRefused()
+                parent.revalidate()
+                visible = os.stat(path.name, dir_fd=parent.fd, follow_symlinks=False)
+                if visible != info:
+                    raise ServiceRefused()
+        except Exception:
+            raise ServiceRefused() from None
+        # Do not turn a candidate/domain/stale-source error raised by the
+        # caller into a service error while unwinding this pinned descriptor.
+        yield fd, (info.st_dev, info.st_ino)
     finally:
         if fd is not None:
             os.close(fd)

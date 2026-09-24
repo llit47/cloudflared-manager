@@ -18,7 +18,9 @@ from cloudflared_manager.cloudflared.editing.errors import (
     UnsupportedConfigStructureError,
 )
 from cloudflared_manager.cloudflared.editing.source import ConfigSourceSnapshot
-from cloudflared_manager.cloudflared.editing.local_ingress import LocalRoute, RouteSelector, route_fingerprint
+from cloudflared_manager.cloudflared.editing.local_ingress import (
+    MAX_ROUTE_POSITION, LocalRoute, RouteSelector, route_fingerprint,
+)
 from cloudflared_manager.cloudflared.editing.errors import StaleMutationError
 from cloudflared_manager.cloudflared.limits import MAX_CLOUDFLARED_CONFIG_BYTES
 
@@ -107,6 +109,8 @@ class EditableCloudflaredConfig:
     def add_local_hostname_ingress(self, route: LocalRoute) -> MutationOutcome:
         _require_alias_free_local_document(self._document, set())
         ingress = _require_safe_ingress(self._document)
+        if len(ingress) - 1 > MAX_ROUTE_POSITION:
+            raise MutationRejectedError("The new local ingress position is unsupported.")
         _require_unique_matcher(ingress, route, excluded=None)
         rule = CommentedMap({"hostname": route.hostname})
         if route.path is not None:

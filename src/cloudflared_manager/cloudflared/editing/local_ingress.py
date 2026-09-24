@@ -14,6 +14,7 @@ from cloudflared_manager.cloudflared.editing.errors import MutationRejectedError
 _HOSTNAME = re.compile(r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
 _SCHEME = re.compile(r"^(?:https?|tcp|ssh)://[^\s]+$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
+MAX_ROUTE_POSITION = 4095
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +42,7 @@ class RouteSelector:
     fingerprint: str
 
     def __post_init__(self) -> None:
-        if type(self.position) is not int or not 0 <= self.position <= 4095:
+        if type(self.position) is not int or not 0 <= self.position <= MAX_ROUTE_POSITION:
             raise MutationRejectedError("Invalid local ingress selector.")
         if type(self.fingerprint) is not str or not _DIGEST.fullmatch(self.fingerprint):
             raise MutationRejectedError("Invalid local ingress selector.")
