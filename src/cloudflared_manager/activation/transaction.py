@@ -123,6 +123,7 @@ class FilesystemActivation:
                     _metadata_supported(active.fd)
                     _require_no_orphan_candidates(active)
                     trusted_executable: Path | None = None
+                    validated_baseline: BaselineFacts | None = None
                     if validator is None:
                         # Production PR16 derives the executable only from the
                         # verified fixed service, never from PATH or the request.
@@ -145,6 +146,7 @@ class FilesystemActivation:
                                 ),
                                 expected_source_revision=expected_source_revision,
                             )
+                        validated_baseline = observed
                     else:
                         prepared = prepare_validated_candidate(
                             adopted, mutation, cloudflared_validator=validator,
@@ -167,14 +169,16 @@ class FilesystemActivation:
                         snapshot = prepared.source
                         source = require_source(snapshot, active)
                         self._require_authority(release, adopted)
-                        self._baseline(adopted, source, executable_path=trusted_executable)
+                        self._baseline(adopted, source, executable_path=trusted_executable,
+                                       validated_baseline=validated_baseline)
                         handle = prepared.candidate.consume_for_activation()
                         if DirectoryFacts.from_stat(os.fstat(handle.directory_fd)) != active.facts:
                             raise FilesystemRefused("STALE_CANDIDATE")
                         candidate = self._convert_candidate(handle, source, active)
                         source = require_source(snapshot, active)
                         self._require_authority(release, adopted)
-                        baseline = self._baseline(adopted, source, executable_path=trusted_executable)
+                        baseline = self._baseline(adopted, source, executable_path=trusted_executable,
+                                                  validated_baseline=validated_baseline)
                         backup_name = f"backup-{transaction_id}"
                         backup_facts = backups.create(backup_name, snapshot.original_bytes, source)
                         backups.require(backup_name, backup_facts)
@@ -188,7 +192,8 @@ class FilesystemActivation:
                                                  authenticate=lambda item: self._authenticate(item, active, backups))
                         # Observe the service first: that check may take time, so
                         # source, candidate, and authority must be checked after it.
-                        if self._baseline(adopted, source, executable_path=trusted_executable) != baseline:
+                        if self._baseline(adopted, source, executable_path=trusted_executable,
+                                          validated_baseline=validated_baseline) != baseline:
                             raise FilesystemRefused("BASELINE_CHANGED")
                         # No journal write or filesystem preparation intervenes
                         # between these final identity checks and exchange.
@@ -396,7 +401,8 @@ class FilesystemActivation:
             self._authenticate(record, active, backups)
 
     def _baseline(self, adopted: Path, source: FileFacts, *,
-                  executable_path: Path | None = None) -> BaselineFacts:
+                  executable_path: Path | None = None,
+                  validated_baseline: BaselineFacts | None = None) -> BaselineFacts:
         assert self.baseline is not None
         fingerprint = _fingerprint(adopted)
         if executable_path is None:
@@ -409,6 +415,10 @@ class FilesystemActivation:
                 raise FilesystemRefused("BASELINE_CHANGED")
         result = BaselineFacts.parse(result.record())
         if result.adopted_fingerprint != fingerprint or result.source_digest != source.sha256:
+            raise FilesystemRefused("BASELINE_CHANGED")
+        if (validated_baseline is not None
+            and (result.executable_device, result.executable_inode)
+            != (validated_baseline.executable_device, validated_baseline.executable_inode)):
             raise FilesystemRefused("BASELINE_CHANGED")
         return result
 
