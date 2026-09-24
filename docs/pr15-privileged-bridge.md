@@ -23,9 +23,10 @@ The production manager runs as `cloudflared-manager` under
 `deploy/cloudflared-manager.service`. Installation, update, adoption, and
 release switching are root administrator operations. The manager service is
 previously configured `NoNewPrivileges=true`, which prevented a setuid sudo
-transition. PR15 sets it to `false`, keeps `RestrictSUIDSGID=true`, and limits
-the capability bounding set and writable mount paths to those needed by the
-bridge. The web unit keeps `/etc/cloudflared` read-only even if host DAC or ACLs
+transition. PR15 sets it to `false`, keeps `RestrictSUIDSGID=true`, and bounds
+capabilities needed by the bridge. The web unit has no writable mount
+exceptions for `/etc/cloudflared`, `/etc/cloudflared-manager`, or
+`/run/cloudflared-manager`, so these remain read-only even if host DAC or ACLs
 later drift. Sudo inherits that read-only mount; the fixed launcher starts a
 transient system-manager service in a separate `ProtectSystem=strict` mount
 namespace with only the fixed recovery directories writable.
@@ -68,7 +69,7 @@ or select another privileged action.
 - `deploy/cloudflared-manager-bridge.sudoers` grants the exact helper path;
   `cfm-config install-bridge` validates and installs both assets explicitly.
 - `deploy/cloudflared-manager.service` permits the sudo transition within a
-  bounded capability namespace while keeping `/etc/cloudflared` read-only.
+  bounded capability namespace while keeping all privileged state read-only.
 - `deploy/cloudflared-manager.tmpfiles.conf` recreates root-owned `0700`
   `/run/cloudflared-manager` through systemd-tmpfiles at boot. Install, update,
   reconciliation, and bridge installation apply the fixed rule immediately

@@ -171,8 +171,9 @@ only `CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_SETGID`,
 `CAP_SETUID`, and `CAP_SYS_PTRACE`. PR14 checks
 `/proc/<MainPID>/environ` and `/proc/<MainPID>/exe`; Linux applies a ptrace
 read check when `cloudflared.service` runs under another UID, so recovery needs
-`CAP_SYS_PTRACE` in the bounding set. The web unit keeps `/etc/cloudflared`
-read-only in its mount namespace. The sudo launcher starts a fixed transient
+`CAP_SYS_PTRACE` in the bounding set. The web unit has no writable mount
+exceptions for cloudflared or manager state under `ProtectSystem=strict`. The
+sudo launcher starts a fixed transient
 root service through `/usr/bin/systemd-run`; that service has its own restricted
 mount namespace with only `/etc/cloudflared`, `/etc/cloudflared-manager`, and
 `/run/cloudflared-manager` writable for recovery. Before installing the bridge, root
@@ -554,10 +555,10 @@ sudo cfm-config install-bridge
 ```
 
 This checks the active release identity, root-owned release assets and target
-directories, installs and applies the fixed runtime tmpfiles rule, verifies
-the writable mount paths, and validates the policy with
-`/usr/sbin/visudo -cf`, then atomically
-installs `/opt/cloudflared-manager/privileged-helper` as root `0755` and
+directories, validates the policy with `/usr/sbin/visudo -cf`, installs and
+applies the fixed runtime tmpfiles rule, then checks the privileged write
+boundary before atomically installing
+`/opt/cloudflared-manager/privileged-helper` as root `0755` and
 `/etc/sudoers.d/cloudflared-manager-bridge` as root `0440`. An ordinary install
 or update does not grant sudo. A missing `visudo`, unsafe collision, or stale
 release fails before installing the policy. Repeating the command with matching
@@ -598,7 +599,8 @@ For privileged host verification, run
 and modes with `stat`, confirm the tmpfiles rule with
 `cat /etc/tmpfiles.d/cloudflared-manager.conf`, and verify
 `stat -c '%U:%G %a' /run/cloudflared-manager` reports `root:root 700`.
-Confirm the web process sees `/etc/cloudflared` read-only in its mount namespace,
+Confirm the web process sees `/etc/cloudflared`, `/etc/cloudflared-manager`,
+and `/run/cloudflared-manager` read-only in its mount namespace,
 and a recovery request starts a transient system service able to complete the
 fixed PR14 transaction. Verify failed install/update leaves the prior tmpfiles
 rule bytes and mode intact.

@@ -262,9 +262,8 @@ def test_recovery_uses_isolated_system_manager_mount_with_fixed_authority():
     web = (root / "deploy/cloudflared-manager.service").read_text()
     helper = (root / "deploy/privileged-helper.sh").read_text()
     assert "ProtectSystem=strict" in web
-    assert "ReadWritePaths=/etc/cloudflared-manager /run/cloudflared-manager" in web
-    assert not any("/etc/cloudflared" in line.split("=", 1)[1].split()
-                   for line in web.splitlines() if line.startswith("ReadWritePaths="))
+    assert not any(line.startswith("ReadWritePaths=")
+                   for line in web.splitlines())
     assert "/usr/bin/systemd-run --system --pipe --wait --quiet --collect" in helper
     assert "--property=ProtectSystem=strict" in helper
     assert "--property=ReadWritePaths=/etc/cloudflared /etc/cloudflared-manager /run/cloudflared-manager" in helper

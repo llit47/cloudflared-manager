@@ -27,7 +27,7 @@ def require_write_boundary(
     anchor: Path = Path("/"),
     probe_as_service: bool = False,
 ) -> None:
-    """Prove the three writable mounts contain no manager-writable authority.
+    """Reject unsafe host metadata before the isolated root recovery grant.
 
     Production calls use root-owned paths. Tests inject a disposable trust
     anchor and owner; no check changes host metadata.
@@ -74,7 +74,7 @@ def require_adopted_write_boundary(adopted: Path, *, service_uid: int,
                                    cloudflared_root: Path = CLOUDFLARED_ROOT,
                                    trusted_uid: int = 0,
                                    anchor: Path = Path("/")) -> None:
-    """Reject unsafe adoption before persisting a path in the writable mount."""
+    """Reject unsafe adoption before persisting a privileged config path."""
     if cloudflared_root not in adopted.parents:
         return
     if service_uid == trusted_uid:

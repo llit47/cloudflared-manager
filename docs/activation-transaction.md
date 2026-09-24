@@ -329,7 +329,8 @@ admits only `{ "version": 1, "operation": "recover" }`; there is no
 serialized mutation request. The helper runs from the active root-owned
 release, independently verifies that release and the root-owned adopted path,
 and permits recovery only for a config directly under `/etc/cloudflared`.
-The manager unit keeps `/etc/cloudflared` read-only in its mount namespace.
+The manager unit keeps `/etc/cloudflared`, `/etc/cloudflared-manager`, and
+`/run/cloudflared-manager` read-only in its mount namespace.
 The fixed sudo launcher starts recovery through a transient system-manager
 service in a separate `ProtectSystem=strict` namespace with only fixed recovery
 paths writable. Because a setuid sudo transition is

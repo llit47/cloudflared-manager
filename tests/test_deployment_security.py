@@ -209,9 +209,8 @@ def test_service_unit_runs_unprivileged_with_manager_owned_paths() -> None:
     assert "ExecStart=/opt/cloudflared-manager/current/.venv/bin/cloudflared-manager" in unit
     assert "NoNewPrivileges=false" in unit
     assert "ProtectSystem=strict" in unit
-    assert "ReadWritePaths=/etc/cloudflared-manager /run/cloudflared-manager" in unit
-    assert not any("/etc/cloudflared " in line or line.endswith("/etc/cloudflared")
-                   for line in unit.splitlines() if line.startswith("ReadWritePaths="))
+    assert not any(line.startswith("ReadWritePaths=")
+                   for line in unit.splitlines())
     # PR14's /proc/<MainPID>/environ and exe checks must work when cloudflared
     # runs under another UID; CAP_DAC_OVERRIDE alone cannot satisfy ptrace access.
     caps = next(line.removeprefix("CapabilityBoundingSet=").split()

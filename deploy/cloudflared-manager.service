@@ -22,7 +22,6 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/etc/cloudflared-manager /run/cloudflared-manager
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true
